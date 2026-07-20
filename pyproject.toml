@@ -1,0 +1,19 @@
+[project]
+name = "agent-workbench"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Rafael Silva", email = "152502239+RafaelRFSSilva@users.noreply.github.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "ollama>=0.6.2",
+]
+
+[project.scripts]
+agent-workbench = "agent_workbench:main"
+
+[build-system]
+requires = ["uv_build>=0.11.29,<0.12.0"]
+build-backend = "uv_build"
