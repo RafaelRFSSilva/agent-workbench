@@ -1,10 +1,10 @@
 """Interactive command-line interface for Agent Workbench."""
 
-from agent_workbench.config import get_model_name
-from agent_workbench.errors import CompletionError
+from agent_workbench.config import get_model_name, get_provider_name
+from agent_workbench.errors import CompletionError, ConfigurationError
 from agent_workbench.messages import Message
 from agent_workbench.providers.base import ChatProvider
-from agent_workbench.providers.ollama import OllamaProvider
+from agent_workbench.providers.factory import create_provider
 
 EXIT_COMMANDS = {"/exit", "/quit"}
 
@@ -53,9 +53,15 @@ def run_cli(provider: ChatProvider) -> None:
 
 
 def main() -> None:
-    """Run the CLI using the configured Ollama provider."""
+    """Run the CLI using the configured provider and model."""
 
-    provider = OllamaProvider(model_name=get_model_name())
+    try:
+        provider_name = get_provider_name()
+        model_name = get_model_name(provider_name)
+        provider = create_provider(provider_name, model_name)
+    except ConfigurationError as exc:
+        print(f"Configuration error: {exc}")
+        return
 
     run_cli(provider)
 

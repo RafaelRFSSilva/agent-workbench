@@ -1,10 +1,16 @@
 """Tests for Agent Workbench configuration."""
 
+import pytest
+
 from agent_workbench.config import (
     DEFAULT_MODEL_NAME,
+    DEFAULT_PROVIDER_NAME,
     MODEL_ENV_VAR,
+    PROVIDER_ENV_VAR,
     get_model_name,
+    get_provider_name,
 )
+from agent_workbench.errors import ConfigurationError
 
 
 def test_default_model_is_used_when_variable_is_missing(monkeypatch) -> None:
@@ -29,3 +35,43 @@ def test_blank_model_uses_default(monkeypatch) -> None:
     monkeypatch.setenv(MODEL_ENV_VAR, "   ")
 
     assert get_model_name() == DEFAULT_MODEL_NAME
+
+
+def test_default_provider_is_used_when_variable_is_missing(monkeypatch) -> None:
+    """Use Ollama when no provider is configured."""
+
+    monkeypatch.delenv(PROVIDER_ENV_VAR, raising=False)
+
+    assert get_provider_name() == DEFAULT_PROVIDER_NAME
+
+
+def test_provider_can_be_configured_through_environment(monkeypatch) -> None:
+    """Read and normalize the provider name from the environment."""
+
+    monkeypatch.setenv(PROVIDER_ENV_VAR, " OpenAI ")
+
+    assert get_provider_name() == "openai"
+
+
+def test_unsupported_provider_is_rejected(monkeypatch) -> None:
+    """Reject provider names that the application does not support."""
+
+    monkeypatch.setenv(PROVIDER_ENV_VAR, "unsupported")
+
+    with pytest.raises(
+        ConfigurationError,
+        match="Unsupported provider 'unsupported'",
+    ):
+        get_provider_name()
+
+
+def test_openai_requires_an_explicit_model(monkeypatch) -> None:
+    """Require explicit model selection for the OpenAI provider."""
+
+    monkeypatch.delenv(MODEL_ENV_VAR, raising=False)
+
+    with pytest.raises(
+        ConfigurationError,
+        match="AGENT_WORKBENCH_MODEL is required",
+    ):
+        get_model_name("openai")
