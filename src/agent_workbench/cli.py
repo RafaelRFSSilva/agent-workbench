@@ -1,5 +1,6 @@
 """Interactive command-line interface for Agent Workbench."""
 
+from collections.abc import Callable
 from typing import Literal, TypedDict
 
 from ollama import chat
@@ -15,6 +16,9 @@ class Message(TypedDict):
     content: str
 
 
+CompletionFunction = Callable[[list[Message]], str]
+
+
 def request_completion(messages: list[Message]) -> str:
     """Send the conversation history to the local language model."""
 
@@ -27,8 +31,8 @@ def request_completion(messages: list[Message]) -> str:
     return response.message.content or ""
 
 
-def main() -> None:
-    """Run an interactive conversation with the local language model."""
+def run_cli(completion_fn: CompletionFunction) -> None:
+    """Run an interactive conversation using the provided completion function."""
 
     messages: list[Message] = []
 
@@ -56,7 +60,7 @@ def main() -> None:
             }
         )
 
-        assistant_reply = request_completion(messages)
+        assistant_reply = completion_fn(messages)
 
         messages.append(
             {
@@ -66,3 +70,13 @@ def main() -> None:
         )
 
         print(f"Assistant: {assistant_reply}\n")
+
+
+def main() -> None:
+    """Run the CLI using the local Ollama completion function."""
+
+    run_cli(request_completion)
+
+
+if __name__ == "__main__":
+    main()
