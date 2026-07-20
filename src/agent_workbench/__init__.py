@@ -3,15 +3,15 @@ from ollama import chat
 MODEL_NAME = "gpt-oss:20b"
 
 def main() -> None:
-    """Execute first interaction with Python and the model local"""
+    """Run the first interaction with the local language model."""
 
     response = chat(model=MODEL_NAME,
                     messages=[
                         {
                             "role": "user",
                             "content": (
-                                "Aswer exactly with: "
-                                "Python on with model local"
+                                "Reply exactly with: "
+                                "Python connected to the local model"
                             ),
                         }
                     ],
