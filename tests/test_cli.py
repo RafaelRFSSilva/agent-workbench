@@ -1,6 +1,10 @@
 """Tests for the Agent Workbench command-line interface."""
 
-from agent_workbench.cli import Message, run_cli
+import pytest
+from ollama import ResponseError
+
+from agent_workbench.cli import Message, request_completion, run_cli
+from agent_workbench.errors import CompletionError
 
 
 def test_exit_command_does_not_call_completion(monkeypatch, capsys) -> None:
@@ -87,3 +91,77 @@ def test_conversation_history_is_preserved(monkeypatch, capsys) -> None:
     ]
     assert "Assistant: acknowledged" in captured.out
     assert "Assistant: cobalt" in captured.out
+
+
+def test_connection_error_is_translated(monkeypatch) -> None:
+    """Translate an Ollama connection failure into an application error."""
+
+    def fake_chat(**kwargs) -> None:
+        raise ConnectionError
+
+    monkeypatch.setattr("agent_workbench.cli.chat", fake_chat)
+
+    with pytest.raises(
+        CompletionError,
+        match="Unable to connect to Ollama",
+    ):
+        request_completion([], model_name="test-model")
+
+
+def test_missing_model_error_is_translated(monkeypatch) -> None:
+    """Provide a clear error when the configured model is unavailable."""
+
+    def fake_chat(**kwargs) -> None:
+        raise ResponseError("model not found", 404)
+
+    monkeypatch.setattr("agent_workbench.cli.chat", fake_chat)
+
+    with pytest.raises(
+        CompletionError,
+        match="Model 'missing-model' is not available",
+    ):
+        request_completion([], model_name="missing-model")
+
+
+def test_cli_recovers_after_completion_error(monkeypatch, capsys) -> None:
+    """Continue the session without preserving a failed request."""
+
+    user_inputs = iter(
+        [
+            "First request",
+            "Second request",
+            "/exit",
+        ]
+    )
+    captured_histories: list[list[Message]] = []
+
+    monkeypatch.setattr("builtins.input", lambda _: next(user_inputs))
+
+    def fake_completion(messages: list[Message]) -> str:
+        captured_histories.append([message.copy() for message in messages])
+
+        if len(captured_histories) == 1:
+            raise CompletionError("Temporary model failure.")
+
+        return "recovered"
+
+    run_cli(fake_completion)
+
+    captured = capsys.readouterr()
+
+    assert captured_histories == [
+        [
+            {
+                "role": "user",
+                "content": "First request",
+            }
+        ],
+        [
+            {
+                "role": "user",
+                "content": "Second request",
+            }
+        ],
+    ]
+    assert "Error: Temporary model failure." in captured.out
+    assert "Assistant: recovered" in captured.out

@@ -4,9 +4,10 @@ from collections.abc import Callable
 from functools import partial
 from typing import Literal, TypedDict
 
-from ollama import chat
+from ollama import ResponseError, chat
 
 from agent_workbench.config import DEFAULT_MODEL_NAME, get_model_name
+from agent_workbench.errors import CompletionError
 
 EXIT_COMMANDS = {"/exit", "/quit"}
 
@@ -28,11 +29,23 @@ def request_completion(
 ) -> str:
     """Send the conversation history to the selected local model."""
 
-    response = chat(
-        model=model_name,
-        messages=messages,
-        stream=False,
-    )
+    try:
+        response = chat(
+            model=model_name,
+            messages=messages,
+            stream=False,
+        )
+    except ConnectionError as exc:
+        raise CompletionError(
+            "Unable to connect to Ollama. Confirm that the Ollama service is running."
+        ) from exc
+    except ResponseError as exc:
+        if exc.status_code == 404:
+            raise CompletionError(
+                f"Model '{model_name}' is not available in Ollama."
+            ) from exc
+
+        raise CompletionError(f"Ollama request failed: {exc.error}") from exc
 
     return response.message.content or ""
 
@@ -63,15 +76,19 @@ def run_cli(
             print("Session ended.")
             break
 
-        messages.append(
-            {
-                "role": "user",
-                "content": user_input,
-            }
-        )
+        user_message: Message = {
+            "role": "user",
+            "content": user_input,
+        }
+        request_messages = [*messages, user_message]
 
-        assistant_reply = completion_fn(messages)
+        try:
+            assistant_reply = completion_fn(request_messages)
+        except CompletionError as exc:
+            print(f"Error: {exc}\n")
+            continue
 
+        messages = request_messages
         messages.append(
             {
                 "role": "assistant",
