@@ -1,11 +1,13 @@
 """Interactive command-line interface for Agent Workbench."""
 
 from collections.abc import Callable
+from functools import partial
 from typing import Literal, TypedDict
 
 from ollama import chat
 
-MODEL_NAME = "gpt-oss:20b"
+from agent_workbench.config import DEFAULT_MODEL_NAME, get_model_name
+
 EXIT_COMMANDS = {"/exit", "/quit"}
 
 
@@ -19,11 +21,15 @@ class Message(TypedDict):
 CompletionFunction = Callable[[list[Message]], str]
 
 
-def request_completion(messages: list[Message]) -> str:
-    """Send the conversation history to the local language model."""
+def request_completion(
+    messages: list[Message],
+    *,
+    model_name: str,
+) -> str:
+    """Send the conversation history to the selected local model."""
 
     response = chat(
-        model=MODEL_NAME,
+        model=model_name,
         messages=messages,
         stream=False,
     )
@@ -31,12 +37,16 @@ def request_completion(messages: list[Message]) -> str:
     return response.message.content or ""
 
 
-def run_cli(completion_fn: CompletionFunction) -> None:
+def run_cli(
+    completion_fn: CompletionFunction,
+    *,
+    model_name: str = DEFAULT_MODEL_NAME,
+) -> None:
     """Run an interactive conversation using the provided completion function."""
 
     messages: list[Message] = []
 
-    print(f"Agent Workbench | Local model: {MODEL_NAME}")
+    print(f"Agent Workbench | Local model: {model_name}")
     print("Type /exit or /quit to end the session.\n")
 
     while True:
@@ -73,9 +83,12 @@ def run_cli(completion_fn: CompletionFunction) -> None:
 
 
 def main() -> None:
-    """Run the CLI using the local Ollama completion function."""
+    """Run the CLI using the configured local Ollama model."""
 
-    run_cli(request_completion)
+    model_name = get_model_name()
+    completion_fn = partial(request_completion, model_name=model_name)
+
+    run_cli(completion_fn, model_name=model_name)
 
 
 if __name__ == "__main__":
