@@ -9,17 +9,20 @@ Generation, agent workflows, evaluation, observability, and cloud deployment.
 
 ## Current Status
 
-The current version provides an interactive command-line interface for
-conversing with a locally hosted language model through Ollama.
+The current version provides an interactive command-line interface built on a
+provider-independent chat abstraction.
 
 Implemented capabilities:
 
 - Interactive multi-turn conversations
-- Conversation history management
+- In-memory conversation history
+- Provider-independent CLI integration through the `ChatProvider` protocol
+- Local model inference through the `OllamaProvider`
 - Configurable local model selection
 - Empty-input and session-exit handling
 - Clear handling of Ollama connection and model errors
-- Automated tests for CLI behavior and configuration
+- Automated tests for CLI, configuration, and provider behavior
+- Continuous integration with GitHub Actions
 - Static analysis and formatting with Ruff
 
 ## Architecture
@@ -29,14 +32,15 @@ User
   ↓
 Interactive CLI
   ↓
-Conversation History
+ChatProvider Protocol
+  ↓
+OllamaProvider
   ↓
 Ollama Python Client
   ↓
 Ollama Local API
   ↓
 Local Language Model
-```
 
 The CLI depends on an injected completion function, allowing the conversation
 logic to be tested without contacting a real model server.
@@ -144,7 +148,8 @@ uv run ruff format --check .
 - [x] Preserve multi-turn conversation history
 - [x] Add configurable local model selection
 - [x] Add automated tests and error handling
-- [ ] Create a common interface for multiple model providers
+- [x] Create a common interface for multiple model providers
+- [x] Move the Ollama integration behind a dedicated provider
 - [ ] Add OpenAI integration
 - [ ] Add Anthropic integration
 - [ ] Add structured outputs

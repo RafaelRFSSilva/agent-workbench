@@ -167,3 +167,99 @@ The implementation was validated through:
 
 Extract the Ollama integration behind a provider-independent interface while
 preserving the existing CLI behavior and automated tests.
+
+## 2026-07-20 — Provider-Independent Chat Architecture
+
+### Objective
+
+Decouple the command-line interface from the Ollama implementation and define
+a reusable contract for future language model providers.
+
+### Implemented
+
+- Extracted the shared message structure into a dedicated module.
+- Introduced the `ChatProvider` protocol as the provider-independent interface.
+- Created an `OllamaProvider` implementation for local model inference.
+- Moved Ollama API calls and provider-specific error translation out of the CLI.
+- Replaced completion-function injection with provider-object injection.
+- Updated the CLI to display both the active provider and model.
+- Added a deterministic `FakeProvider` for isolated CLI testing.
+- Added dedicated automated tests for the Ollama provider.
+- Preserved existing conversation, configuration, and error-handling behavior.
+
+### Architecture
+
+```text
+Application Entry Point
+        ↓
+Runtime Configuration
+        ↓
+OllamaProvider
+        ↓
+ChatProvider Contract
+        ↓
+Interactive CLI
+```
+
+At runtime, the CLI receives an object compatible with the provider contract:
+
+```text
+Interactive CLI
+        ↓
+ChatProvider
+        ↓
+OllamaProvider
+        ↓
+Ollama API
+```
+
+During automated testing:
+
+```text
+Interactive CLI
+        ↓
+FakeProvider
+        ↓
+Deterministic Outcomes
+```
+
+### Validation
+
+The refactoring was validated through:
+
+- Successful Ruff formatting and static-analysis checks.
+- Ten passing automated tests.
+- Dedicated tests for successful Ollama responses.
+- Dedicated tests for connection and missing-model failures.
+- CLI tests using a deterministic provider implementation.
+- A successful real completion through the local Ollama server.
+- Verification that multi-turn conversation history remained unchanged.
+
+### Technical Decisions
+
+- Used a Python `Protocol` to define behavior without requiring providers to
+  inherit from a concrete base class.
+- Kept provider-specific dependencies and exceptions outside the CLI layer.
+- Assigned model configuration to the provider instance rather than passing it
+  with every completion request.
+- Used an immutable, slotted dataclass for `OllamaProvider` because its runtime
+  configuration should not change after initialization.
+- Retained application-level `CompletionError` handling so the CLI remains
+  independent of provider-specific exception types.
+- Replaced function-level test doubles with a fake provider that follows the
+  same interface as production implementations.
+
+### Current Limitations
+
+- Ollama remains the only implemented provider.
+- Provider selection is not yet configurable independently of model selection.
+- All providers currently use the same internal message representation.
+- Responses are not streamed.
+- Generation parameters are not exposed through the provider interface.
+- Provider capabilities are not yet represented explicitly.
+- Integration tests against a live Ollama server are still manual.
+
+### Next Milestone
+
+Add the first cloud-based provider while preserving the provider-independent
+CLI and shared message contract.
