@@ -3,25 +3,27 @@
 An incremental AI engineering workbench for building and evaluating
 applications powered by local and cloud-based language models.
 
-The project begins with a direct Ollama integration and evolves through
-provider abstraction, structured outputs, tool calling, Retrieval-Augmented
-Generation, agent workflows, evaluation, observability, and cloud deployment.
+The project evolves through provider abstraction, structured outputs, tool
+calling, Retrieval-Augmented Generation, agent workflows, evaluation,
+observability, and cloud deployment.
 
 ## Current Status
 
 The current version provides an interactive command-line interface built on a
-provider-independent chat abstraction.
+provider-independent chat architecture.
 
 Implemented capabilities:
 
 - Interactive multi-turn conversations
 - In-memory conversation history
-- Provider-independent CLI integration through the `ChatProvider` protocol
-- Local model inference through the `OllamaProvider`
-- Configurable local model selection
-- Empty-input and session-exit handling
-- Clear handling of Ollama connection and model errors
-- Automated tests for CLI, configuration, and provider behavior
+- Provider-independent integration through the `ChatProvider` protocol
+- Local inference through `OllamaProvider`
+- Cloud inference through `OpenAIProvider`
+- Runtime provider and model selection
+- Local configuration through environment variables
+- Secure `.env` loading without overriding runtime variables
+- Clear provider-specific error handling
+- Automated tests for CLI, configuration, provider construction, and API behavior
 - Continuous integration with GitHub Actions
 - Static analysis and formatting with Ruff
 
@@ -32,32 +34,44 @@ User
   ↓
 Interactive CLI
   ↓
+Provider Factory
+  ↓
 ChatProvider Protocol
-  ↓
-OllamaProvider
-  ↓
-Ollama Python Client
-  ↓
-Ollama Local API
-  ↓
-Local Language Model
+  ├── OllamaProvider
+  │       ↓
+  │   Ollama Local API
+  │
+  └── OpenAIProvider
+          ↓
+      OpenAI Responses API
+```
 
-The CLI depends on an injected completion function, allowing the conversation
-logic to be tested without contacting a real model server.
+The CLI depends only on the `ChatProvider` protocol. Provider-specific clients,
+authentication, API calls, and error translation remain outside the
+conversation layer.
+
+During automated testing, real providers and external APIs are replaced by
+deterministic test doubles.
 
 ## Requirements
 
+### Core
+
 - Python 3.12
 - uv
+
+### Ollama provider
+
 - Ollama
 - A locally available Ollama model
 - Sufficient system memory or a compatible GPU
 
-The default model is:
+### OpenAI provider
 
-```text
-gpt-oss:20b
-```
+- An OpenAI API project
+- An API key with access to the Responses API
+- Available API credit
+- An explicitly configured OpenAI model
 
 ## Setup
 
@@ -67,17 +81,51 @@ Install the project dependencies:
 uv sync
 ```
 
-Download the default local model:
+Create a local environment file from the public template:
+
+```bash
+cp .env.example .env
+```
+
+The `.env` file is excluded from Git and must never be committed.
+
+## Ollama Configuration
+
+The default configuration uses Ollama with `gpt-oss:20b`.
+
+Download the model:
 
 ```bash
 ollama pull gpt-oss:20b
 ```
 
-Confirm that Ollama is running and that the model is available:
+Confirm that Ollama is running and the model is available:
 
 ```bash
 ollama list
 ```
+
+Example `.env` configuration:
+
+```dotenv
+AGENT_WORKBENCH_PROVIDER=ollama
+AGENT_WORKBENCH_MODEL=gpt-oss:20b
+```
+
+## OpenAI Configuration
+
+Configure the OpenAI provider in `.env`:
+
+```dotenv
+OPENAI_API_KEY=<your-api-key>
+AGENT_WORKBENCH_PROVIDER=openai
+AGENT_WORKBENCH_MODEL=<openai-model>
+```
+
+The API key must remain only in the private `.env` file or another secure
+runtime environment.
+
+Runtime environment variables take precedence over values loaded from `.env`.
 
 ## Usage
 
@@ -87,10 +135,10 @@ Start the interactive CLI:
 uv run agent-workbench
 ```
 
-Example session:
+Example:
 
 ```text
-Agent Workbench | Local model: gpt-oss:20b
+Agent Workbench | Provider: OpenAI | Model: <openai-model>
 Type /exit or /quit to end the session.
 
 You: Remember the code word cobalt.
@@ -105,21 +153,13 @@ Session ended.
 
 Empty input is ignored. Use `/exit` or `/quit` to end the session.
 
-## Model Configuration
-
-Set `AGENT_WORKBENCH_MODEL` to use another model already available in Ollama:
+Configuration can also be supplied for a single command:
 
 ```bash
-AGENT_WORKBENCH_MODEL=<model-name> uv run agent-workbench
+AGENT_WORKBENCH_PROVIDER=ollama \
+AGENT_WORKBENCH_MODEL=gpt-oss:20b \
+uv run agent-workbench
 ```
-
-Example:
-
-```bash
-AGENT_WORKBENCH_MODEL=<model-name> uv run agent-workbench
-```
-
-When the variable is missing or blank, the application uses `gpt-oss:20b`.
 
 ## Quality Checks
 
@@ -141,16 +181,25 @@ Verify formatting:
 uv run ruff format --check .
 ```
 
+## Security
+
+- API keys are never stored in source code.
+- `.env` and related local environment files are ignored by Git.
+- `.env.example` contains variable names only and no secrets.
+- Existing runtime environment variables are not overwritten by `.env`.
+- Tests use simulated clients and do not make paid API requests.
+
 ## Roadmap
 
 - [x] Connect Python to a local Ollama model
 - [x] Add an interactive command-line interface
 - [x] Preserve multi-turn conversation history
-- [x] Add configurable local model selection
 - [x] Add automated tests and error handling
 - [x] Create a common interface for multiple model providers
 - [x] Move the Ollama integration behind a dedicated provider
-- [ ] Add OpenAI integration
+- [x] Add runtime provider and model selection
+- [x] Add OpenAI Responses API integration
+- [x] Add secure local environment configuration
 - [ ] Add Anthropic integration
 - [ ] Add structured outputs
 - [ ] Implement tool calling

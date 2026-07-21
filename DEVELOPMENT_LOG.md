@@ -263,3 +263,133 @@ The refactoring was validated through:
 
 Add the first cloud-based provider while preserving the provider-independent
 CLI and shared message contract.
+
+
+## 2026-07-21 — OpenAI Provider and Secure Runtime Selection
+
+### Objective
+
+Add the first cloud-based language model provider while preserving the existing
+provider-independent CLI, shared message contract, and local Ollama workflow.
+
+### Implemented
+
+- Added the official OpenAI Python SDK.
+- Implemented `OpenAIProvider` using the OpenAI Responses API.
+- Added runtime selection between Ollama and OpenAI.
+- Added a provider factory responsible for constructing configured providers.
+- Added explicit provider and model validation.
+- Required an explicit model when using the OpenAI provider.
+- Added validation for the `OPENAI_API_KEY` environment variable.
+- Added application-level translation for OpenAI connection, authentication,
+  unavailable-model, rate-limit, and API status errors.
+- Added local `.env` loading through `python-dotenv`.
+- Preserved existing runtime variables by disabling `.env` overrides.
+- Added a public `.env.example` without credentials.
+- Updated `.gitignore` to exclude local environment files.
+- Added automated tests for OpenAI behavior, provider construction,
+  configuration validation, and environment loading.
+
+### Architecture
+
+```text
+Runtime Configuration
+        ↓
+Provider Factory
+        ↓
+ChatProvider
+        ├── OllamaProvider
+        │       ↓
+        │   Ollama Local API
+        │
+        └── OpenAIProvider
+                ↓
+        OpenAI Responses API
+```
+
+The provider factory creates only the provider selected at runtime. OpenAI
+credentials are therefore required only when the OpenAI provider is selected.
+
+### Configuration
+
+```text
+AGENT_WORKBENCH_PROVIDER
+        ↓
+Select Ollama or OpenAI
+
+AGENT_WORKBENCH_MODEL
+        ↓
+Select the provider-specific model
+
+OPENAI_API_KEY
+        ↓
+Authenticate OpenAI requests
+```
+
+Configuration is loaded in this order:
+
+```text
+Runtime Environment
+        ↓
+Local .env File
+        ↓
+Application Defaults
+```
+
+Values already present in the runtime environment are not overwritten by the
+local `.env` file.
+
+### Validation
+
+The implementation was validated through:
+
+- Successful Ruff formatting and static-analysis checks.
+- Twenty-four passing automated tests.
+- Simulated OpenAI Responses API success and failure scenarios.
+- Verification of authentication, connection, unavailable-model, and
+  rate-limit error translation.
+- Verification that unsupported providers are rejected.
+- Verification that OpenAI requires an explicit model and API key.
+- Verification that Ollama remains the default provider.
+- Verification that `.env` does not override runtime environment variables.
+- Verification that the private `.env` file is ignored by Git.
+- A successful real completion through the OpenAI Responses API.
+- Confirmation that the existing Ollama workflow remains available.
+
+### Technical Decisions
+
+- Used the OpenAI Responses API rather than introducing a separate
+  conversation implementation.
+- Injected the OpenAI SDK client into `OpenAIProvider` so provider behavior can
+  be tested without network access or paid requests.
+- Centralized provider construction in a factory to keep the CLI independent
+  of provider-specific initialization.
+- Required explicit OpenAI model selection instead of silently choosing a
+  cloud model with potentially different availability or cost.
+- Kept Ollama as the default provider so the application remains usable
+  locally without cloud credentials.
+- Stored API credentials only in environment variables and ignored local
+  environment files through Git.
+- Used `.env.example` to document required configuration without publishing
+  secrets.
+- Preserved runtime environment precedence to support CI, containers, and
+  future cloud deployment.
+
+### Current Limitations
+
+- Only Ollama and OpenAI are implemented.
+- The provider is selected only at application startup.
+- Responses are not streamed.
+- Generation parameters are not yet configurable.
+- Usage metadata and token consumption are not exposed by the provider
+  abstraction.
+- Provider capabilities are not represented explicitly.
+- Conversation history exists only in memory for the current process.
+- OpenAI integration tests use simulated clients; live API validation remains
+  a manual operation.
+- Logging and structured observability are not implemented.
+
+### Next Milestone
+
+Add Anthropic as a second cloud provider and evaluate whether the shared
+message contract requires provider-specific normalization.
