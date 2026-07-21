@@ -1,6 +1,10 @@
 """Interactive command-line interface for Agent Workbench."""
 
-from agent_workbench.config import get_model_name, get_provider_name
+from agent_workbench.config import (
+    get_model_name,
+    get_provider_name,
+    load_environment,
+)
 from agent_workbench.errors import CompletionError, ConfigurationError
 from agent_workbench.messages import Message
 from agent_workbench.providers.base import ChatProvider
@@ -54,6 +58,8 @@ def run_cli(provider: ChatProvider) -> None:
 
 def main() -> None:
     """Run the CLI using the configured provider and model."""
+
+    load_environment()
 
     try:
         provider_name = get_provider_name()

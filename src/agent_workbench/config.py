@@ -4,6 +4,7 @@ import os
 from typing import Literal, cast
 
 from agent_workbench.errors import ConfigurationError
+from dotenv import load_dotenv
 
 ProviderName = Literal["ollama", "openai"]
 
@@ -14,6 +15,17 @@ PROVIDER_ENV_VAR = "AGENT_WORKBENCH_PROVIDER"
 MODEL_ENV_VAR = "AGENT_WORKBENCH_MODEL"
 
 SUPPORTED_PROVIDERS = {"ollama", "openai"}
+
+
+def load_environment(
+    dotenv_path: str | os.PathLike[str] | None = None,
+) -> None:
+    """Load local environment variables without overriding existing values."""
+
+    load_dotenv(
+        dotenv_path=dotenv_path,
+        override=False,
+    )
 
 
 def get_provider_name() -> ProviderName:

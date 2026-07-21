@@ -1,5 +1,7 @@
 """Tests for Agent Workbench configuration."""
 
+import os
+from pathlib import Path
 import pytest
 
 from agent_workbench.config import (
@@ -9,6 +11,7 @@ from agent_workbench.config import (
     PROVIDER_ENV_VAR,
     get_model_name,
     get_provider_name,
+    load_environment,
 )
 from agent_workbench.errors import ConfigurationError
 
@@ -75,3 +78,41 @@ def test_openai_requires_an_explicit_model(monkeypatch) -> None:
         match="AGENT_WORKBENCH_MODEL is required",
     ):
         get_model_name("openai")
+
+
+def test_environment_file_is_loaded(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """Load variables from a local environment file."""
+
+    environment_file = tmp_path / ".env"
+    environment_file.write_text(
+        "OPENAI_API_KEY=file-api-key\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    load_environment(environment_file)
+
+    assert os.getenv("OPENAI_API_KEY") == "file-api-key"
+
+
+def test_environment_file_does_not_override_existing_variables(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """Preserve variables already defined by the runtime environment."""
+
+    environment_file = tmp_path / ".env"
+    environment_file.write_text(
+        "OPENAI_API_KEY=file-api-key\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("OPENAI_API_KEY", "runtime-api-key")
+
+    load_environment(environment_file)
+
+    assert os.getenv("OPENAI_API_KEY") == "runtime-api-key"
