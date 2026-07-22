@@ -6,6 +6,7 @@ from agent_workbench.agents import (
     AGENT_PROFILES,
     SUPPORTED_AGENT_NAMES,
     get_agent_profile,
+    parse_agent_profile,
 )
 from agent_workbench.errors import ConfigurationError
 
@@ -45,3 +46,84 @@ def test_get_agent_profile_rejects_unknown_profiles() -> None:
         match="Unsupported agent profile 'unknown'",
     ):
         get_agent_profile("unknown")
+
+
+def test_parse_agent_profile_returns_valid_profile() -> None:
+    """Parse a valid profile from TOML content."""
+
+    profile = parse_agent_profile(
+        content="""
+name = "Security Reviewer"
+description = "Reviews application security."
+system_prompt = "You are a security review agent."
+""",
+        source="security-reviewer.toml",
+    )
+
+    assert profile.name == "Security Reviewer"
+    assert profile.description == "Reviews application security."
+    assert profile.system_prompt == "You are a security review agent."
+
+
+def test_parse_agent_profile_rejects_invalid_toml() -> None:
+    """Reject malformed TOML profile content."""
+
+    with pytest.raises(
+        ConfigurationError,
+        match="Invalid TOML",
+    ):
+        parse_agent_profile(
+            content='name = "Broken',
+            source="broken.toml",
+        )
+
+
+def test_parse_agent_profile_rejects_missing_fields() -> None:
+    """Reject profiles without every required field."""
+
+    with pytest.raises(
+        ConfigurationError,
+        match="missing required fields: system_prompt",
+    ):
+        parse_agent_profile(
+            content="""
+name = "Incomplete"
+description = "Missing its system prompt."
+""",
+            source="incomplete.toml",
+        )
+
+
+def test_parse_agent_profile_rejects_blank_fields() -> None:
+    """Reject required fields containing only whitespace."""
+
+    with pytest.raises(
+        ConfigurationError,
+        match="field 'name' must be a non-empty string",
+    ):
+        parse_agent_profile(
+            content="""
+name = "   "
+description = "Invalid profile."
+system_prompt = "Some instructions."
+""",
+            source="blank.toml",
+        )
+
+
+def test_parse_agent_profile_rejects_unsupported_fields() -> None:
+    """Reject unknown fields that may represent configuration mistakes."""
+
+    with pytest.raises(
+        ConfigurationError,
+        match="unsupported fields: temperature",
+    ):
+        parse_agent_profile(
+            content="""
+name = "Unexpected"
+description = "Contains an unsupported field."
+system_prompt = "Some instructions."
+temperature = 0.5
+""",
+            source="unexpected.toml",
+        )
