@@ -116,3 +116,33 @@ def test_environment_file_does_not_override_existing_variables(
     load_environment(environment_file)
 
     assert os.getenv("OPENAI_API_KEY") == "runtime-api-key"
+
+
+def test_get_provider_name_accepts_anthropic(
+    monkeypatch,
+) -> None:
+    """Accept Anthropic as a supported provider."""
+
+    monkeypatch.setenv(
+        PROVIDER_ENV_VAR,
+        " Anthropic ",
+    )
+
+    assert get_provider_name() == "anthropic"
+
+
+def test_get_model_name_requires_explicit_anthropic_model(
+    monkeypatch,
+) -> None:
+    """Require explicit model selection for Anthropic."""
+
+    monkeypatch.delenv(
+        MODEL_ENV_VAR,
+        raising=False,
+    )
+
+    with pytest.raises(
+        ConfigurationError,
+        match=MODEL_ENV_VAR,
+    ):
+        get_model_name("anthropic")

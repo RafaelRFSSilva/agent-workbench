@@ -6,7 +6,7 @@ from typing import Literal, cast
 from agent_workbench.errors import ConfigurationError
 from dotenv import load_dotenv
 
-ProviderName = Literal["ollama", "openai"]
+ProviderName = Literal["anthropic", "ollama", "openai"]
 
 DEFAULT_PROVIDER_NAME: ProviderName = "ollama"
 DEFAULT_MODEL_NAME = "gpt-oss:20b"
@@ -14,7 +14,7 @@ DEFAULT_MODEL_NAME = "gpt-oss:20b"
 PROVIDER_ENV_VAR = "AGENT_WORKBENCH_PROVIDER"
 MODEL_ENV_VAR = "AGENT_WORKBENCH_MODEL"
 
-SUPPORTED_PROVIDERS = {"ollama", "openai"}
+SUPPORTED_PROVIDERS = {"anthropic", "ollama", "openai"}
 
 
 def load_environment(
