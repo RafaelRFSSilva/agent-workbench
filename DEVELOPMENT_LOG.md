@@ -588,3 +588,125 @@ The implementation was validated through:
 
 Introduce structured system prompts and conversation roles before adding tool
 calling and multi-agent orchestration.
+
+## 2026-07-22 — Provider-Independent Chat Requests and System Prompts
+
+### Objective
+
+Introduce a provider-independent request model and allow users to define the
+assistant's role and behavior through a system prompt.
+
+### Implemented
+
+- Added the immutable `ChatRequest` data structure.
+- Separated system instructions from conversation messages.
+- Updated the `ChatProvider` protocol to accept `ChatRequest`.
+- Updated Ollama, OpenAI, and Anthropic providers to translate shared requests
+  into their provider-specific formats.
+- Added Ollama system instructions through a `system` message.
+- Added OpenAI system instructions through the Responses API `instructions`
+  parameter.
+- Added Anthropic system instructions through the Messages API `system`
+  parameter.
+- Updated the interactive CLI to construct provider-independent chat requests.
+- Added the `--system-prompt` command-line argument.
+- Added validation that rejects blank system prompts.
+- Forwarded the system prompt with every completion request in the session.
+- Kept system instructions outside user and assistant conversation history.
+- Updated automated provider and CLI tests for the new request contract.
+
+### Architecture
+
+```text
+Command-Line Configuration
+        ↓
+System Prompt
+        ↓
+Interactive CLI
+        ↓
+ChatRequest
+├── system_prompt
+└── messages
+        ↓
+ChatProvider
+        ├── OllamaProvider
+        │       ↓
+        │   system message
+        │
+        ├── OpenAIProvider
+        │       ↓
+        │   instructions parameter
+        │
+        └── AnthropicProvider
+                ↓
+            system parameter
+```
+
+### Conversation State
+
+The system prompt is configuration rather than conversation history:
+
+```text
+System Prompt
+    └── Defines identity and behavior
+
+Conversation History
+    ├── User message
+    ├── Assistant message
+    ├── User message
+    └── Assistant message
+```
+
+The same system prompt accompanies each request, while only successful user
+and assistant messages are preserved in the session history.
+
+### Validation
+
+The implementation was validated through:
+
+- Successful Ruff formatting and static-analysis checks.
+- Forty-two passing automated tests.
+- Verification that all providers accept the shared `ChatRequest`.
+- Verification that Ollama receives a system message before conversation
+  messages.
+- Verification that OpenAI receives system instructions separately from input
+  messages.
+- Verification that Anthropic receives the dedicated system parameter.
+- Verification that provider errors continue to use `CompletionError`.
+- Verification that blank system prompt arguments are rejected.
+- Verification that the system prompt is forwarded with every request.
+- Verification that system instructions do not enter conversation history.
+- A successful real Ollama completion using a software reviewer identity.
+- Confirmation that the existing provider and model CLI arguments remain
+  functional.
+
+### Technical Decisions
+
+- Represented system instructions separately from the `Message` type because
+  they describe agent configuration rather than conversation history.
+- Removed the `system` role from the shared conversation message contract.
+- Used a provider-independent `ChatRequest` instead of adding provider-specific
+  parameters to the CLI.
+- Kept provider translation inside each provider implementation.
+- Used an immutable, slotted dataclass for `ChatRequest`.
+- Avoided storing the system prompt repeatedly in the in-memory message list.
+- Added system prompts as runtime configuration before introducing persistent
+  agent profiles.
+
+### Current Limitations
+
+- System prompts are supplied as raw command-line text.
+- Reusable agent profiles are not yet implemented.
+- System prompts cannot yet be loaded from dedicated files.
+- Provider-specific generation parameters are not exposed.
+- Responses are not streamed.
+- Conversation history exists only in memory.
+- Tool calling is not implemented.
+- Multiple agents are not yet coordinated by an orchestrator.
+- Logging and structured observability are not implemented.
+
+### Next Milestone
+
+Introduce reusable agent profiles so named roles such as `Planner`,
+`Developer`, `Reviewer`, and `Tester` can define their own system prompts and
+later receive provider, model, and tool configuration.

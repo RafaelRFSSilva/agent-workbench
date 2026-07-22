@@ -29,6 +29,9 @@ Implemented capabilities:
 - Static analysis and formatting with Ruff
 - Provider and model selection through command-line arguments
 - Configuration precedence between CLI arguments, environment variables, and defaults
+- Provider-independent requests through the `ChatRequest` abstraction
+- System prompt configuration through the `--system-prompt` argument
+- Provider-specific translation of system instructions
 
 ## Architecture
 
@@ -178,6 +181,47 @@ When `--provider` is specified, `--model` must also be supplied. This prevents
 a model configured for one provider from being reused accidentally with
 another provider.
 
+## System Prompts
+
+A system prompt defines the assistant's role, behavior, and operating
+instructions for the entire conversation.
+
+Provide one through the command line:
+
+```bash
+uv run agent-workbench \
+  --provider ollama \
+  --model gpt-oss:20b \
+  --system-prompt "You are a strict software reviewer."
+```
+
+System prompts are represented separately from conversation history:
+
+```text
+ChatRequest
+├── system_prompt
+└── messages
+    ├── user
+    └── assistant
+```
+
+Each provider translates the shared request into its native API format:
+
+```text
+ChatRequest.system_prompt
+        ↓
+Provider Adapter
+        ├── Ollama: system message
+        ├── OpenAI: instructions
+        └── Anthropic: system parameter
+```
+
+The system prompt is included with every model request in the session but is
+not stored as a user or assistant conversation message.
+
+This separation provides the foundation for reusable agent identities such as
+`Planner`, `Developer`, `Reviewer`, and `Tester`.
+
 ## Usage
 
 Start the CLI using the configuration stored in `.env`:
@@ -241,6 +285,16 @@ Session ended.
 
 Empty input is ignored. Use `/exit` or `/quit` to end the session.
 
+Use a temporary system prompt without modifying `.env`:
+
+```bash
+uv run agent-workbench \
+  --provider ollama \
+  --model gpt-oss:20b \
+  --system-prompt \
+  "You are a software reviewer. Focus on correctness, security, and maintainability."
+```
+
 ## Quality Checks
 
 Run the automated tests:
@@ -268,6 +322,7 @@ uv run ruff format --check .
 - `.env.example` contains variable names only and no secrets.
 - Existing runtime environment variables are not overwritten by `.env`.
 - Automated tests use simulated SDK clients and do not make paid API requests.
+- System prompts are runtime instructions and are not persisted automatically.
 
 ## Roadmap
 
@@ -282,6 +337,8 @@ uv run ruff format --check .
 - [x] Add secure local environment configuration
 - [x] Add Anthropic Messages API integration
 - [x] Add command-line provider and model selection
+- [x] Add a provider-independent chat request abstraction
+- [x] Add system prompt configuration
 - [ ] Add structured outputs
 - [ ] Implement tool calling
 - [ ] Build a local RAG pipeline
