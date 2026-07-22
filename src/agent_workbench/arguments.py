@@ -20,6 +20,7 @@ class CLIArguments:
 
     provider_name: ProviderName | None
     model_name: str | None
+    system_prompt: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,6 +29,7 @@ class RuntimeConfiguration:
 
     provider_name: ProviderName
     model_name: str
+    system_prompt: str | None = None
 
 
 def _non_empty_model_name(value: str) -> str:
@@ -39,6 +41,17 @@ def _non_empty_model_name(value: str) -> str:
         raise ArgumentTypeError("model name must not be blank")
 
     return model_name
+
+
+def _non_empty_system_prompt(value: str) -> str:
+    """Return a normalized system prompt or reject a blank value."""
+
+    system_prompt = value.strip()
+
+    if not system_prompt:
+        raise ArgumentTypeError("system prompt must not be blank")
+
+    return system_prompt
 
 
 def parse_cli_arguments(
@@ -64,6 +77,11 @@ def parse_cli_arguments(
         help="Provider-specific model name.",
     )
 
+    parser.add_argument(
+        "--system-prompt",
+        type=_non_empty_system_prompt,
+        help="Instructions that define the assistant's role and behavior.",
+    )
     parsed_arguments = parser.parse_args(argv)
 
     provider_name = (
@@ -75,6 +93,7 @@ def parse_cli_arguments(
     return CLIArguments(
         provider_name=provider_name,
         model_name=parsed_arguments.model,
+        system_prompt=parsed_arguments.system_prompt,
     )
 
 
@@ -92,4 +111,5 @@ def resolve_runtime_configuration(
     return RuntimeConfiguration(
         provider_name=provider_name,
         model_name=model_name,
+        system_prompt=arguments.system_prompt,
     )

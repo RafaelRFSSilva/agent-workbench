@@ -17,11 +17,14 @@ class FakeProvider:
     ) -> None:
         self._outcomes = iter(outcomes or [])
         self.calls: list[list[Message]] = []
+        self.system_prompts: list[str | None] = []
 
     def complete(self, request: ChatRequest) -> str:
         """Return the next configured response or error."""
 
         self.calls.append([message.copy() for message in request.messages])
+        self.system_prompts.append(request.system_prompt)
+
         outcome = next(self._outcomes)
 
         if isinstance(outcome, CompletionError):
@@ -142,3 +145,44 @@ def test_cli_recovers_after_provider_error(monkeypatch, capsys) -> None:
     ]
     assert "Error: Temporary provider failure." in captured.out
     assert "Assistant: recovered" in captured.out
+
+
+def test_system_prompt_is_forwarded_without_entering_history(
+    monkeypatch,
+) -> None:
+    """Forward the system prompt separately from conversation history."""
+
+    user_inputs = iter(
+        [
+            "First request",
+            "Second request",
+            "/exit",
+        ]
+    )
+    provider = FakeProvider(
+        [
+            "first response",
+            "second response",
+        ]
+    )
+
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda _: next(user_inputs),
+    )
+
+    run_cli(
+        provider,
+        system_prompt="You are a strict software reviewer.",
+    )
+
+    assert provider.system_prompts == [
+        "You are a strict software reviewer.",
+        "You are a strict software reviewer.",
+    ]
+
+    assert all(
+        message["role"] != "system"
+        for request_messages in provider.calls
+        for message in request_messages
+    )

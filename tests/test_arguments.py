@@ -25,6 +25,7 @@ def test_parse_cli_arguments_accepts_provider_and_model() -> None:
 
     assert arguments.provider_name == "ollama"
     assert arguments.model_name == "gpt-oss:20b"
+    assert arguments.system_prompt is None
 
 
 def test_parse_cli_arguments_rejects_unsupported_provider() -> None:
@@ -118,3 +119,34 @@ def test_environment_is_used_without_cli_arguments(
 
     assert configuration.provider_name == "anthropic"
     assert configuration.model_name == "claude-test-model"
+
+
+def test_parse_cli_arguments_accepts_system_prompt() -> None:
+    """Parse and normalize an explicit system prompt."""
+
+    arguments = parse_cli_arguments(
+        [
+            "--provider",
+            "ollama",
+            "--model",
+            "gpt-oss:20b",
+            "--system-prompt",
+            "  You are a strict software reviewer.  ",
+        ]
+    )
+
+    assert arguments.system_prompt == "You are a strict software reviewer."
+
+
+def test_parse_cli_arguments_rejects_blank_system_prompt() -> None:
+    """Reject system prompts containing only whitespace."""
+
+    with pytest.raises(SystemExit) as exc_info:
+        parse_cli_arguments(
+            [
+                "--system-prompt",
+                "   ",
+            ]
+        )
+
+    assert exc_info.value.code == 2
