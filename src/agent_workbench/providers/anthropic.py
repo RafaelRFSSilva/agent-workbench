@@ -12,7 +12,7 @@ from anthropic import (
 )
 
 from agent_workbench.errors import CompletionError
-from agent_workbench.messages import Message
+from agent_workbench.messages import ChatRequest, Message
 
 
 class AnthropicContentBlock(Protocol):
@@ -37,8 +37,11 @@ class AnthropicMessagesResource(Protocol):
         model: str,
         max_tokens: int,
         messages: list[Message],
+        system: str | None = None,
     ) -> AnthropicResponse:
         """Create a message completion."""
+
+        ...
 
 
 class AnthropicClient(Protocol):
@@ -61,23 +64,31 @@ class AnthropicProvider:
 
         return "Anthropic"
 
-    def complete(self, messages: list[Message]) -> str:
-        """Return an assistant reply for the supplied conversation."""
+    def complete(self, request: ChatRequest) -> str:
+        """Return an assistant reply for the supplied chat request."""
 
-        request_messages = [
+        request_messages: list[Message] = [
             {
                 "role": message["role"],
                 "content": message["content"],
             }
-            for message in messages
+            for message in request.messages
         ]
 
         try:
-            response = self.client.messages.create(
-                model=self.model_name,
-                max_tokens=self.max_tokens,
-                messages=request_messages,
-            )
+            if request.system_prompt is None:
+                response = self.client.messages.create(
+                    model=self.model_name,
+                    max_tokens=self.max_tokens,
+                    messages=request_messages,
+                )
+            else:
+                response = self.client.messages.create(
+                    model=self.model_name,
+                    max_tokens=self.max_tokens,
+                    messages=request_messages,
+                    system=request.system_prompt,
+                )
         except APIConnectionError as exc:
             raise CompletionError(
                 "Unable to connect to Anthropic. Check the network connection."

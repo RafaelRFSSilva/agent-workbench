@@ -2,7 +2,7 @@
 
 from typing import Protocol
 
-from agent_workbench.messages import Message
+from agent_workbench.messages import ChatRequest
 
 
 class ChatProvider(Protocol):
@@ -20,7 +20,7 @@ class ChatProvider(Protocol):
 
         ...
 
-    def complete(self, messages: list[Message]) -> str:
-        """Generate a response for the supplied conversation."""
+    def complete(self, request: ChatRequest) -> str:
+        """Generate a response for the supplied chat request."""
 
         ...

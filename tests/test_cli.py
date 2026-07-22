@@ -2,7 +2,7 @@
 
 from agent_workbench.cli import run_cli
 from agent_workbench.errors import CompletionError
-from agent_workbench.messages import Message
+from agent_workbench.messages import ChatRequest, Message
 
 
 class FakeProvider:
@@ -18,10 +18,10 @@ class FakeProvider:
         self._outcomes = iter(outcomes or [])
         self.calls: list[list[Message]] = []
 
-    def complete(self, messages: list[Message]) -> str:
+    def complete(self, request: ChatRequest) -> str:
         """Return the next configured response or error."""
 
-        self.calls.append([message.copy() for message in messages])
+        self.calls.append([message.copy() for message in request.messages])
         outcome = next(self._outcomes)
 
         if isinstance(outcome, CompletionError):

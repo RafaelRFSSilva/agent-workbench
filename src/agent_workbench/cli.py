@@ -9,7 +9,7 @@ from agent_workbench.config import (
     load_environment,
 )
 from agent_workbench.errors import CompletionError, ConfigurationError
-from agent_workbench.messages import Message
+from agent_workbench.messages import ChatRequest, Message
 from agent_workbench.providers.base import ChatProvider
 from agent_workbench.providers.factory import create_provider
 
@@ -45,7 +45,7 @@ def run_cli(provider: ChatProvider) -> None:
         request_messages = [*messages, user_message]
 
         try:
-            assistant_reply = provider.complete(request_messages)
+            assistant_reply = provider.complete(ChatRequest(messages=request_messages))
         except CompletionError as exc:
             print(f"Error: {exc}\n")
             continue
