@@ -1,8 +1,11 @@
 """Interactive command-line interface for Agent Workbench."""
 
+from collections.abc import Sequence
+from agent_workbench.arguments import (
+    parse_cli_arguments,
+    resolve_runtime_configuration,
+)
 from agent_workbench.config import (
-    get_model_name,
-    get_provider_name,
     load_environment,
 )
 from agent_workbench.errors import CompletionError, ConfigurationError
@@ -56,15 +59,20 @@ def run_cli(provider: ChatProvider) -> None:
         print(f"Assistant: {assistant_reply}\n")
 
 
-def main() -> None:
-    """Run the CLI using the configured provider and model."""
+def main(
+    argv: Sequence[str] | None = None,
+) -> None:
+    """Run the CLI using the resolved provider and model."""
 
     load_environment()
+    arguments = parse_cli_arguments(argv)
 
     try:
-        provider_name = get_provider_name()
-        model_name = get_model_name(provider_name)
-        provider = create_provider(provider_name, model_name)
+        runtime_configuration = resolve_runtime_configuration(arguments)
+        provider = create_provider(
+            runtime_configuration.provider_name,
+            runtime_configuration.model_name,
+        )
     except ConfigurationError as exc:
         print(f"Configuration error: {exc}")
         return
