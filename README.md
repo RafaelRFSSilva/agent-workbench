@@ -27,6 +27,8 @@ Implemented capabilities:
 - Automated tests for CLI, configuration, provider construction, and API behavior
 - Continuous integration with GitHub Actions
 - Static analysis and formatting with Ruff
+- Provider and model selection through command-line arguments
+- Configuration precedence between CLI arguments, environment variables, and defaults
 
 ## Architecture
 
@@ -152,18 +154,79 @@ AGENT_WORKBENCH_MODEL=<anthropic-model>
 The API key must remain only in the private `.env` file or another secure
 runtime environment.
 
+## Runtime Configuration
+
+Provider and model configuration can be supplied through command-line
+arguments or environment variables.
+
+The application uses the following precedence:
+
+```text
+Command-Line Arguments
+        ↓
+Runtime Environment Variables
+        ↓
+Local .env File
+        ↓
+Application Defaults
+```
+
+Command-line arguments therefore allow temporary provider changes without
+editing `.env`.
+
+When `--provider` is specified, `--model` must also be supplied. This prevents
+a model configured for one provider from being reused accidentally with
+another provider.
+
 ## Usage
 
-Start the interactive CLI:
+Start the CLI using the configuration stored in `.env`:
 
 ```bash
 uv run agent-workbench
 ```
 
-Example:
+Display the available command-line options:
+
+```bash
+uv run agent-workbench --help
+```
+
+Use Ollama without changing `.env`:
+
+```bash
+uv run agent-workbench \
+  --provider ollama \
+  --model gpt-oss:20b
+```
+
+Use OpenAI:
+
+```bash
+uv run agent-workbench \
+  --provider openai \
+  --model <openai-model>
+```
+
+Use Anthropic:
+
+```bash
+uv run agent-workbench \
+  --provider anthropic \
+  --model <anthropic-model>
+```
+
+A model can also be overridden while keeping the provider configured through
+the environment:
+
+```bash
+uv run agent-workbench --model <provider-specific-model>
+```
+
+Example session:
 
 ```text
-Agent Workbench | Provider: OpenAI | Model: <openai-model>
+Agent Workbench | Provider: Ollama | Model: gpt-oss:20b
 Type /exit or /quit to end the session.
 
 You: Remember the code word cobalt.
@@ -177,14 +240,6 @@ Session ended.
 ```
 
 Empty input is ignored. Use `/exit` or `/quit` to end the session.
-
-Configuration can also be supplied for a single command:
-
-```bash
-AGENT_WORKBENCH_PROVIDER=ollama \
-AGENT_WORKBENCH_MODEL=gpt-oss:20b \
-uv run agent-workbench
-```
 
 ## Quality Checks
 
@@ -226,6 +281,7 @@ uv run ruff format --check .
 - [x] Add OpenAI Responses API integration
 - [x] Add secure local environment configuration
 - [x] Add Anthropic Messages API integration
+- [x] Add command-line provider and model selection
 - [ ] Add structured outputs
 - [ ] Implement tool calling
 - [ ] Build a local RAG pipeline

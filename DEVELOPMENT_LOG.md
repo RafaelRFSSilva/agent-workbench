@@ -492,3 +492,99 @@ The implementation was validated through:
 
 Add command-line arguments for provider and model selection so users can switch
 between Ollama, OpenAI, and Anthropic without editing `.env`.
+
+## 2026-07-22 — Command-Line Runtime Configuration
+
+### Objective
+
+Allow users to select a provider and model for each application execution
+without editing the local `.env` file.
+
+### Implemented
+
+- Added command-line parsing through Python's `argparse`.
+- Added the optional `--provider` argument.
+- Added the optional `--model` argument.
+- Restricted provider values to Ollama, OpenAI, and Anthropic.
+- Added validation that rejects blank model arguments.
+- Added immutable data structures for parsed arguments and resolved runtime
+  configuration.
+- Added explicit configuration precedence between command-line arguments,
+  environment variables, `.env`, and application defaults.
+- Required `--model` whenever `--provider` is supplied.
+- Updated the CLI entry point to resolve configuration before constructing the
+  selected provider.
+- Added automated tests for parsing, validation, environment fallback, and CLI
+  precedence.
+
+### Configuration Precedence
+
+```text
+Command-Line Arguments
+        ↓
+Runtime Environment Variables
+        ↓
+Local .env File
+        ↓
+Application Defaults
+```
+
+For example, a local `.env` can keep Anthropic as its configured provider while
+a single execution temporarily selects Ollama:
+
+```bash
+uv run agent-workbench \
+  --provider ollama \
+  --model gpt-oss:20b
+```
+
+The `.env` file is not modified by this command.
+
+### Validation
+
+The implementation was validated through:
+
+- Successful Ruff formatting and static-analysis checks.
+- Thirty-nine passing automated tests.
+- Verification that supported provider names are displayed in `--help`.
+- Verification that unsupported providers are rejected by `argparse`.
+- Verification that blank model values are rejected.
+- Verification that command-line arguments override environment configuration.
+- Verification that environment configuration is used when CLI arguments are
+  absent.
+- Verification that a model can be overridden while retaining the configured
+  provider.
+- Verification that `--provider` without `--model` produces a clear
+  configuration error.
+- A successful Ollama execution while Anthropic remained configured in
+  `.env`.
+
+### Technical Decisions
+
+- Used the Python standard-library `argparse` module instead of introducing an
+  additional CLI dependency.
+- Separated argument parsing from runtime configuration resolution so each
+  responsibility can be tested independently.
+- Represented parsed and resolved configuration using immutable, slotted
+  dataclasses.
+- Required a model whenever the provider is overridden to prevent
+  provider-model mismatches.
+- Preserved environment configuration as the fallback so existing `.env`, CI,
+  container, and cloud workflows continue to work.
+- Kept provider construction inside the existing provider factory.
+
+### Current Limitations
+
+- The CLI supports only provider and model overrides.
+- Provider-specific generation parameters are not exposed.
+- API keys cannot be supplied through command-line arguments.
+- Responses are not streamed.
+- Configuration profiles are not implemented.
+- Conversation history exists only in memory.
+- Multiple agents are not yet coordinated by an orchestrator.
+- Logging and structured observability are not implemented.
+
+### Next Milestone
+
+Introduce structured system prompts and conversation roles before adding tool
+calling and multi-agent orchestration.
