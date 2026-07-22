@@ -9,6 +9,7 @@ from agent_workbench.errors import ConfigurationError
 from agent_workbench.providers.factory import create_provider
 from agent_workbench.providers.ollama import OllamaProvider
 from agent_workbench.providers.openai import OpenAIProvider
+from agent_workbench.providers.anthropic import AnthropicProvider
 
 
 def test_create_ollama_provider() -> None:
@@ -58,4 +59,52 @@ def test_create_openai_provider(monkeypatch) -> None:
     assert isinstance(provider, OpenAIProvider)
     assert provider.model_name == "cloud-test-model"
     assert provider.client is fake_client
+    client_factory.assert_called_once_with()
+
+
+def test_create_anthropic_provider_requires_api_key(
+    monkeypatch,
+) -> None:
+    """Reject Anthropic configuration without an API key."""
+
+    monkeypatch.delenv(
+        "ANTHROPIC_API_KEY",
+        raising=False,
+    )
+
+    with pytest.raises(
+        ConfigurationError,
+        match="ANTHROPIC_API_KEY",
+    ):
+        create_provider(
+            "anthropic",
+            "claude-test",
+        )
+
+
+def test_create_anthropic_provider(
+    monkeypatch,
+) -> None:
+    """Create Anthropic with the configured SDK client."""
+
+    client = SimpleNamespace()
+    client_factory = Mock(return_value=client)
+
+    monkeypatch.setenv(
+        "ANTHROPIC_API_KEY",
+        "test-api-key",
+    )
+    monkeypatch.setattr(
+        "agent_workbench.providers.factory.Anthropic",
+        client_factory,
+    )
+
+    provider = create_provider(
+        "anthropic",
+        "claude-test",
+    )
+
+    assert isinstance(provider, AnthropicProvider)
+    assert provider.model_name == "claude-test"
+    assert provider.client is client
     client_factory.assert_called_once_with()

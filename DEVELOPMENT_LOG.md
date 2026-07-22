@@ -393,3 +393,102 @@ The implementation was validated through:
 
 Add Anthropic as a second cloud provider and evaluate whether the shared
 message contract requires provider-specific normalization.
+
+## 2026-07-22 — Anthropic Provider Integration
+
+### Objective
+
+Add Anthropic as a second cloud-based language model provider while preserving
+the provider-independent CLI, the local Ollama workflow, and the existing
+OpenAI integration.
+
+### Implemented
+
+- Added the official Anthropic Python SDK.
+- Implemented `AnthropicProvider` using the Anthropic Messages API.
+- Added Anthropic to runtime provider selection.
+- Added Anthropic provider construction through the shared provider factory.
+- Required explicit Anthropic model configuration.
+- Added validation for the `ANTHROPIC_API_KEY` environment variable.
+- Added application-level translation for connection, authentication,
+  unavailable-model, rate-limit, and generic API status errors.
+- Added support for extracting and concatenating text content blocks from
+  Anthropic responses.
+- Added configurable `max_tokens` to the provider implementation.
+- Updated `.env.example` with the Anthropic API key variable.
+- Added automated tests for provider behavior, configuration, and factory
+  construction.
+
+### Architecture
+
+```text
+Runtime Configuration
+        ↓
+Provider Factory
+        ↓
+ChatProvider
+        ├── OllamaProvider
+        │       ↓
+        │   Ollama Local API
+        │
+        ├── OpenAIProvider
+        │       ↓
+        │   OpenAI Responses API
+        │
+        └── AnthropicProvider
+                ↓
+        Anthropic Messages API
+```
+
+### Validation
+
+The implementation was validated through:
+
+- Successful Ruff formatting and static-analysis checks.
+- Thirty-three passing automated tests.
+- Simulated Anthropic success and failure scenarios.
+- Verification that text response blocks are concatenated correctly.
+- Verification that non-text content blocks are ignored.
+- Verification of connection, authentication, unavailable-model, and
+  rate-limit error translation.
+- Verification that Anthropic requires an explicit model and API key.
+- Verification that no API request is made when the API key is missing.
+- A successful direct request through the Anthropic Python SDK.
+- A successful real completion through `AnthropicProvider`.
+- Confirmation that the private `.env` file remains excluded from Git.
+- Confirmation that the existing Ollama and OpenAI providers remain available.
+
+### Technical Decisions
+
+- Used the Anthropic Messages API as the provider-specific completion
+  interface.
+- Injected the Anthropic SDK client into `AnthropicProvider` so automated tests
+  remain deterministic and do not make paid network requests.
+- Kept Anthropic response parsing inside the provider implementation because
+  the Messages API returns structured content blocks.
+- Ignored non-text blocks until tool calling is represented in the shared
+  provider contract.
+- Made `max_tokens` a provider property because it is required by the
+  Anthropic Messages API.
+- Required explicit model selection instead of choosing a cloud model
+  automatically.
+- Kept Ollama as the default provider so the project remains usable without
+  cloud credentials or API costs.
+
+### Current Limitations
+
+- Provider and model selection rely on environment variables rather than
+  command-line arguments.
+- Responses are not streamed.
+- System prompts are not represented separately.
+- Usage metadata and token consumption are not exposed.
+- Generation parameters are not managed through a shared configuration model.
+- Tool-use content blocks are currently ignored.
+- Conversation history exists only in memory for the current process.
+- Logging and structured observability are not implemented.
+- Multiple agents are not yet coordinated by an orchestrator.
+
+### Next Milestone
+
+Add command-line arguments for provider and model selection so users can switch
+between Ollama, OpenAI, and Anthropic without editing `.env`.

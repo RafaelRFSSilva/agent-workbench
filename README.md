@@ -19,6 +19,7 @@ Implemented capabilities:
 - Provider-independent integration through the `ChatProvider` protocol
 - Local inference through `OllamaProvider`
 - Cloud inference through `OpenAIProvider`
+- Cloud inference through `AnthropicProvider`
 - Runtime provider and model selection
 - Local configuration through environment variables
 - Secure `.env` loading without overriding runtime variables
@@ -41,9 +42,13 @@ ChatProvider Protocol
   │       ↓
   │   Ollama Local API
   │
-  └── OpenAIProvider
+  ├── OpenAIProvider
+  │       ↓
+  │   OpenAI Responses API
+  │
+  └── AnthropicProvider
           ↓
-      OpenAI Responses API
+      Anthropic Messages API
 ```
 
 The CLI depends only on the `ChatProvider` protocol. Provider-specific clients,
@@ -72,6 +77,13 @@ deterministic test doubles.
 - An API key with access to the Responses API
 - Available API credit
 - An explicitly configured OpenAI model
+
+### Anthropic provider
+
+- An Anthropic Console workspace
+- An API key with access to the Messages API
+- Available API credit
+- An explicitly configured Anthropic model
 
 ## Setup
 
@@ -126,6 +138,19 @@ The API key must remain only in the private `.env` file or another secure
 runtime environment.
 
 Runtime environment variables take precedence over values loaded from `.env`.
+
+## Anthropic Configuration
+
+Configure the Anthropic provider in `.env`:
+
+```dotenv
+ANTHROPIC_API_KEY=<your-api-key>
+AGENT_WORKBENCH_PROVIDER=anthropic
+AGENT_WORKBENCH_MODEL=<anthropic-model>
+```
+
+The API key must remain only in the private `.env` file or another secure
+runtime environment.
 
 ## Usage
 
@@ -187,7 +212,7 @@ uv run ruff format --check .
 - `.env` and related local environment files are ignored by Git.
 - `.env.example` contains variable names only and no secrets.
 - Existing runtime environment variables are not overwritten by `.env`.
-- Tests use simulated clients and do not make paid API requests.
+- Automated tests use simulated SDK clients and do not make paid API requests.
 
 ## Roadmap
 
@@ -200,7 +225,7 @@ uv run ruff format --check .
 - [x] Add runtime provider and model selection
 - [x] Add OpenAI Responses API integration
 - [x] Add secure local environment configuration
-- [ ] Add Anthropic integration
+- [x] Add Anthropic Messages API integration
 - [ ] Add structured outputs
 - [ ] Implement tool calling
 - [ ] Build a local RAG pipeline
