@@ -9,14 +9,17 @@ from agent_workbench.config import (
     load_environment,
 )
 from agent_workbench.errors import CompletionError, ConfigurationError
-from agent_workbench.messages import Message
+from agent_workbench.messages import ChatRequest, Message
 from agent_workbench.providers.base import ChatProvider
 from agent_workbench.providers.factory import create_provider
 
 EXIT_COMMANDS = {"/exit", "/quit"}
 
 
-def run_cli(provider: ChatProvider) -> None:
+def run_cli(
+    provider: ChatProvider,
+    system_prompt: str | None = None,
+) -> None:
     """Run an interactive conversation using the provided model provider."""
 
     messages: list[Message] = []
@@ -45,7 +48,12 @@ def run_cli(provider: ChatProvider) -> None:
         request_messages = [*messages, user_message]
 
         try:
-            assistant_reply = provider.complete(request_messages)
+            assistant_reply = provider.complete(
+                ChatRequest(
+                    messages=request_messages,
+                    system_prompt=system_prompt,
+                )
+            )
         except CompletionError as exc:
             print(f"Error: {exc}\n")
             continue
@@ -77,7 +85,10 @@ def main(
         print(f"Configuration error: {exc}")
         return
 
-    run_cli(provider)
+    run_cli(
+        provider,
+        system_prompt=runtime_configuration.system_prompt,
+    )
 
 
 if __name__ == "__main__":

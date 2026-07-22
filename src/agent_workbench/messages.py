@@ -1,10 +1,19 @@
-"""Message types shared across Agent Workbench."""
+"""Message and request types shared across Agent Workbench."""
 
+from dataclasses import dataclass
 from typing import Literal, TypedDict
 
 
 class Message(TypedDict):
-    """Represent a message exchanged with a language model."""
+    """Represent a conversation message exchanged with a language model."""
 
-    role: Literal["system", "user", "assistant"]
+    role: Literal["user", "assistant"]
     content: str
+
+
+@dataclass(frozen=True, slots=True)
+class ChatRequest:
+    """Represent a provider-independent chat completion request."""
+
+    messages: list[Message]
+    system_prompt: str | None = None

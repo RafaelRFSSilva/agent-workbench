@@ -8,7 +8,7 @@ import pytest
 from openai import APIConnectionError, APIStatusError
 
 from agent_workbench.errors import CompletionError
-from agent_workbench.messages import Message
+from agent_workbench.messages import ChatRequest, Message
 from agent_workbench.providers.openai import OpenAIProvider
 
 
@@ -70,13 +70,18 @@ def test_provider_returns_response_text() -> None:
         client=client,
     )
 
-    result = provider.complete(messages)
+    request = ChatRequest(
+        messages=messages,
+        system_prompt="You are a software reviewer.",
+    )
+    result = provider.complete(request)
 
     assert provider.name == "OpenAI"
     assert result == "OpenAI provider working"
     create_mock.assert_called_once_with(
         model="test-model",
         input=messages,
+        instructions="You are a software reviewer.",
     )
 
 
@@ -98,7 +103,7 @@ def test_connection_error_is_translated() -> None:
         CompletionError,
         match="Unable to connect to OpenAI",
     ):
-        provider.complete([])
+        provider.complete(ChatRequest(messages=[]))
 
 
 def test_authentication_error_is_translated() -> None:
@@ -118,7 +123,7 @@ def test_authentication_error_is_translated() -> None:
         CompletionError,
         match="OpenAI authentication failed",
     ):
-        provider.complete([])
+        provider.complete(ChatRequest(messages=[]))
 
 
 def test_missing_model_error_is_translated() -> None:
@@ -138,7 +143,7 @@ def test_missing_model_error_is_translated() -> None:
         CompletionError,
         match="Model 'missing-model' is not available through OpenAI",
     ):
-        provider.complete([])
+        provider.complete(ChatRequest(messages=[]))
 
 
 def test_rate_limit_error_is_translated() -> None:
@@ -158,4 +163,4 @@ def test_rate_limit_error_is_translated() -> None:
         CompletionError,
         match="rate limit or account quota was exceeded",
     ):
-        provider.complete([])
+        provider.complete(ChatRequest(messages=[]))

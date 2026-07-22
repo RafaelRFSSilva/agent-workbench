@@ -6,7 +6,7 @@ from typing import Protocol
 from openai import APIConnectionError, APIStatusError
 
 from agent_workbench.errors import CompletionError
-from agent_workbench.messages import Message
+from agent_workbench.messages import ChatRequest, Message
 
 
 class OpenAIResponse(Protocol):
@@ -23,6 +23,7 @@ class OpenAIResponsesResource(Protocol):
         *,
         model: str,
         input: list[Message],
+        instructions: str | None = None,
     ) -> OpenAIResponse:
         """Create a model response."""
 
@@ -48,7 +49,7 @@ class OpenAIProvider:
 
         return "OpenAI"
 
-    def complete(self, messages: list[Message]) -> str:
+    def complete(self, request: ChatRequest) -> str:
         """Generate a response using the configured OpenAI model."""
 
         input_messages: list[Message] = [
@@ -56,14 +57,21 @@ class OpenAIProvider:
                 "role": message["role"],
                 "content": message["content"],
             }
-            for message in messages
+            for message in request.messages
         ]
 
         try:
-            response = self.client.responses.create(
-                model=self.model_name,
-                input=input_messages,
-            )
+            if request.system_prompt is None:
+                response = self.client.responses.create(
+                    model=self.model_name,
+                    input=input_messages,
+                )
+            else:
+                response = self.client.responses.create(
+                    model=self.model_name,
+                    input=input_messages,
+                    instructions=request.system_prompt,
+                )
         except APIConnectionError as exc:
             raise CompletionError(
                 "Unable to connect to OpenAI. Check the network connection."

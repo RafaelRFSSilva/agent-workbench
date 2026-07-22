@@ -13,6 +13,7 @@ from anthropic import (
 )
 
 from agent_workbench.errors import CompletionError
+from agent_workbench.messages import ChatRequest
 from agent_workbench.providers.anthropic import AnthropicProvider
 
 
@@ -43,13 +44,18 @@ def test_complete_returns_concatenated_text_blocks() -> None:
         }
     ]
 
-    result = provider.complete(messages)
+    request = ChatRequest(
+        messages=messages,
+        system_prompt="You are a software reviewer.",
+    )
+    result = provider.complete(request)
 
     assert result == "Hello world"
     create.assert_called_once_with(
         model="claude-test",
         max_tokens=256,
         messages=messages,
+        system="You are a software reviewer.",
     )
 
 
@@ -75,7 +81,7 @@ def test_complete_translates_connection_errors() -> None:
         CompletionError,
         match="Unable to connect to Anthropic",
     ):
-        provider.complete([])
+        provider.complete(ChatRequest(messages=[]))
 
 
 def test_complete_translates_authentication_errors() -> None:
@@ -104,7 +110,7 @@ def test_complete_translates_authentication_errors() -> None:
         CompletionError,
         match="authentication failed",
     ):
-        provider.complete([])
+        provider.complete(ChatRequest(messages=[]))
 
 
 def test_complete_translates_missing_model_errors() -> None:
@@ -133,7 +139,7 @@ def test_complete_translates_missing_model_errors() -> None:
         CompletionError,
         match="Model 'claude-test' is not available through Anthropic",
     ):
-        provider.complete([])
+        provider.complete(ChatRequest(messages=[]))
 
 
 def test_complete_translates_rate_limit_errors() -> None:
@@ -162,4 +168,4 @@ def test_complete_translates_rate_limit_errors() -> None:
         CompletionError,
         match="rate limit or account quota",
     ):
-        provider.complete([])
+        provider.complete(ChatRequest(messages=[]))

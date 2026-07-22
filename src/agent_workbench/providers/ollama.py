@@ -1,11 +1,19 @@
 """Ollama provider implementation."""
 
 from dataclasses import dataclass
+from typing import Literal, TypedDict
 
 from ollama import ResponseError, chat
 
 from agent_workbench.errors import CompletionError
-from agent_workbench.messages import Message
+from agent_workbench.messages import ChatRequest
+
+
+class OllamaMessage(TypedDict):
+    """Represent a message accepted by the Ollama chat API."""
+
+    role: Literal["system", "user", "assistant"]
+    content: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,13 +28,31 @@ class OllamaProvider:
 
         return "Ollama"
 
-    def complete(self, messages: list[Message]) -> str:
+    def complete(self, request: ChatRequest) -> str:
         """Generate a response using the configured Ollama model."""
+
+        request_messages: list[OllamaMessage] = []
+
+        if request.system_prompt is not None:
+            request_messages.append(
+                {
+                    "role": "system",
+                    "content": request.system_prompt,
+                }
+            )
+
+        for message in request.messages:
+            request_messages.append(
+                {
+                    "role": message["role"],
+                    "content": message["content"],
+                }
+            )
 
         try:
             response = chat(
                 model=self.model_name,
-                messages=messages,
+                messages=request_messages,
                 stream=False,
             )
         except ConnectionError as exc:
