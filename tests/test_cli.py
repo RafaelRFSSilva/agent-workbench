@@ -3,6 +3,7 @@
 from agent_workbench.cli import run_cli
 from agent_workbench.errors import CompletionError
 from agent_workbench.messages import ChatRequest, Message
+from agent_workbench.agents import get_agent_profile
 
 
 class FakeProvider:
@@ -186,3 +187,30 @@ def test_system_prompt_is_forwarded_without_entering_history(
         for request_messages in provider.calls
         for message in request_messages
     )
+
+
+def test_agent_profile_is_displayed(
+    monkeypatch,
+    capsys,
+) -> None:
+    """Display the active agent identity when the session starts."""
+
+    user_inputs = iter(["/exit"])
+    provider = FakeProvider()
+    agent_profile = get_agent_profile("reviewer")
+
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda _: next(user_inputs),
+    )
+
+    run_cli(
+        provider,
+        system_prompt=agent_profile.system_prompt,
+        agent_profile=agent_profile,
+    )
+
+    captured = capsys.readouterr()
+
+    assert "Agent: Reviewer" in captured.out
+    assert agent_profile.description in captured.out
