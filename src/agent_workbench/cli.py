@@ -12,6 +12,7 @@ from agent_workbench.errors import CompletionError, ConfigurationError
 from agent_workbench.messages import ChatRequest, Message
 from agent_workbench.providers.base import ChatProvider
 from agent_workbench.providers.factory import create_provider
+from agent_workbench.agents import AgentProfile
 
 EXIT_COMMANDS = {"/exit", "/quit"}
 
@@ -19,13 +20,25 @@ EXIT_COMMANDS = {"/exit", "/quit"}
 def run_cli(
     provider: ChatProvider,
     system_prompt: str | None = None,
+    agent_profile: AgentProfile | None = None,
 ) -> None:
     """Run an interactive conversation using the provided model provider."""
 
     messages: list[Message] = []
 
-    print(f"Agent Workbench | Provider: {provider.name} | Model: {provider.model_name}")
+    header = (
+        f"Agent Workbench | Provider: {provider.name} | Model: {provider.model_name}"
+    )
+
+    if agent_profile is not None:
+        header += f" | Agent: {agent_profile.name}"
+
+    print(header)
     print("Type /exit or /quit to end the session.\n")
+    if agent_profile is not None:
+        print(f"Role: {agent_profile.description}")
+
+    print()
 
     while True:
         try:
@@ -88,6 +101,7 @@ def main(
     run_cli(
         provider,
         system_prompt=runtime_configuration.system_prompt,
+        agent_profile=runtime_configuration.agent_profile,
     )
 
 

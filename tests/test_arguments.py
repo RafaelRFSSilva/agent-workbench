@@ -150,3 +150,68 @@ def test_parse_cli_arguments_rejects_blank_system_prompt() -> None:
         )
 
     assert exc_info.value.code == 2
+
+
+def test_parse_cli_arguments_accepts_agent_profile() -> None:
+    """Parse a reusable agent profile."""
+
+    arguments = parse_cli_arguments(
+        [
+            "--agent",
+            "reviewer",
+        ]
+    )
+
+    assert arguments.agent_name == "reviewer"
+
+
+def test_parse_cli_arguments_rejects_unknown_agent_profile() -> None:
+    """Reject agent profiles outside the registered collection."""
+
+    with pytest.raises(SystemExit) as exc_info:
+        parse_cli_arguments(
+            [
+                "--agent",
+                "unknown",
+            ]
+        )
+
+    assert exc_info.value.code == 2
+
+
+def test_agent_profile_provides_system_prompt(
+    monkeypatch,
+) -> None:
+    """Resolve the selected profile into its system instructions."""
+
+    monkeypatch.setenv(PROVIDER_ENV_VAR, "ollama")
+    monkeypatch.setenv(MODEL_ENV_VAR, "gpt-oss:20b")
+
+    configuration = resolve_runtime_configuration(
+        CLIArguments(
+            provider_name=None,
+            model_name=None,
+            agent_name="reviewer",
+        )
+    )
+
+    assert configuration.agent_profile is not None
+    assert configuration.agent_profile.name == "Reviewer"
+    assert configuration.system_prompt == (configuration.agent_profile.system_prompt)
+
+
+def test_agent_and_system_prompt_cannot_be_combined() -> None:
+    """Reject ambiguous simultaneous agent and prompt configuration."""
+
+    with pytest.raises(
+        ConfigurationError,
+        match="--agent cannot be combined",
+    ):
+        resolve_runtime_configuration(
+            CLIArguments(
+                provider_name="ollama",
+                model_name="gpt-oss:20b",
+                system_prompt="Custom instructions.",
+                agent_name="reviewer",
+            )
+        )
