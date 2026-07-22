@@ -710,3 +710,120 @@ The implementation was validated through:
 Introduce reusable agent profiles so named roles such as `Planner`,
 `Developer`, `Reviewer`, and `Tester` can define their own system prompts and
 later receive provider, model, and tool configuration.
+
+## 2026-07-22 — Reusable Agent Profiles
+
+### Objective
+
+Introduce reusable agent identities that define consistent responsibilities,
+descriptions, and system instructions independently of the selected model
+provider.
+
+### Implemented
+
+- Added the immutable `AgentProfile` data structure.
+- Added built-in `planner`, `developer`, `reviewer`, and `tester` profiles.
+- Added a centralized agent profile registry.
+- Added normalized profile lookup.
+- Added clear validation for unsupported agent names.
+- Added the `--agent` command-line argument.
+- Restricted the argument to registered agent profiles.
+- Resolved agent profiles into system prompts during runtime configuration.
+- Prevented simultaneous use of `--agent` and `--system-prompt`.
+- Added the active agent name to the CLI session header.
+- Added the agent role description to the session startup output.
+- Kept agent identity independent from provider and model selection.
+- Added automated tests for profile registration, lookup, configuration, and
+  CLI presentation.
+
+### Built-In Profiles
+
+```text
+planner
+    └── Plans tasks, dependencies, risks, assumptions, and acceptance criteria
+
+developer
+    └── Designs and implements maintainable, testable, and secure software
+
+reviewer
+    └── Reviews correctness, security, maintainability, tests, and edge cases
+
+tester
+    └── Designs tests and investigates failures, regressions, and assumptions
+```
+
+### Architecture
+
+```text
+Command-Line Arguments
+        ↓
+Agent Profile Registry
+        ↓
+AgentProfile
+├── name
+├── description
+└── system_prompt
+        ↓
+Runtime Configuration
+        ↓
+Interactive CLI
+        ↓
+ChatRequest
+        ↓
+Selected Provider
+```
+
+Agent profiles do not contain provider-specific behavior. The same profile can
+be combined with Ollama, OpenAI, or Anthropic.
+
+### Validation
+
+The implementation was validated through:
+
+- Successful Ruff formatting and static-analysis checks.
+- Fifty passing automated tests.
+- Verification that all four built-in profiles are registered.
+- Verification that every profile contains a name, description, and system
+  prompt.
+- Verification that profile names are normalized before lookup.
+- Verification that unknown profile names are rejected.
+- Verification that `--help` lists all supported agent profiles.
+- Verification that the selected profile provides the runtime system prompt.
+- Verification that `--agent` and `--system-prompt` cannot be combined.
+- Verification that the active profile name and description appear in the CLI.
+- A successful real Ollama conversation using the `reviewer` profile.
+- Confirmation that the reviewer identified correctness, edge-case, and
+  testing concerns in a Python division expression.
+
+### Technical Decisions
+
+- Stored built-in profiles in a centralized registry so discovery, validation,
+  and lookup use the same source of truth.
+- Used immutable, slotted dataclasses for agent profile definitions.
+- Kept provider and model configuration outside `AgentProfile` in this first
+  version so roles remain reusable across providers.
+- Reused the existing system prompt pipeline instead of adding agent-specific
+  logic to providers.
+- Rejected simultaneous custom prompts and profiles to avoid unclear
+  instruction precedence.
+- Displayed the agent identity at session startup without changing the generic
+  session termination message.
+- Started with software engineering roles that can later participate in a
+  coordinated multi-agent workflow.
+
+### Current Limitations
+
+- Only built-in profiles defined in Python are available.
+- Profiles cannot yet be loaded from YAML, TOML, or JSON files.
+- Profiles do not define provider, model, tools, or generation parameters.
+- Only one agent profile can be active in each CLI process.
+- Separate CLI processes are not coordinated.
+- Agents do not share state, tasks, or conversation history.
+- Tool calling is not implemented.
+- Responses are not streamed.
+- Logging and structured observability are not implemented.
+
+### Next Milestone
+
+Move agent definitions into external configuration files so users can create
+and modify profiles without editing Python source code.

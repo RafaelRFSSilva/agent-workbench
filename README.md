@@ -32,6 +32,9 @@ Implemented capabilities:
 - Provider-independent requests through the `ChatRequest` abstraction
 - System prompt configuration through the `--system-prompt` argument
 - Provider-specific translation of system instructions
+- Reusable agent profiles for planning, development, review, and testing
+- Agent selection through the `--agent` command-line argument
+- Clear display of the active agent identity and role
 
 ## Architecture
 
@@ -222,6 +225,55 @@ not stored as a user or assistant conversation message.
 This separation provides the foundation for reusable agent identities such as
 `Planner`, `Developer`, `Reviewer`, and `Tester`.
 
+## Agent Profiles
+
+Agent profiles provide reusable identities and system instructions for common
+software engineering responsibilities.
+
+The initial profiles are:
+
+| Profile | Purpose |
+| --- | --- |
+| `planner` | Breaks objectives into tasks, dependencies, risks, and acceptance criteria |
+| `developer` | Designs and implements maintainable, testable, and secure solutions |
+| `reviewer` | Reviews correctness, security, maintainability, edge cases, and test coverage |
+| `tester` | Designs tests and investigates failures, regressions, and incorrect assumptions |
+
+Activate a profile with `--agent`:
+
+```bash
+uv run agent-workbench \
+  --provider ollama \
+  --model gpt-oss:20b \
+  --agent reviewer
+```
+
+Example startup output:
+
+```text
+Agent Workbench | Provider: Ollama | Model: gpt-oss:20b | Agent: Reviewer
+Type /exit or /quit to end the session.
+Role: Reviews software for correctness, security, maintainability, and test coverage.
+```
+
+Agent profiles are represented independently from providers:
+
+```text
+AgentProfile
+├── name
+├── description
+└── system_prompt
+        ↓
+ChatRequest
+        ↓
+Selected ChatProvider
+```
+
+The same profile can therefore be used with Ollama, OpenAI, or Anthropic.
+
+A custom `--system-prompt` and `--agent` cannot currently be used together.
+This prevents ambiguous or conflicting instructions.
+
 ## Usage
 
 Start the CLI using the configuration stored in `.env`:
@@ -295,6 +347,42 @@ uv run agent-workbench \
   "You are a software reviewer. Focus on correctness, security, and maintainability."
 ```
 
+Use the built-in planner:
+
+```bash
+uv run agent-workbench \
+  --provider ollama \
+  --model gpt-oss:20b \
+  --agent planner
+```
+
+Use the built-in developer:
+
+```bash
+uv run agent-workbench \
+  --provider ollama \
+  --model gpt-oss:20b \
+  --agent developer
+```
+
+Use the built-in reviewer:
+
+```bash
+uv run agent-workbench \
+  --provider ollama \
+  --model gpt-oss:20b \
+  --agent reviewer
+```
+
+Use the built-in tester:
+
+```bash
+uv run agent-workbench \
+  --provider ollama \
+  --model gpt-oss:20b \
+  --agent tester
+```
+
 ## Quality Checks
 
 Run the automated tests:
@@ -339,6 +427,9 @@ uv run ruff format --check .
 - [x] Add command-line provider and model selection
 - [x] Add a provider-independent chat request abstraction
 - [x] Add system prompt configuration
+- [x] Add reusable agent profiles
+- [ ] Load custom agent profiles from configuration files
+- [ ] Coordinate multiple agents through an orchestrator
 - [ ] Add structured outputs
 - [ ] Implement tool calling
 - [ ] Build a local RAG pipeline
