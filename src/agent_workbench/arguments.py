@@ -4,11 +4,13 @@ from argparse import ArgumentParser, ArgumentTypeError
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import cast
+from pathlib import Path
 
 from agent_workbench.agents import (
     SUPPORTED_AGENT_NAMES,
     AgentProfile,
     get_agent_profile,
+    load_agent_profile_file,
 )
 
 from agent_workbench.config import (
@@ -28,6 +30,7 @@ class CLIArguments:
     model_name: str | None
     system_prompt: str | None = None
     agent_name: str | None = None
+    agent_file: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +63,17 @@ def _non_empty_system_prompt(value: str) -> str:
         raise ArgumentTypeError("system prompt must not be blank")
 
     return system_prompt
+
+
+def _agent_profile_path(value: str) -> Path:
+    """Return a normalized custom agent profile path."""
+
+    normalized_path = value.strip()
+
+    if not normalized_path:
+        raise ArgumentTypeError("agent file path must not be blank")
+
+    return Path(normalized_path).expanduser()
 
 
 def parse_cli_arguments(
@@ -96,6 +110,12 @@ def parse_cli_arguments(
         choices=sorted(SUPPORTED_AGENT_NAMES),
         help="Reusable agent profile to activate.",
     )
+
+    parser.add_argument(
+        "--agent-file",
+        type=_agent_profile_path,
+        help="Path to a custom TOML agent profile.",
+    )
     parsed_arguments = parser.parse_args(argv)
 
     provider_name = (
@@ -109,6 +129,7 @@ def parse_cli_arguments(
         model_name=parsed_arguments.model,
         system_prompt=parsed_arguments.system_prompt,
         agent_name=parsed_arguments.agent,
+        agent_file=parsed_arguments.agent_file,
     )
 
 
@@ -120,14 +141,23 @@ def resolve_runtime_configuration(
     if arguments.provider_name is not None and arguments.model_name is None:
         raise ConfigurationError("--model is required when --provider is specified.")
 
+    if arguments.agent_name is not None and arguments.agent_file is not None:
+        raise ConfigurationError("--agent cannot be combined with --agent-file.")
+
     if arguments.agent_name is not None and arguments.system_prompt is not None:
         raise ConfigurationError("--agent cannot be combined with --system-prompt.")
 
-    agent_profile = (
-        get_agent_profile(arguments.agent_name)
-        if arguments.agent_name is not None
-        else None
-    )
+    if arguments.agent_file is not None and arguments.system_prompt is not None:
+        raise ConfigurationError(
+            "--agent-file cannot be combined with --system-prompt."
+        )
+
+    if arguments.agent_file is not None:
+        agent_profile = load_agent_profile_file(arguments.agent_file)
+    elif arguments.agent_name is not None:
+        agent_profile = get_agent_profile(arguments.agent_name)
+    else:
+        agent_profile = None
 
     system_prompt = (
         agent_profile.system_prompt

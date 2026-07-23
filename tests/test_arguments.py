@@ -1,6 +1,7 @@
 """Tests for command-line configuration handling."""
 
 import pytest
+from pathlib import Path
 
 from agent_workbench.arguments import (
     CLIArguments,
@@ -213,5 +214,88 @@ def test_agent_and_system_prompt_cannot_be_combined() -> None:
                 model_name="gpt-oss:20b",
                 system_prompt="Custom instructions.",
                 agent_name="reviewer",
+            )
+        )
+
+
+def test_parse_cli_arguments_accepts_agent_file() -> None:
+    """Accept the path of a custom agent profile."""
+
+    arguments = parse_cli_arguments(["--agent-file", "agents/security-reviewer.toml"])
+
+    assert arguments.agent_file == Path("agents/security-reviewer.toml")
+
+
+def test_parse_cli_arguments_rejects_blank_agent_file() -> None:
+    """Reject a blank custom agent profile path."""
+
+    with pytest.raises(SystemExit) as exc_info:
+        parse_cli_arguments(["--agent-file", "   "])
+
+    assert exc_info.value.code == 2
+
+
+def test_agent_file_provides_system_prompt(tmp_path) -> None:
+    """Resolve a custom agent profile into the runtime configuration."""
+
+    profile_path = tmp_path / "security-reviewer.toml"
+    profile_path.write_text(
+        """
+name = "Security Reviewer"
+description = "Reviews application security."
+system_prompt = "You are a security review agent."
+""",
+        encoding="utf-8",
+    )
+
+    configuration = resolve_runtime_configuration(
+        CLIArguments(
+            provider_name="ollama",
+            model_name="gpt-oss:20b",
+            agent_file=profile_path,
+        )
+    )
+
+    assert configuration.agent_profile is not None
+    assert configuration.agent_profile.name == "Security Reviewer"
+    assert configuration.system_prompt == "You are a security review agent."
+
+
+def test_agent_and_agent_file_cannot_be_combined(tmp_path) -> None:
+    """Reject simultaneous built-in and external agent selection."""
+
+    profile_path = tmp_path / "custom.toml"
+
+    with pytest.raises(
+        ConfigurationError,
+        match="--agent cannot be combined with --agent-file",
+    ):
+        resolve_runtime_configuration(
+            CLIArguments(
+                provider_name="ollama",
+                model_name="gpt-oss:20b",
+                agent_name="reviewer",
+                agent_file=profile_path,
+            )
+        )
+
+
+def test_agent_file_and_system_prompt_cannot_be_combined(
+    tmp_path,
+) -> None:
+    """Reject ambiguous custom profile and system prompt configuration."""
+
+    profile_path = tmp_path / "custom.toml"
+
+    with pytest.raises(
+        ConfigurationError,
+        match="--agent-file cannot be combined with --system-prompt",
+    ):
+        resolve_runtime_configuration(
+            CLIArguments(
+                provider_name="ollama",
+                model_name="gpt-oss:20b",
+                system_prompt="Custom instructions.",
+                agent_file=profile_path,
             )
         )
