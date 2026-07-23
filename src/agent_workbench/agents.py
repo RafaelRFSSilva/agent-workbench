@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from importlib.resources import files
 import tomllib
+from pathlib import Path
 
 from agent_workbench.errors import ConfigurationError
 
@@ -89,6 +90,35 @@ def parse_agent_profile(
             "system_prompt",
             source,
         ),
+    )
+
+
+def load_agent_profile_file(path: Path) -> AgentProfile:
+    """Load and validate an agent profile from an external TOML file."""
+
+    profile_path = path.expanduser()
+
+    if profile_path.suffix.lower() != ".toml":
+        raise ConfigurationError(
+            f"Agent profile file '{profile_path}' must use the .toml extension."
+        )
+
+    if not profile_path.exists():
+        raise ConfigurationError(f"Agent profile file '{profile_path}' does not exist.")
+
+    if not profile_path.is_file():
+        raise ConfigurationError(f"Agent profile path '{profile_path}' is not a file.")
+
+    try:
+        content = profile_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise ConfigurationError(
+            f"Could not read agent profile file '{profile_path}': {exc}"
+        ) from exc
+
+    return parse_agent_profile(
+        content=content,
+        source=str(profile_path),
     )
 
 

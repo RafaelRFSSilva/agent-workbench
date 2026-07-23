@@ -6,6 +6,7 @@ from agent_workbench.agents import (
     AGENT_PROFILES,
     SUPPORTED_AGENT_NAMES,
     get_agent_profile,
+    load_agent_profile_file,
     parse_agent_profile,
 )
 from agent_workbench.errors import ConfigurationError
@@ -127,3 +128,61 @@ temperature = 0.5
 """,
             source="unexpected.toml",
         )
+
+
+def test_load_agent_profile_file_returns_valid_profile(tmp_path) -> None:
+    """Load a valid custom agent profile from the filesystem."""
+
+    profile_path = tmp_path / "security-reviewer.toml"
+    profile_path.write_text(
+        """
+name = "Security Reviewer"
+description = "Reviews application security."
+system_prompt = "You are a security review agent."
+""",
+        encoding="utf-8",
+    )
+
+    profile = load_agent_profile_file(profile_path)
+
+    assert profile.name == "Security Reviewer"
+    assert profile.description == "Reviews application security."
+    assert profile.system_prompt == "You are a security review agent."
+
+
+def test_load_agent_profile_file_rejects_missing_file(tmp_path) -> None:
+    """Reject a custom profile file that does not exist."""
+
+    profile_path = tmp_path / "missing.toml"
+
+    with pytest.raises(
+        ConfigurationError,
+        match="does not exist",
+    ):
+        load_agent_profile_file(profile_path)
+
+
+def test_load_agent_profile_file_rejects_directory(tmp_path) -> None:
+    """Reject a directory passed as an agent profile file."""
+
+    profile_path = tmp_path / "profile.toml"
+    profile_path.mkdir()
+
+    with pytest.raises(
+        ConfigurationError,
+        match="is not a file",
+    ):
+        load_agent_profile_file(profile_path)
+
+
+def test_load_agent_profile_file_rejects_non_toml_extension(tmp_path) -> None:
+    """Reject custom profile files without a TOML extension."""
+
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(
+        ConfigurationError,
+        match=r"must use the \.toml extension",
+    ):
+        load_agent_profile_file(profile_path)
