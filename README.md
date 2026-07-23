@@ -35,6 +35,9 @@ Implemented capabilities:
 - Reusable agent profiles for planning, development, review, and testing
 - Agent selection through the `--agent` command-line argument
 - Clear display of the active agent identity and role
+- Built-in agent profiles loaded from packaged TOML resources
+- Custom agent profiles loaded through `--agent-file`
+- Validation for malformed, incomplete, or unsupported TOML configuration
 
 ## Architecture
 
@@ -239,6 +242,38 @@ The initial profiles are:
 | `reviewer` | Reviews correctness, security, maintainability, edge cases, and test coverage |
 | `tester` | Designs tests and investigates failures, regressions, and incorrect assumptions |
 
+### Built-In Profile Files
+
+The built-in profiles are stored as TOML resources inside the application
+package:
+
+```text
+src/agent_workbench/profiles/
+├── developer.toml
+├── planner.toml
+├── reviewer.toml
+└── tester.toml
+```
+
+Each profile defines three required fields:
+
+```toml
+name = "Reviewer"
+description = "Reviews software quality and risks."
+system_prompt = """
+You are a strict software review agent.
+Evaluate correctness, security, maintainability, and test coverage.
+"""
+```
+
+Keeping the profiles outside the Python implementation separates agent
+behavior from profile loading and validation logic.
+
+The TOML files are included in the source distribution and wheel, so the
+built-in profiles remain available when the application is installed as a
+package.
+
+
 Activate a profile with `--agent`:
 
 ```bash
@@ -253,6 +288,7 @@ Example startup output:
 ```text
 Agent Workbench | Provider: Ollama | Model: gpt-oss:20b | Agent: Reviewer
 Type /exit or /quit to end the session.
+
 Role: Reviews software for correctness, security, maintainability, and test coverage.
 ```
 
@@ -271,8 +307,85 @@ Selected ChatProvider
 
 The same profile can therefore be used with Ollama, OpenAI, or Anthropic.
 
-A custom `--system-prompt` and `--agent` cannot currently be used together.
-This prevents ambiguous or conflicting instructions.
+### Custom Agent Profiles
+
+Users can create custom agent profiles without modifying the application
+source code.
+
+Create a TOML file:
+
+```toml
+name = "Security Reviewer"
+description = """
+Reviews source code for security vulnerabilities and unsafe assumptions.
+"""
+
+system_prompt = """
+You are a strict application security review agent.
+Identify vulnerabilities, insecure defaults, input validation problems,
+secret exposure, injection risks, and unsafe file operations.
+Prioritize findings by severity and propose concrete mitigations.
+"""
+```
+
+Start a session with the custom profile:
+
+```bash
+uv run agent-workbench \
+  --provider ollama \
+  --model gpt-oss:20b \
+  --agent-file ./security-reviewer.toml
+```
+
+Example startup output:
+
+```text
+Agent Workbench | Provider: Ollama | Model: gpt-oss:20b | Agent: Security Reviewer
+Type /exit or /quit to end the session.
+
+Role: Reviews source code for security vulnerabilities and unsafe assumptions.
+```
+
+Custom profile files:
+
+- Must use the `.toml` extension
+- Must be encoded as UTF-8
+- Must contain `name`, `description`, and `system_prompt`
+- Must use non-empty strings for all required fields
+- Cannot contain unsupported fields
+- Are validated before the provider session starts
+
+The following combinations are intentionally rejected:
+
+```text
+--agent + --agent-file
+--agent + --system-prompt
+--agent-file + --system-prompt
+```
+
+This prevents ambiguous instruction precedence.
+
+Custom profiles currently define agent identity and behavior only. Provider,
+model, tools, context files, and generation parameters remain separate runtime
+configuration concerns.
+
+### Agent Profile Architecture
+
+```text
+Built-In TOML Profiles ─┐
+                        ├── Agent Profile Loader
+Custom TOML Profile ────┘            ↓
+                              AgentProfile
+                                    ↓
+                         Runtime Configuration
+                                    ↓
+                              ChatRequest
+                                    ↓
+                         Selected ChatProvider
+```
+
+Both built-in and custom profiles use the same validation and runtime system
+prompt pipeline.
 
 ## Usage
 
@@ -383,6 +496,15 @@ uv run agent-workbench \
   --agent tester
 ```
 
+Load a custom agent profile:
+
+```bash
+uv run agent-workbench \
+  --provider ollama \
+  --model gpt-oss:20b \
+  --agent-file ./security-reviewer.toml
+```
+
 ## Quality Checks
 
 Run the automated tests:
@@ -428,7 +550,11 @@ uv run ruff format --check .
 - [x] Add a provider-independent chat request abstraction
 - [x] Add system prompt configuration
 - [x] Add reusable agent profiles
-- [ ] Load custom agent profiles from configuration files
+- [x] Load built-in agent profiles from TOML resources
+- [x] Support custom agent profile files
+- [ ] Add file-based conversation context
+- [ ] Add an interactive setup wizard
+- [ ] Discover custom profiles from a user profile directory
 - [ ] Coordinate multiple agents through an orchestrator
 - [ ] Add structured outputs
 - [ ] Implement tool calling

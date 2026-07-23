@@ -827,3 +827,172 @@ The implementation was validated through:
 
 Move agent definitions into external configuration files so users can create
 and modify profiles without editing Python source code.
+
+## 2026-07-23 — External Agent Profile Configuration
+
+### Objective
+
+Separate agent definitions from Python source code and allow users to load
+custom agent identities and instructions from external TOML files.
+
+### Implemented
+
+- Moved the built-in `planner`, `developer`, `reviewer`, and `tester` profiles
+  into packaged TOML resources.
+- Added a TOML parser for agent profile definitions.
+- Added validation for malformed TOML content.
+- Added validation for missing required fields.
+- Added validation for blank field values.
+- Added validation for unsupported fields.
+- Added loading of built-in resources through `importlib.resources`.
+- Verified that packaged profiles are included in the generated wheel.
+- Added loading of external UTF-8 TOML profile files.
+- Added validation for missing files, directories, and unsupported file
+  extensions.
+- Added the `--agent-file` command-line argument.
+- Resolved custom profile system instructions into runtime configuration.
+- Prevented ambiguous combinations between built-in profiles, external
+  profiles, and direct system prompts.
+- Preserved compatibility with Ollama, OpenAI, and Anthropic providers.
+- Added automated tests for profile parsing, filesystem loading, CLI parsing,
+  and runtime configuration.
+
+### Built-In Profile Resources
+
+```text
+src/agent_workbench/profiles/
+├── __init__.py
+├── developer.toml
+├── planner.toml
+├── reviewer.toml
+└── tester.toml
+```
+
+The profile filename provides the built-in CLI identifier:
+
+```text
+reviewer.toml
+      ↓
+--agent reviewer
+```
+
+The file content provides the agent identity and behavior:
+
+```toml
+name = "Reviewer"
+description = "Reviews software quality and risks."
+system_prompt = "You are a strict software review agent."
+```
+
+### Custom Profile Flow
+
+```text
+--agent-file ./custom-agent.toml
+                 ↓
+        Validate file path
+                 ↓
+          Read UTF-8 TOML
+                 ↓
+       Parse and validate fields
+                 ↓
+            AgentProfile
+                 ↓
+       Runtime system prompt
+                 ↓
+         Selected provider
+```
+
+### Required Fields
+
+Every profile must contain exactly:
+
+```text
+name
+description
+system_prompt
+```
+
+All fields must contain non-empty strings.
+
+Unknown fields are rejected so spelling mistakes and unsupported configuration
+do not pass silently.
+
+### Configuration Precedence
+
+The application accepts one agent instruction source per session:
+
+```text
+Built-in profile
+    OR
+External profile file
+    OR
+Direct system prompt
+```
+
+The following combinations are rejected:
+
+```text
+--agent + --agent-file
+--agent + --system-prompt
+--agent-file + --system-prompt
+```
+
+### Validation
+
+The implementation was validated through:
+
+- Successful Ruff formatting and static-analysis checks.
+- Sixty-four passing automated tests.
+- Verification that all four packaged TOML profiles are discovered.
+- Verification that valid TOML content creates an `AgentProfile`.
+- Verification that malformed TOML is rejected.
+- Verification that missing, blank, and unsupported fields are rejected.
+- Verification that missing files are rejected.
+- Verification that directories cannot be used as profile files.
+- Verification that custom profiles require the `.toml` extension.
+- Verification that `--agent-file` appears in CLI help.
+- Verification that custom profiles provide the runtime system prompt.
+- Verification that conflicting profile arguments are rejected.
+- Verification that the built-in TOML files are included in the generated
+  wheel.
+- A successful real Ollama session using an external `Security Reviewer`
+  profile.
+- Confirmation that the external system prompt changed the model behavior.
+
+### Technical Decisions
+
+- Used `tomllib` from the Python 3.12 standard library, avoiding another
+  runtime dependency.
+- Used `importlib.resources` instead of filesystem-relative paths for packaged
+  resources.
+- Kept the immutable `AgentProfile` data structure as the provider-independent
+  representation.
+- Used strict field validation to detect configuration mistakes early.
+- Kept provider and model configuration outside the profile format.
+- Added `--agent-file` rather than automatically scanning directories in this
+  milestone, keeping profile selection explicit and predictable.
+- Preserved the same system prompt pipeline for built-in profiles, custom
+  profiles, and direct instructions.
+- Prepared the profile loader for a future interactive configuration mode.
+
+### Current Limitations
+
+- Custom profiles must be selected through an explicit file path.
+- The application does not yet discover profiles from a default user
+  directory.
+- Profiles cannot yet configure provider, model, temperature, tools, or
+  context sources.
+- File-based project context is not implemented.
+- Only one profile can be active in each CLI session.
+- The application does not yet provide an interactive selection wizard.
+- Agents are not coordinated through an orchestrator.
+- Conversation state is not persisted between sessions.
+
+### Next Milestone
+
+Add file-based context so users can provide source code, documentation, and
+other text files to the active agent.
+
+After context support is stable, add an interactive setup flow for selecting
+the provider, model, agent profile, and context sources without requiring the
+user to memorize command-line arguments.
