@@ -9,6 +9,7 @@ from agent_workbench.config import (
     load_environment,
 )
 from agent_workbench.context import ContextDocument
+from agent_workbench.interactive_setup import run_interactive_setup
 from agent_workbench.errors import CompletionError, ConfigurationError
 from agent_workbench.messages import ChatRequest, Message
 from agent_workbench.providers.base import ChatProvider
@@ -96,7 +97,11 @@ def main(
     arguments = parse_cli_arguments(argv)
 
     try:
-        runtime_configuration = resolve_runtime_configuration(arguments)
+        if arguments.setup:
+            runtime_configuration = run_interactive_setup()
+        else:
+            runtime_configuration = resolve_runtime_configuration(arguments)
+
         provider = create_provider(
             runtime_configuration.provider_name,
             runtime_configuration.model_name,

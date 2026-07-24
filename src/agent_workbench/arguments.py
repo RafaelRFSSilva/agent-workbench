@@ -30,6 +30,7 @@ class CLIArguments:
 
     provider_name: ProviderName | None
     model_name: str | None
+    setup: bool = False
     system_prompt: str | None = None
     agent_name: str | None = None
     agent_file: Path | None = None
@@ -159,6 +160,12 @@ def parse_cli_arguments(
             "language model provider."
         ),
     )
+
+    parser.add_argument(
+        "--setup",
+        action="store_true",
+        help="Configure the session through an interactive setup flow.",
+    )
     parser.add_argument(
         "--provider",
         choices=sorted(SUPPORTED_PROVIDERS),
@@ -216,6 +223,21 @@ def parse_cli_arguments(
 
     parsed_arguments = parser.parse_args(argv)
 
+    setup_conflicts = (
+        parsed_arguments.provider is not None
+        or parsed_arguments.model is not None
+        or parsed_arguments.system_prompt is not None
+        or parsed_arguments.agent is not None
+        or parsed_arguments.agent_file is not None
+        or bool(parsed_arguments.context_file)
+        or parsed_arguments.temperature is not None
+        or parsed_arguments.top_p is not None
+        or parsed_arguments.max_output_tokens is not None
+    )
+
+    if parsed_arguments.setup and setup_conflicts:
+        parser.error("--setup cannot be combined with other configuration arguments.")
+
     provider_name = (
         cast(ProviderName, parsed_arguments.provider)
         if parsed_arguments.provider is not None
@@ -225,6 +247,7 @@ def parse_cli_arguments(
     return CLIArguments(
         provider_name=provider_name,
         model_name=parsed_arguments.model,
+        setup=parsed_arguments.setup,
         system_prompt=parsed_arguments.system_prompt,
         agent_name=parsed_arguments.agent,
         agent_file=parsed_arguments.agent_file,

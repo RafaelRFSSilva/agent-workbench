@@ -1,8 +1,10 @@
 """Tests for the Agent Workbench command-line interface."""
 
 from pathlib import Path
+from unittest.mock import Mock
 
-from agent_workbench.cli import run_cli
+from agent_workbench.cli import main, run_cli
+from agent_workbench.arguments import RuntimeConfiguration
 from agent_workbench.context import ContextDocument
 from agent_workbench.errors import CompletionError
 from agent_workbench.messages import ChatRequest, Message
@@ -305,3 +307,47 @@ def test_generation_config_is_forwarded_without_entering_history(
             }
         ]
     ]
+
+
+def test_main_uses_interactive_runtime_setup(
+    monkeypatch,
+) -> None:
+    """Use the setup result before constructing the provider."""
+
+    configuration = RuntimeConfiguration(
+        provider_name="ollama",
+        model_name="test-model",
+    )
+    provider = FakeProvider()
+
+    setup_mock = Mock(return_value=configuration)
+    create_provider_mock = Mock(return_value=provider)
+    run_cli_mock = Mock()
+
+    monkeypatch.setattr(
+        "agent_workbench.cli.run_interactive_setup",
+        setup_mock,
+    )
+    monkeypatch.setattr(
+        "agent_workbench.cli.create_provider",
+        create_provider_mock,
+    )
+    monkeypatch.setattr(
+        "agent_workbench.cli.run_cli",
+        run_cli_mock,
+    )
+
+    main(["--setup"])
+
+    setup_mock.assert_called_once_with()
+    create_provider_mock.assert_called_once_with(
+        "ollama",
+        "test-model",
+    )
+    run_cli_mock.assert_called_once_with(
+        provider,
+        system_prompt=None,
+        agent_profile=None,
+        context_documents=(),
+        generation_config=GenerationConfig(),
+    )
