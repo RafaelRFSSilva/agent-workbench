@@ -1631,3 +1631,352 @@ abstraction.
 After structured outputs are stable, continue toward tool calling,
 Retrieval-Augmented Generation, agent orchestration, evaluation,
 observability, and deployment.
+
+## 2026-07-24 — Provider-Independent Structured Outputs
+
+### Objective
+
+Allow callers to request machine-readable JSON responses through a shared
+response-format abstraction without exposing the CLI, conversation layer, or
+shared request model to provider-specific structured output arguments.
+
+### Implemented
+
+* Added the provider-independent `JSONResponseFormat` abstraction.
+* Added the recursive `JSONValue` type alias.
+* Added the shared `JSONSchema` type alias.
+* Added portable response format name validation.
+* Added validation requiring a non-empty schema object.
+* Added validation requiring `object` as the top-level schema type.
+* Added strict JSON-compatible value validation.
+* Added rejection of non-string JSON object keys.
+* Added rejection of non-finite floating-point values.
+* Added canonical internal JSON storage.
+* Added defensive schema copies through the `schema` property.
+* Added equality independent of original dictionary key order.
+* Added `response_format` to `ChatRequest`.
+* Added `response_format_file` to `CLIArguments`.
+* Added `response_format` to `RuntimeConfiguration`.
+* Added the `--response-format-file` command-line argument.
+* Added response format forwarding through `run_cli()`.
+* Added structured output selection to the interactive setup.
+* Added immediate interactive response format file validation.
+* Added repeated prompts after invalid response format files.
+* Added structured output translation for Ollama.
+* Added structured output translation for the OpenAI Responses API.
+* Added structured output translation for the Anthropic Messages API.
+* Preserved existing unstructured response behavior when no format is
+  supplied.
+* Added automated tests for the shared abstraction, file loader, CLI parsing,
+  runtime resolution, conversation forwarding, interactive setup, and all
+  provider translations.
+
+### Shared Architecture
+
+```text
+Response Format JSON File
+        ↓
+load_response_format_file()
+        ↓
+JSONResponseFormat
+├── name
+└── schema
+        ↓
+RuntimeConfiguration.response_format
+        ↓
+Interactive CLI
+        ↓
+ChatRequest.response_format
+        ↓
+Provider Adapter
+```
+
+Structured output configuration remains separate from:
+
+```text
+ChatRequest
+├── messages
+├── system_prompt
+├── context_documents
+├── generation_config
+└── response_format
+```
+
+The response format is request configuration rather than a conversation
+message or model instruction.
+
+### Response Format Definition
+
+A response format file contains:
+
+```json
+{
+  "name": "software_review",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "summary": {
+        "type": "string"
+      },
+      "risk_level": {
+        "type": "string",
+        "enum": [
+          "low",
+          "medium",
+          "high"
+        ]
+      }
+    },
+    "required": [
+      "summary",
+      "risk_level"
+    ],
+    "additionalProperties": false
+  }
+}
+```
+
+Only `name` and `schema` are supported at the top level.
+
+The format name is portable across the shared application model, even though
+not every provider requires it in its native API request.
+
+### Immutability
+
+A frozen dataclass prevents field reassignment but does not make nested
+dictionaries immutable.
+
+The response format therefore stores the validated schema as canonical JSON:
+
+```text
+Mutable Input Dictionary
+        ↓
+Validation
+        ↓
+json.dumps(sort_keys=True, allow_nan=False)
+        ↓
+Immutable Internal String
+        ↓
+json.loads() when schema is requested
+```
+
+This prevents mutation of the original input dictionary and mutation of a
+returned schema copy from changing the active response format.
+
+Canonical key ordering also ensures that logically equivalent schemas compare
+equally.
+
+### File Loading and Validation
+
+Response format files are validated for:
+
+* File existence.
+* Regular-file type.
+* `.json` extension.
+* Maximum size of 100 KiB.
+* UTF-8 encoding.
+* Non-empty content.
+* Valid JSON syntax.
+* JSON object root.
+* Required `name` field.
+* Required `schema` field.
+* Unsupported top-level fields.
+* String response format name.
+* JSON object schema.
+* Portable response format name syntax.
+* Non-empty schema.
+* Top-level schema type.
+* JSON-compatible nested values.
+* String object keys.
+* Finite JSON numbers.
+
+Malformed JSON errors include the source line and column.
+
+### Provider Translation
+
+```text
+JSONResponseFormat
+├── OllamaProvider
+│   └── format = schema
+│
+├── OpenAIProvider
+│   └── text
+│       └── format
+│           ├── type = "json_schema"
+│           ├── name
+│           ├── schema
+│           └── strict = True
+│
+└── AnthropicProvider
+    └── output_config
+        └── format
+            ├── type = "json_schema"
+            └── schema
+```
+
+The OpenAI Responses API requires the portable response format name.
+
+Ollama and Anthropic receive the shared schema but do not receive the name.
+
+Provider-specific field names remain isolated inside each adapter.
+
+### CLI Integration
+
+The direct command-line workflow supports:
+
+```bash
+uv run agent-workbench \
+  --provider ollama \
+  --model gpt-oss:20b \
+  --response-format-file ./schemas/software-review.json
+```
+
+The argument parser rejects blank response format file paths.
+
+The runtime resolver loads and validates the file before provider creation.
+
+`--response-format-file` cannot be combined directly with `--setup`, because
+the setup contains its own optional response format question.
+
+### Interactive Setup Integration
+
+The interactive setup now collects:
+
+```text
+Provider
+Model
+Built-In Agent Profile
+Context Files
+Generation Settings
+Structured Output
+```
+
+The final optional question is:
+
+```text
+Structured output:
+Press Enter to use the normal unstructured text response.
+Response format file [none]:
+```
+
+Pressing Enter keeps `response_format=None`.
+
+A valid file is loaded and displayed by name.
+
+An invalid file produces a clear error and repeats only that question.
+
+### Validation
+
+The implementation was validated through:
+
+* Successful Ruff formatting checks.
+* Successful Ruff static-analysis checks.
+* One hundred and ninety-two passing automated tests.
+* Verification of response format name normalization.
+* Verification of response format name length and character restrictions.
+* Verification that schemas require a non-empty object root.
+* Verification that non-string object keys are rejected.
+* Verification that unsupported Python values are rejected.
+* Verification that `NaN` and infinite values are rejected.
+* Verification that schema mutation after construction does not affect the
+  response format.
+* Verification that mutation of a returned schema copy does not affect the
+  response format.
+* Verification that equivalent schemas compare equally regardless of key
+  order.
+* Verification of missing-file rejection.
+* Verification of directory-path rejection.
+* Verification of unsupported-extension rejection.
+* Verification of the 100 KiB file-size limit.
+* Verification of invalid UTF-8 rejection.
+* Verification of empty-file rejection.
+* Verification of malformed JSON rejection.
+* Verification of non-object JSON root rejection.
+* Verification of missing required fields.
+* Verification of unsupported top-level fields.
+* Verification of invalid `name` and `schema` field types.
+* Verification that `ChatRequest` defaults to no response format.
+* Verification that `RuntimeConfiguration` loads the selected response format.
+* Verification that response formats remain separate from conversation
+  history.
+* Verification that setup conflicts with a directly supplied
+  `--response-format-file`.
+* Verification that interactive setup can skip structured output.
+* Verification that interactive setup loads a valid response format.
+* Verification that interactive setup repeats the question after an invalid
+  response format.
+* Verification that Ollama receives the schema through `format`.
+* Verification that OpenAI receives `text.format` with strict JSON Schema
+  configuration.
+* Verification that Anthropic receives `output_config.format`.
+* Verification that providers omit structured output arguments when no
+  response format is supplied.
+* Verification that provider responses remain strings.
+* Confirmation that the CLI help displays `--response-format-file`.
+* A successful real Ollama session using direct command-line configuration.
+* A successful real Ollama session using interactive setup.
+* A successful direct response:
+  `{"risk_level":"low","summary":"Structured output works."}`.
+* A successful setup response:
+  `{"risk_level":"medium","summary":"Setup structured output works."}`.
+* Confirmation that both real responses respected the required properties and
+  configured enum.
+* Confirmation that the temporary response format file was removed after
+  validation.
+
+### Technical Decisions
+
+* Used a dedicated provider-independent response format abstraction.
+* Used `JSONResponseFormat` rather than placing raw schemas directly on
+  `ChatRequest`.
+* Used `name` as a portable shared field because OpenAI requires a schema name.
+* Kept strict structured output behavior implicit rather than exposing a
+  provider-dependent `strict` option.
+* Always enabled strict mode for the OpenAI translation.
+* Used native structured output APIs for all three providers.
+* Kept provider translation inside each provider adapter.
+* Continued returning provider output as a string.
+* Required file-based schema input rather than inline command-line JSON.
+* Avoided shell escaping and quoting problems for large schemas.
+* Limited response format files to 100 KiB.
+* Required exactly `name` and `schema` at the file root.
+* Stored schemas internally as canonical JSON to provide defensive
+  immutability.
+* Used `allow_nan=False` to enforce strict JSON numeric values.
+* Reused the same loader for direct CLI and interactive setup workflows.
+* Preserved the existing application behavior when structured output is not
+  selected.
+* Added no new third-party dependencies.
+
+### Current Limitations
+
+* Only top-level JSON object schemas are accepted.
+* Complete JSON Schema specification validation is not implemented.
+* Unsupported JSON Schema keywords are not detected locally.
+* Provider-specific JSON Schema subsets are not represented.
+* Model-specific structured output compatibility is not checked.
+* Provider or model support is discovered only when the API request is made.
+* Responses remain JSON strings.
+* Responses are not deserialized into Python objects.
+* Responses are not validated locally against the configured schema after
+  generation.
+* Invalid provider output is not repaired or retried automatically.
+* Pydantic models cannot be supplied directly.
+* Python dataclasses cannot be converted automatically into schemas.
+* Inline JSON Schema command-line input is not supported.
+* Only one response format can be active per session.
+* Response formats cannot be changed during an active conversation.
+* Response format files are not copied or persisted by the application.
+* The interactive setup does not provide a schema editor.
+* Responses are not streamed.
+* Conversation history remains in memory only.
+* Logging and structured observability are not implemented.
+
+### Next Milestone
+
+Introduce provider-independent tool calling so models can request structured
+application actions through a shared tool definition, invocation, and result
+abstraction.
+
+After tool calling is stable, continue toward Retrieval-Augmented Generation,
+agent orchestration, evaluation, observability, and deployment.
