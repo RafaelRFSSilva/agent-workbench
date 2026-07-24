@@ -7,6 +7,7 @@ from agent_workbench.context import ContextDocument
 from agent_workbench.errors import CompletionError
 from agent_workbench.messages import ChatRequest, Message
 from agent_workbench.agents import get_agent_profile
+from agent_workbench.generation import GenerationConfig
 
 
 class FakeProvider:
@@ -23,6 +24,7 @@ class FakeProvider:
         self.calls: list[list[Message]] = []
         self.system_prompts: list[str | None] = []
         self.context_documents: list[tuple[ContextDocument, ...]] = []
+        self.generation_configs: list[GenerationConfig] = []
 
     def complete(self, request: ChatRequest) -> str:
         """Return the next configured response or error."""
@@ -30,6 +32,7 @@ class FakeProvider:
         self.calls.append([message.copy() for message in request.messages])
         self.system_prompts.append(request.system_prompt)
         self.context_documents.append(request.context_documents)
+        self.generation_configs.append(request.generation_config)
 
         outcome = next(self._outcomes)
 
@@ -260,6 +263,45 @@ def test_context_documents_are_forwarded_without_entering_history(
             {
                 "role": "user",
                 "content": "Review the supplied project files.",
+            }
+        ]
+    ]
+
+
+def test_generation_config_is_forwarded_without_entering_history(
+    monkeypatch,
+) -> None:
+    """Forward generation settings separately from conversation messages."""
+
+    user_inputs = iter(
+        [
+            "Generate a concise response.",
+            "/exit",
+        ]
+    )
+    provider = FakeProvider(["configured response"])
+    generation_config = GenerationConfig(
+        temperature=0.2,
+        top_p=0.8,
+        max_output_tokens=256,
+    )
+
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda _: next(user_inputs),
+    )
+
+    run_cli(
+        provider,
+        generation_config=generation_config,
+    )
+
+    assert provider.generation_configs == [generation_config]
+    assert provider.calls == [
+        [
+            {
+                "role": "user",
+                "content": "Generate a concise response.",
             }
         ]
     ]

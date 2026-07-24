@@ -2,7 +2,7 @@
 
 from argparse import ArgumentParser, ArgumentTypeError
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import cast
 from pathlib import Path
 
@@ -21,6 +21,7 @@ from agent_workbench.config import (
 )
 from agent_workbench.context import ContextDocument, load_context_document
 from agent_workbench.errors import ConfigurationError
+from agent_workbench.generation import GenerationConfig
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +34,9 @@ class CLIArguments:
     agent_name: str | None = None
     agent_file: Path | None = None
     context_files: tuple[Path, ...] = ()
+    temperature: float | None = None
+    top_p: float | None = None
+    max_output_tokens: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +48,7 @@ class RuntimeConfiguration:
     system_prompt: str | None = None
     agent_profile: AgentProfile | None = None
     context_documents: tuple[ContextDocument, ...] = ()
+    generation_config: GenerationConfig = field(default_factory=GenerationConfig)
 
 
 def _non_empty_model_name(value: str) -> str:
@@ -88,6 +93,58 @@ def _context_file_path(value: str) -> Path:
         raise ArgumentTypeError("context file path must not be blank")
 
     return Path(normalized_path).expanduser()
+
+
+def _unit_interval(
+    value: str,
+    *,
+    argument_name: str,
+) -> float:
+    """Parse a numeric command-line value between zero and one."""
+
+    try:
+        parsed_value = float(value)
+    except ValueError as exc:
+        raise ArgumentTypeError(
+            f"{argument_name} must be a number between 0.0 and 1.0"
+        ) from exc
+
+    if not 0.0 <= parsed_value <= 1.0:
+        raise ArgumentTypeError(f"{argument_name} must be a number between 0.0 and 1.0")
+
+    return parsed_value
+
+
+def _temperature(value: str) -> float:
+    """Parse a portable temperature value."""
+
+    return _unit_interval(
+        value,
+        argument_name="temperature",
+    )
+
+
+def _top_p(value: str) -> float:
+    """Parse a portable top-p value."""
+
+    return _unit_interval(
+        value,
+        argument_name="top-p",
+    )
+
+
+def _positive_output_token_limit(value: str) -> int:
+    """Parse a positive maximum output token count."""
+
+    try:
+        parsed_value = int(value)
+    except ValueError as exc:
+        raise ArgumentTypeError("max output tokens must be a positive integer") from exc
+
+    if parsed_value <= 0:
+        raise ArgumentTypeError("max output tokens must be a positive integer")
+
+    return parsed_value
 
 
 def parse_cli_arguments(
@@ -139,6 +196,24 @@ def parse_cli_arguments(
         help="Path to a context file. May be supplied multiple times.",
     )
 
+    parser.add_argument(
+        "--temperature",
+        type=_temperature,
+        help="Sampling temperature between 0.0 and 1.0.",
+    )
+
+    parser.add_argument(
+        "--top-p",
+        type=_top_p,
+        help="Nucleus sampling probability between 0.0 and 1.0.",
+    )
+
+    parser.add_argument(
+        "--max-output-tokens",
+        type=_positive_output_token_limit,
+        help="Maximum number of tokens generated in each response.",
+    )
+
     parsed_arguments = parser.parse_args(argv)
 
     provider_name = (
@@ -154,6 +229,9 @@ def parse_cli_arguments(
         agent_name=parsed_arguments.agent,
         agent_file=parsed_arguments.agent_file,
         context_files=tuple(parsed_arguments.context_file),
+        temperature=parsed_arguments.temperature,
+        top_p=parsed_arguments.top_p,
+        max_output_tokens=parsed_arguments.max_output_tokens,
     )
 
 
@@ -193,6 +271,12 @@ def resolve_runtime_configuration(
         load_context_document(path) for path in arguments.context_files
     )
 
+    generation_config = GenerationConfig(
+        temperature=arguments.temperature,
+        top_p=arguments.top_p,
+        max_output_tokens=arguments.max_output_tokens,
+    )
+
     provider_name = arguments.provider_name or get_provider_name()
     model_name = arguments.model_name or get_model_name(provider_name)
 
@@ -202,4 +286,5 @@ def resolve_runtime_configuration(
         system_prompt=system_prompt,
         agent_profile=agent_profile,
         context_documents=context_documents,
+        generation_config=generation_config,
     )

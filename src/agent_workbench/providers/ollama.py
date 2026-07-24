@@ -55,12 +55,33 @@ class OllamaProvider:
                 }
             )
 
-        try:
-            response = chat(
-                model=self.model_name,
-                messages=request_messages,
-                stream=False,
+        generation_options: dict[str, float | int] = {}
+
+        if request.generation_config.temperature is not None:
+            generation_options["temperature"] = request.generation_config.temperature
+
+        if request.generation_config.top_p is not None:
+            generation_options["top_p"] = request.generation_config.top_p
+
+        if request.generation_config.max_output_tokens is not None:
+            generation_options["num_predict"] = (
+                request.generation_config.max_output_tokens
             )
+
+        try:
+            if generation_options:
+                response = chat(
+                    model=self.model_name,
+                    messages=request_messages,
+                    options=generation_options,
+                    stream=False,
+                )
+            else:
+                response = chat(
+                    model=self.model_name,
+                    messages=request_messages,
+                    stream=False,
+                )
         except ConnectionError as exc:
             raise CompletionError(
                 "Unable to connect to Ollama. "

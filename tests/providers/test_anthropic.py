@@ -18,6 +18,7 @@ from agent_workbench.context import (
     ContextDocument,
 )
 from agent_workbench.errors import CompletionError
+from agent_workbench.generation import GenerationConfig
 from agent_workbench.messages import ChatRequest
 from agent_workbench.providers.anthropic import AnthropicProvider
 
@@ -227,4 +228,52 @@ def test_context_documents_are_added_to_system_instructions() -> None:
             "Agent Workbench documentation.\n"
             "</context_document>"
         ),
+    )
+
+
+def test_generation_config_is_translated_to_anthropic_arguments() -> None:
+    """Translate shared generation settings into Anthropic arguments."""
+
+    create = Mock(
+        return_value=SimpleNamespace(
+            content=[
+                SimpleNamespace(
+                    type="text",
+                    text="Configured Anthropic response",
+                )
+            ]
+        )
+    )
+    client = SimpleNamespace(
+        messages=SimpleNamespace(create=create),
+    )
+    provider = AnthropicProvider(
+        model_name="claude-test",
+        client=client,
+    )
+    messages = [
+        {
+            "role": "user",
+            "content": "Generate a short response.",
+        }
+    ]
+
+    request = ChatRequest(
+        messages=messages,
+        generation_config=GenerationConfig(
+            temperature=0.2,
+            top_p=0.8,
+            max_output_tokens=256,
+        ),
+    )
+
+    result = provider.complete(request)
+
+    assert result == "Configured Anthropic response"
+    create.assert_called_once_with(
+        model="claude-test",
+        max_tokens=256,
+        messages=messages,
+        temperature=0.2,
+        top_p=0.8,
     )

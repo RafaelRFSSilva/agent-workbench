@@ -366,3 +366,113 @@ def test_runtime_configuration_loads_context_documents_in_order(
         "First document.",
         "Second document.",
     ]
+
+
+def test_runtime_configuration_uses_default_generation_config(
+    monkeypatch,
+) -> None:
+    """Use provider defaults when generation parameters are absent."""
+
+    monkeypatch.setenv(PROVIDER_ENV_VAR, "ollama")
+    monkeypatch.setenv(MODEL_ENV_VAR, "gpt-oss:20b")
+
+    configuration = resolve_runtime_configuration(
+        CLIArguments(
+            provider_name=None,
+            model_name=None,
+        )
+    )
+
+    assert configuration.generation_config.temperature is None
+    assert configuration.generation_config.top_p is None
+    assert configuration.generation_config.max_output_tokens is None
+
+
+def test_parse_cli_arguments_accepts_generation_parameters() -> None:
+    """Parse provider-independent generation parameters."""
+
+    arguments = parse_cli_arguments(
+        [
+            "--temperature",
+            "0.2",
+            "--top-p",
+            "0.8",
+            "--max-output-tokens",
+            "512",
+        ]
+    )
+
+    assert arguments.temperature == 0.2
+    assert arguments.top_p == 0.8
+    assert arguments.max_output_tokens == 512
+
+
+@pytest.mark.parametrize(
+    ("argument", "value"),
+    [
+        ("--temperature", "-0.1"),
+        ("--temperature", "1.1"),
+        ("--temperature", "invalid"),
+        ("--top-p", "-0.1"),
+        ("--top-p", "1.1"),
+        ("--top-p", "invalid"),
+    ],
+)
+def test_parse_cli_arguments_rejects_invalid_sampling_values(
+    argument,
+    value,
+) -> None:
+    """Reject sampling values outside the portable range."""
+
+    with pytest.raises(SystemExit) as exc_info:
+        parse_cli_arguments(
+            [
+                argument,
+                value,
+            ]
+        )
+
+    assert exc_info.value.code == 2
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "0",
+        "-1",
+        "1.5",
+        "invalid",
+    ],
+)
+def test_parse_cli_arguments_rejects_invalid_output_token_limit(
+    value,
+) -> None:
+    """Reject invalid maximum output token limits."""
+
+    with pytest.raises(SystemExit) as exc_info:
+        parse_cli_arguments(
+            [
+                "--max-output-tokens",
+                value,
+            ]
+        )
+
+    assert exc_info.value.code == 2
+
+
+def test_runtime_configuration_preserves_generation_parameters() -> None:
+    """Resolve CLI generation parameters into runtime configuration."""
+
+    configuration = resolve_runtime_configuration(
+        CLIArguments(
+            provider_name="ollama",
+            model_name="gpt-oss:20b",
+            temperature=0.2,
+            top_p=0.8,
+            max_output_tokens=512,
+        )
+    )
+
+    assert configuration.generation_config.temperature == 0.2
+    assert configuration.generation_config.top_p == 0.8
+    assert configuration.generation_config.max_output_tokens == 512

@@ -1,7 +1,7 @@
 """OpenAI provider implementation."""
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import NotRequired, Protocol, TypedDict, Unpack
 
 from openai import APIConnectionError, APIStatusError
 
@@ -16,15 +16,23 @@ class OpenAIResponse(Protocol):
     output_text: str
 
 
+class OpenAIResponseCreateArguments(TypedDict):
+    """Represent arguments supplied to the OpenAI Responses API."""
+
+    model: str
+    input: list[Message]
+    instructions: NotRequired[str]
+    temperature: NotRequired[float]
+    top_p: NotRequired[float]
+    max_output_tokens: NotRequired[int]
+
+
 class OpenAIResponsesResource(Protocol):
     """Define the Responses API operation required by the provider."""
 
     def create(
         self,
-        *,
-        model: str,
-        input: list[Message],
-        instructions: str | None = None,
+        **kwargs: Unpack[OpenAIResponseCreateArguments],
     ) -> OpenAIResponse:
         """Create a model response."""
 
@@ -66,18 +74,29 @@ class OpenAIProvider:
             request.context_documents,
         )
 
+        response_arguments: OpenAIResponseCreateArguments = {
+            "model": self.model_name,
+            "input": input_messages,
+        }
+
+        if system_instructions is not None:
+            response_arguments["instructions"] = system_instructions
+
+        if request.generation_config.temperature is not None:
+            response_arguments["temperature"] = request.generation_config.temperature
+
+        if request.generation_config.top_p is not None:
+            response_arguments["top_p"] = request.generation_config.top_p
+
+        if request.generation_config.max_output_tokens is not None:
+            response_arguments["max_output_tokens"] = (
+                request.generation_config.max_output_tokens
+            )
+
         try:
-            if system_instructions is None:
-                response = self.client.responses.create(
-                    model=self.model_name,
-                    input=input_messages,
-                )
-            else:
-                response = self.client.responses.create(
-                    model=self.model_name,
-                    input=input_messages,
-                    instructions=system_instructions,
-                )
+            response = self.client.responses.create(
+                **response_arguments,
+            )
         except APIConnectionError as exc:
             raise CompletionError(
                 "Unable to connect to OpenAI. Check the network connection."

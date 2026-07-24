@@ -13,6 +13,7 @@ from agent_workbench.context import (
     ContextDocument,
 )
 from agent_workbench.errors import CompletionError
+from agent_workbench.generation import GenerationConfig
 from agent_workbench.messages import ChatRequest, Message
 from agent_workbench.providers.openai import OpenAIProvider
 
@@ -208,4 +209,40 @@ def test_context_documents_are_added_to_instructions() -> None:
             "Agent Workbench documentation.\n"
             "</context_document>"
         ),
+    )
+
+
+def test_generation_config_is_translated_to_openai_arguments() -> None:
+    """Translate shared generation settings into OpenAI arguments."""
+
+    client, create_mock = create_fake_client("Configured OpenAI response")
+    provider = OpenAIProvider(
+        model_name="test-model",
+        client=client,
+    )
+    messages: list[Message] = [
+        {
+            "role": "user",
+            "content": "Generate a short response.",
+        }
+    ]
+
+    request = ChatRequest(
+        messages=messages,
+        generation_config=GenerationConfig(
+            temperature=0.2,
+            top_p=0.8,
+            max_output_tokens=256,
+        ),
+    )
+
+    result = provider.complete(request)
+
+    assert result == "Configured OpenAI response"
+    create_mock.assert_called_once_with(
+        model="test-model",
+        input=messages,
+        temperature=0.2,
+        top_p=0.8,
+        max_output_tokens=256,
     )
