@@ -47,6 +47,13 @@ Implemented capabilities:
 - Strict validation of portable generation parameter ranges
 - Provider-specific generation translation for Ollama, OpenAI, and Anthropic
 - Preservation of provider defaults when optional parameters are not supplied
+- Interactive runtime configuration through the `--setup` argument
+- Guided provider and model selection with safe defaults
+- Optional built-in agent profile selection during setup
+- Interactive loading and validation of multiple context files
+- Interactive configuration of temperature, top-p, and maximum output tokens
+- Repeated prompts after invalid interactive input
+- Preservation of the existing non-interactive CLI workflow
 
 ## Architecture
 
@@ -576,12 +583,259 @@ the expected final content. Very small output budgets may therefore be
 insufficient for models that consume part of the generation budget before
 producing their final answer.
 
+## Interactive Runtime Setup
+
+Agent Workbench provides an optional guided setup flow for users who do not
+want to memorize all command-line configuration arguments.
+
+Start the interactive setup with:
+
+```bash
+uv run agent-workbench --setup
+```
+
+The setup collects the session configuration in the following order:
+
+```text
+Provider
+    ↓
+Model
+    ↓
+Built-In Agent Profile
+    ↓
+Context Files
+    ↓
+Generation Settings
+    ↓
+Interactive Conversation
+```
+
+The selected values are converted into the same provider-independent
+`RuntimeConfiguration` used by the normal command-line workflow:
+
+```text
+--setup
+   ↓
+Interactive Setup
+   ↓
+RuntimeConfiguration
+├── provider_name
+├── model_name
+├── system_prompt
+├── agent_profile
+├── context_documents
+└── generation_config
+   ↓
+Provider Factory
+   ↓
+Interactive Conversation
+```
+
+The setup does not introduce a separate provider or conversation
+implementation. Provider construction, request translation, error handling,
+and conversation execution continue to use the existing application
+architecture.
+
+### Provider Selection
+
+The currently configured provider is shown as the default:
+
+```text
+Available providers:
+  1. anthropic
+  2. ollama
+  3. openai
+Provider [ollama]:
+```
+
+Users may select a provider by entering either its name or menu number.
+
+Pressing Enter accepts the displayed default.
+
+Invalid provider values are rejected and the question is repeated without
+terminating the application.
+
+### Model Selection
+
+When the selected provider matches the configured provider, the configured
+model is offered as the default.
+
+When switching to Ollama, the application can safely offer the default local
+model:
+
+```text
+Model [gpt-oss:20b]:
+```
+
+A model configured for one provider is not reused automatically with another
+provider.
+
+For example, an Ollama model is not suggested after selecting OpenAI or
+Anthropic. When no safe default exists, the user must provide a non-empty
+provider-specific model name.
+
+### Agent Profile Selection
+
+The setup supports the packaged built-in agent profiles:
+
+```text
+Available agent profiles:
+  0. none
+  1. developer
+  2. planner
+  3. reviewer
+  4. tester
+Agent [none]:
+```
+
+Pressing Enter, entering `0`, or entering `none` starts the session without an
+agent profile.
+
+An agent can be selected through its name or menu number.
+
+The selected profile is resolved through the same existing agent-profile
+pipeline and provides the active system prompt, display name, and role
+description.
+
+Custom `--agent-file` profiles and direct `--system-prompt` values are not
+currently collected by the interactive setup.
+
+### Context File Selection
+
+The setup accepts zero or more context files:
+
+```text
+Context files:
+Enter one file path at a time. Press Enter when finished.
+Context file [done]: README.md
+Added context file: README.md
+Context file [done]: pyproject.toml
+Added context file: pyproject.toml
+Context file [done]:
+```
+
+Every path is validated immediately through the existing context document
+loader.
+
+The same file requirements apply as in the normal CLI workflow:
+
+- The path must exist.
+- The path must point to a regular file.
+- The extension must be supported.
+- The contents must be valid UTF-8.
+- The file must not be empty or whitespace-only.
+- The file must not exceed the individual 100 KiB limit.
+
+Invalid files are reported and the setup continues asking for another path.
+
+Multiple valid files preserve the order in which they were entered.
+
+### Generation Settings
+
+The setup collects the provider-independent generation parameters:
+
+```text
+Generation settings:
+Press Enter to use the provider or model default.
+Temperature [provider default]:
+Top-p [provider default]:
+Maximum output tokens [provider default]:
+```
+
+The supported values are:
+
+| Setting               | Validation                              |
+| --------------------- | --------------------------------------- |
+| Temperature           | Optional number between `0.0` and `1.0` |
+| Top-p                 | Optional number between `0.0` and `1.0` |
+| Maximum output tokens | Optional positive integer               |
+
+Pressing Enter leaves a parameter unset and preserves the provider or model
+default.
+
+Invalid values are rejected and the individual question is repeated.
+
+The collected values are stored in `GenerationConfig` and translated by the
+selected provider adapter exactly as they are when supplied through direct
+command-line arguments.
+
+### Argument Compatibility
+
+The interactive setup is an explicit alternative to direct configuration
+arguments.
+
+Therefore, `--setup` cannot be combined with:
+
+```text
+--provider
+--model
+--system-prompt
+--agent
+--agent-file
+--context-file
+--temperature
+--top-p
+--max-output-tokens
+```
+
+This prevents ambiguous configuration sources inside the same session.
+
+Running Agent Workbench without `--setup` preserves the existing behavior and
+continues to resolve configuration through command-line arguments,
+environment variables, the local `.env` file, and application defaults.
+
+### Example
+
+```text
+Agent Workbench Interactive Setup
+Press Enter to accept a displayed default or skip an optional value.
+
+Available providers:
+  1. anthropic
+  2. ollama
+  3. openai
+Provider [anthropic]: 2
+Model [gpt-oss:20b]:
+
+Available agent profiles:
+  0. none
+  1. developer
+  2. planner
+  3. reviewer
+  4. tester
+Agent [none]: 3
+
+Context files:
+Enter one file path at a time. Press Enter when finished.
+Context file [done]: README.md
+Added context file: README.md
+Context file [done]:
+
+Generation settings:
+Press Enter to use the provider or model default.
+Temperature [provider default]: 0.0
+Top-p [provider default]: 1.0
+Maximum output tokens [provider default]: 256
+```
+
 ## Usage
 
 Start the CLI using the configuration stored in `.env`:
 
 ```bash
 uv run agent-workbench
+```
+
+Start the guided interactive setup:
+
+```bash
+uv run agent-workbench --setup
+```
+
+Display the available command-line options:
+
+```bash
+uv run agent-workbench --help
 ```
 
 Display the available command-line options:
@@ -746,7 +1000,8 @@ uv run ruff format --check .
 - [x] Support custom agent profile files
 - [x] Add file-based conversation context
 - [x] Add provider-independent generation configuration
-- [ ] Add an interactive setup wizard
+- [x] Add prompt-based interactive runtime setup
+- [ ] Add a navigable terminal setup wizard
 - [ ] Discover custom profiles from a user profile directory
 - [ ] Coordinate multiple agents through an orchestrator
 - [ ] Add structured outputs

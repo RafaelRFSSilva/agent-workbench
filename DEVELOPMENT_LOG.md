@@ -1363,3 +1363,271 @@ command-line arguments.
 After the interactive setup flow is stable, continue toward structured model
 outputs, tool calling, Retrieval-Augmented Generation, agent orchestration,
 evaluation, observability, and deployment.
+
+
+## 2026-07-24 — Interactive Runtime Setup
+
+### Objective
+
+Provide a guided runtime configuration flow so users can prepare a complete
+Agent Workbench session without memorizing provider, model, agent, context, and
+generation command-line arguments.
+
+### Implemented
+
+* Added the `--setup` command-line argument.
+* Added explicit validation preventing `--setup` from being combined with
+  direct configuration arguments.
+* Added the interactive runtime setup module.
+* Added guided provider selection.
+* Allowed providers to be selected by name or menu number.
+* Displayed the currently configured provider as the default.
+* Added safe model-default resolution.
+* Prevented models configured for one provider from being suggested for a
+  different provider.
+* Required a non-empty model when no safe default exists.
+* Added optional built-in agent profile selection.
+* Allowed agent profiles to be selected by name or menu number.
+* Added an explicit `none` agent option.
+* Added interactive loading of zero or more context files.
+* Validated context files immediately through the existing context loader.
+* Preserved the order of multiple context documents.
+* Added interactive temperature configuration.
+* Added interactive top-p configuration.
+* Added interactive maximum-output-token configuration.
+* Preserved provider defaults when generation fields are skipped.
+* Repeated individual questions after invalid input.
+* Converted the collected values into the existing `RuntimeConfiguration`.
+* Reused the existing provider factory and conversation execution flow.
+* Preserved the existing non-interactive CLI behavior.
+* Added automated tests for parsing, conflict validation, setup integration,
+  provider selection, model selection, agents, context files, and generation
+  settings.
+
+### Architecture
+
+```text
+uv run agent-workbench --setup
+              ↓
+Interactive Runtime Setup
+              ↓
+Provider Selection
+              ↓
+Model Selection
+              ↓
+Agent Profile Selection
+              ↓
+Context File Selection
+              ↓
+Generation Configuration
+              ↓
+RuntimeConfiguration
+├── provider_name
+├── model_name
+├── system_prompt
+├── agent_profile
+├── context_documents
+└── generation_config
+              ↓
+Provider Factory
+              ↓
+Interactive Conversation
+```
+
+The setup produces the same `RuntimeConfiguration` used by the direct
+command-line workflow.
+
+It does not create a separate provider-construction path or conversation
+implementation.
+
+### Provider and Model Defaults
+
+The configured provider is displayed as the setup default.
+
+The model is offered as a default only when it is safe for the selected
+provider.
+
+```text
+Configured provider and model
+        ↓
+Selected provider matches configured provider
+        ↓
+Configured model can be offered
+```
+
+When the user switches providers, the application does not automatically reuse
+the previously configured model.
+
+Ollama can fall back to the application default `gpt-oss:20b`. Cloud providers
+require the user to enter a model when no matching configured model is
+available.
+
+### Agent Selection
+
+The setup lists the four packaged profiles:
+
+```text
+0. none
+1. developer
+2. planner
+3. reviewer
+4. tester
+```
+
+The selected built-in profile is resolved through the existing agent profile
+registry.
+
+The resulting profile supplies the system prompt, agent identity, and role
+description used by the conversation.
+
+### Context Selection
+
+Users can enter context paths one at a time and press Enter when finished.
+
+Each path is loaded immediately through `load_context_document()`.
+
+Invalid paths, unsupported extensions, directories, oversized files, invalid
+UTF-8 contents, and blank files are reported without terminating the setup.
+
+Validated context documents are stored in their original input order.
+
+Because `RuntimeConfiguration` is immutable, `dataclasses.replace()` is used
+to attach the already validated context documents to the resolved
+configuration.
+
+### Generation Settings
+
+The setup collects:
+
+```text
+temperature
+top_p
+max_output_tokens
+```
+
+Temperature and top-p accept optional values between `0.0` and `1.0`.
+
+Maximum output tokens accepts an optional positive integer.
+
+Leaving a value blank stores `None`, allowing the selected provider or model to
+retain its default behavior.
+
+The setup creates the existing provider-independent `GenerationConfig`; native
+parameter translation remains inside each provider adapter.
+
+### Argument Compatibility
+
+The following combinations are rejected:
+
+```text
+--setup + --provider
+--setup + --model
+--setup + --system-prompt
+--setup + --agent
+--setup + --agent-file
+--setup + --context-file
+--setup + --temperature
+--setup + --top-p
+--setup + --max-output-tokens
+```
+
+This keeps interactive and direct configuration as two unambiguous entry
+points into the same runtime architecture.
+
+### Validation
+
+The implementation was validated through:
+
+* Successful Ruff formatting and static-analysis checks.
+* One hundred and forty-nine passing automated tests.
+* Verification that `--setup` appears in CLI help.
+* Verification that `--setup` is parsed independently.
+* Verification that setup conflicts with direct configuration arguments are
+  rejected.
+* Verification that the existing non-setup configuration path is preserved.
+* Verification that `main()` uses the interactive configuration before
+  constructing the provider.
+* Verification that environment provider and model defaults can be accepted by
+  pressing Enter.
+* Verification that providers can be selected by name.
+* Verification that providers can be selected by menu number.
+* Verification that invalid provider selections are asked again.
+* Verification that a model from one provider is not reused for another
+  provider.
+* Verification that blank models are rejected when no safe default exists.
+* Verification that the setup can start without an agent.
+* Verification that built-in agents can be selected by menu number.
+* Verification that built-in agents can be selected by name.
+* Verification that invalid agent selections are asked again.
+* Verification that multiple context files preserve their input order.
+* Verification that invalid context files do not terminate the setup.
+* Verification that optional generation values can all remain unset.
+* Verification that valid generation parameters are collected.
+* Verification that invalid temperature values are asked again.
+* Verification that invalid top-p values are asked again.
+* Verification that invalid output-token limits are asked again.
+* A successful real interactive setup using Ollama and `gpt-oss:20b`.
+* A successful real selection of the built-in Reviewer profile.
+* A successful real context-file load through the setup.
+* A successful real setup using `temperature=0.0`, `top_p=1.0`, and
+  `max_output_tokens=256`.
+* Confirmation that the model recovered the exact validation code
+  `SETUP-149-OK` from the supplied context.
+* Confirmation that the model identified the project owner as `Rafael Silva`.
+* Confirmation that the temporary validation file was removed after the test.
+
+### Technical Decisions
+
+* Made the setup explicit through `--setup` rather than changing the default
+  startup behavior.
+* Kept argument parsing separate from interactive terminal input.
+* Kept interactive setup logic in a dedicated module.
+* Used injectable input and output functions to make the setup deterministic
+  in automated tests.
+* Reused `RuntimeConfiguration` as the output of both direct and interactive
+  configuration.
+* Reused `resolve_runtime_configuration()` for agent and generation
+  configuration.
+* Reused `load_context_document()` for context validation.
+* Reused `create_provider()` after setup completion.
+* Preserved the provider-independent `ChatRequest` and conversation pipeline.
+* Ordered providers and built-in agent names alphabetically for predictable
+  menu numbering.
+* Allowed both names and menu numbers to make selection convenient.
+* Repeated only the invalid question rather than restarting the complete
+  setup.
+* Preserved optional provider defaults through blank generation inputs.
+* Avoided saving setup values to disk in this milestone.
+* Avoided adding a new third-party dependency for terminal menus.
+
+### Current Limitations
+
+* The setup is a plain text terminal flow.
+* Arrow-key navigation and graphical terminal controls are not supported.
+* Setup values are not persisted between sessions.
+* The setup does not create or update `.env`.
+* Custom agent profile files cannot be selected through the setup.
+* Direct system prompts cannot be entered through the setup.
+* Context directories cannot be scanned.
+* Context files cannot be removed after being added during setup.
+* Duplicate context paths are not detected.
+* The setup cannot be cancelled through `/exit` or `/quit`.
+* Provider API credentials are not collected by the setup.
+* Provider and model availability are not verified before the conversation
+  begins.
+* Model-specific generation compatibility is not detected.
+* Generation presets are not available.
+* Setup values cannot be changed during an active conversation.
+* Responses are not streamed.
+* Conversation history remains in memory only.
+* Logging and structured observability are not implemented.
+
+### Next Milestone
+
+Introduce provider-independent structured outputs so callers can request
+machine-readable model responses through a shared schema or response-format
+abstraction.
+
+After structured outputs are stable, continue toward tool calling,
+Retrieval-Augmented Generation, agent orchestration, evaluation,
+observability, and deployment.

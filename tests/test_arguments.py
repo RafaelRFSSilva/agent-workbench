@@ -476,3 +476,52 @@ def test_runtime_configuration_preserves_generation_parameters() -> None:
     assert configuration.generation_config.temperature == 0.2
     assert configuration.generation_config.top_p == 0.8
     assert configuration.generation_config.max_output_tokens == 512
+
+
+def test_parse_cli_arguments_accepts_interactive_setup() -> None:
+    """Enable the interactive runtime setup flow."""
+
+    arguments = parse_cli_arguments(["--setup"])
+
+    assert arguments.setup is True
+    assert arguments.provider_name is None
+    assert arguments.model_name is None
+
+
+@pytest.mark.parametrize(
+    "conflicting_arguments",
+    [
+        [
+            "--provider",
+            "ollama",
+            "--model",
+            "gpt-oss:20b",
+        ],
+        [
+            "--agent",
+            "reviewer",
+        ],
+        [
+            "--context-file",
+            "README.md",
+        ],
+        [
+            "--temperature",
+            "0.2",
+        ],
+    ],
+)
+def test_interactive_setup_rejects_configuration_arguments(
+    conflicting_arguments,
+) -> None:
+    """Reject ambiguous setup and direct configuration combinations."""
+
+    with pytest.raises(SystemExit) as exc_info:
+        parse_cli_arguments(
+            [
+                "--setup",
+                *conflicting_arguments,
+            ]
+        )
+
+    assert exc_info.value.code == 2
