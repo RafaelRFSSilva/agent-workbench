@@ -1178,3 +1178,188 @@ provider-supported options.
 After generation configuration is stable, add an interactive setup wizard so
 users can select providers, models, agents, context files, and inference
 presets without memorizing command-line arguments.
+
+
+## 2026-07-24 — Provider-Independent Generation Configuration
+
+### Objective
+
+Allow users to control common text-generation parameters without exposing the
+interactive CLI and conversation layer to provider-specific API names.
+
+### Implemented
+
+* Added the immutable `GenerationConfig` data structure.
+* Added optional provider-independent `temperature`, `top_p`, and
+  `max_output_tokens` fields.
+* Added validation for portable sampling values between `0.0` and `1.0`.
+* Added validation requiring maximum output tokens to be a positive integer.
+* Explicitly rejected boolean values from numeric generation fields.
+* Added `GenerationConfig` to `ChatRequest`.
+* Added generation configuration to `RuntimeConfiguration`.
+* Forwarded generation settings separately from conversation history.
+* Added the `--temperature` command-line argument.
+* Added the `--top-p` command-line argument.
+* Added the `--max-output-tokens` command-line argument.
+* Added CLI parsing and early validation for generation values.
+* Preserved provider defaults when optional parameters are not supplied.
+* Added generation translation for Ollama.
+* Added generation translation for the OpenAI Responses API.
+* Added generation translation for the Anthropic Messages API.
+* Added typed provider request argument structures.
+* Added automated tests for validation, CLI parsing, runtime resolution,
+  request forwarding, and provider translation.
+
+### Architecture
+
+```text
+--temperature
+--top-p
+--max-output-tokens
+        ↓
+CLIArguments
+        ↓
+GenerationConfig
+├── temperature
+├── top_p
+└── max_output_tokens
+        ↓
+RuntimeConfiguration.generation_config
+        ↓
+Interactive CLI
+        ↓
+ChatRequest.generation_config
+        ↓
+Provider Adapter
+```
+
+Generation configuration remains separate from:
+
+```text
+ChatRequest
+├── system_prompt
+├── context_documents
+├── generation_config
+└── messages
+```
+
+Generation parameters are runtime request configuration rather than
+conversation messages or model instructions.
+
+### Provider Translation
+
+```text
+GenerationConfig
+├── OllamaProvider
+│   ├── temperature → options["temperature"]
+│   ├── top_p → options["top_p"]
+│   └── max_output_tokens → options["num_predict"]
+│
+├── OpenAIProvider
+│   ├── temperature → temperature
+│   ├── top_p → top_p
+│   └── max_output_tokens → max_output_tokens
+│
+└── AnthropicProvider
+    ├── temperature → temperature
+    ├── top_p → top_p
+    └── max_output_tokens → max_tokens
+```
+
+Ollama and OpenAI generation parameters are omitted completely when they are
+not configured, preserving provider and model defaults.
+
+Anthropic requires `max_tokens` in every Messages API request. When the shared
+maximum output value is absent, the provider continues to use its existing
+default of `1024`.
+
+### Validation
+
+The implementation was validated through:
+
+* Successful Ruff formatting and static-analysis checks.
+* One hundred and thirty-four passing automated tests.
+* Verification that all generation parameters remain optional.
+* Verification that default `GenerationConfig` values are `None`.
+* Verification that temperature accepts boundary values `0.0` and `1.0`.
+* Verification that top-p accepts boundary values `0.0` and `1.0`.
+* Verification that values outside the portable interval are rejected.
+* Verification that non-numeric sampling values are rejected by the CLI.
+* Verification that maximum output tokens must be a positive integer.
+* Verification that floating-point, zero, negative, string, and boolean token
+  limits are rejected.
+* Verification that CLI arguments are preserved in runtime configuration.
+* Verification that generation settings are forwarded separately from
+  conversation history.
+* Verification that omitted generation parameters do not alter Ollama or
+  OpenAI provider calls.
+* Verification that Ollama receives generation parameters through `options`.
+* Verification that OpenAI receives native Responses API arguments.
+* Verification that Anthropic receives native Messages API arguments.
+* Verification that Anthropic preserves its provider output-token default when
+  no shared limit is supplied.
+* Verification that provider tests use simulated clients and make no paid API
+  calls.
+* A successful real Ollama session using `temperature=0.0`, `top_p=1.0`, and
+  `max_output_tokens=256`.
+* Confirmation that `gpt-oss:20b` returned the exact expected text
+  `GENERATION-CONFIG-OK`.
+* Observation that a `32`-token output budget produced empty final content for
+  the same reasoning model.
+* Confirmation that increasing the output budget to `256` allowed the model to
+  produce its final answer.
+
+### Technical Decisions
+
+* Used a dedicated provider-independent configuration object instead of
+  adding provider-specific parameters directly to `ChatRequest`.
+* Used an immutable, slotted dataclass to prevent configuration mutation during
+  a session.
+* Kept every shared generation field optional so existing provider behavior
+  remains unchanged.
+* Used a portable `0.0` to `1.0` interval for temperature and top-p.
+* Validated values both at the CLI boundary and inside `GenerationConfig`.
+* Explicitly rejected booleans because Python treats `bool` as a subclass of
+  `int`.
+* Used `max_output_tokens` as the shared semantic name even though providers
+  use different native names.
+* Kept provider-specific translation inside each provider adapter.
+* Used typed dictionaries and `Unpack` for dynamically constructed OpenAI and
+  Anthropic keyword arguments.
+* Omitted optional keyword arguments instead of sending explicit `None`
+  values.
+* Preserved the existing Anthropic provider fallback because its API requires
+  a maximum output-token value.
+* Limited the first implementation to common provider-independent parameters.
+* Deferred stop sequences and provider-specific generation controls until a
+  later milestone.
+
+### Current Limitations
+
+* Only temperature, top-p, and maximum output tokens are represented.
+* Stop sequences are not supported by the shared configuration.
+* Reasoning effort and thinking-budget controls are not represented.
+* Seeds and deterministic generation controls are not represented.
+* Provider-specific parameters cannot be supplied through the shared CLI.
+* Model-specific parameter compatibility is not detected before the provider
+  request.
+* The application does not estimate whether the requested output limit is
+  appropriate for the selected model.
+* Very small output-token limits may prevent reasoning models from producing
+  final response content.
+* Generation presets cannot yet be stored in agent profile files.
+* Generation settings cannot be changed during an active conversation.
+* Responses are not streamed.
+* Token usage and generation metadata are not displayed.
+* Conversation state remains in memory only.
+* Logging and structured observability are not implemented.
+
+### Next Milestone
+
+Add an interactive runtime setup flow so users can select a provider, model,
+agent profile, context files, and generation settings without memorizing
+command-line arguments.
+
+After the interactive setup flow is stable, continue toward structured model
+outputs, tool calling, Retrieval-Augmented Generation, agent orchestration,
+evaluation, observability, and deployment.
