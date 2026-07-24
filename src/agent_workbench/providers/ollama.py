@@ -1,13 +1,14 @@
 """Ollama provider implementation."""
 
 from dataclasses import dataclass
-from typing import Literal, TypedDict
+from typing import Literal, NotRequired, TypedDict
 
 from ollama import ResponseError, chat
 
 from agent_workbench.context import build_system_instructions
 from agent_workbench.errors import CompletionError
 from agent_workbench.messages import ChatRequest
+from agent_workbench.structured_outputs import JSONSchema
 
 
 class OllamaMessage(TypedDict):
@@ -15,6 +16,16 @@ class OllamaMessage(TypedDict):
 
     role: Literal["system", "user", "assistant"]
     content: str
+
+
+class OllamaChatArguments(TypedDict):
+    """Represent arguments supplied to the Ollama chat API."""
+
+    model: str
+    messages: list[OllamaMessage]
+    stream: bool
+    options: NotRequired[dict[str, float | int]]
+    format: NotRequired[JSONSchema]
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,20 +79,20 @@ class OllamaProvider:
                 request.generation_config.max_output_tokens
             )
 
+        chat_arguments: OllamaChatArguments = {
+            "model": self.model_name,
+            "messages": request_messages,
+            "stream": False,
+        }
+
+        if generation_options:
+            chat_arguments["options"] = generation_options
+
+        if request.response_format is not None:
+            chat_arguments["format"] = request.response_format.schema
+
         try:
-            if generation_options:
-                response = chat(
-                    model=self.model_name,
-                    messages=request_messages,
-                    options=generation_options,
-                    stream=False,
-                )
-            else:
-                response = chat(
-                    model=self.model_name,
-                    messages=request_messages,
-                    stream=False,
-                )
+            response = chat(**chat_arguments)
         except ConnectionError as exc:
             raise CompletionError(
                 "Unable to connect to Ollama. "

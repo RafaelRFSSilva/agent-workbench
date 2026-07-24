@@ -1,7 +1,9 @@
 """Tests for command-line configuration handling."""
 
-import pytest
+import json
 from pathlib import Path
+
+import pytest
 
 from agent_workbench.arguments import (
     CLIArguments,
@@ -368,6 +370,33 @@ def test_runtime_configuration_loads_context_documents_in_order(
     ]
 
 
+def test_parse_cli_arguments_accepts_response_format_file() -> None:
+    """Parse a JSON response format file path."""
+
+    arguments = parse_cli_arguments(
+        [
+            "--response-format-file",
+            "schemas/software-review.json",
+        ]
+    )
+
+    assert arguments.response_format_file == Path("schemas/software-review.json")
+
+
+def test_parse_cli_arguments_rejects_blank_response_format_file() -> None:
+    """Reject a blank response format file path."""
+
+    with pytest.raises(SystemExit) as exc_info:
+        parse_cli_arguments(
+            [
+                "--response-format-file",
+                "   ",
+            ]
+        )
+
+    assert exc_info.value.code == 2
+
+
 def test_runtime_configuration_uses_default_generation_config(
     monkeypatch,
 ) -> None:
@@ -386,6 +415,7 @@ def test_runtime_configuration_uses_default_generation_config(
     assert configuration.generation_config.temperature is None
     assert configuration.generation_config.top_p is None
     assert configuration.generation_config.max_output_tokens is None
+    assert configuration.response_format is None
 
 
 def test_parse_cli_arguments_accepts_generation_parameters() -> None:
@@ -509,6 +539,10 @@ def test_parse_cli_arguments_accepts_interactive_setup() -> None:
             "--temperature",
             "0.2",
         ],
+        [
+            "--response-format-file",
+            "schema.json",
+        ],
     ],
 )
 def test_interactive_setup_rejects_configuration_arguments(
@@ -521,7 +555,49 @@ def test_interactive_setup_rejects_configuration_arguments(
             [
                 "--setup",
                 *conflicting_arguments,
-            ]
+            ],
         )
 
     assert exc_info.value.code == 2
+
+
+def test_runtime_configuration_loads_response_format_file(
+    tmp_path,
+) -> None:
+    """Load a response format into runtime configuration."""
+
+    format_path = tmp_path / "software-review.json"
+    schema = {
+        "type": "object",
+        "properties": {
+            "summary": {
+                "type": "string",
+            },
+        },
+        "required": [
+            "summary",
+        ],
+        "additionalProperties": False,
+    }
+
+    format_path.write_text(
+        json.dumps(
+            {
+                "name": "software_review",
+                "schema": schema,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    configuration = resolve_runtime_configuration(
+        CLIArguments(
+            provider_name="ollama",
+            model_name="gpt-oss:20b",
+            response_format_file=format_path,
+        )
+    )
+
+    assert configuration.response_format is not None
+    assert configuration.response_format.name == "software_review"
+    assert configuration.response_format.schema == schema

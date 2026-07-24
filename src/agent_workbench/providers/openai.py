@@ -1,19 +1,34 @@
 """OpenAI provider implementation."""
 
 from dataclasses import dataclass
-from typing import NotRequired, Protocol, TypedDict, Unpack
-
+from typing import Literal, NotRequired, Protocol, TypedDict, Unpack
 from openai import APIConnectionError, APIStatusError
 
 from agent_workbench.context import build_system_instructions
 from agent_workbench.errors import CompletionError
 from agent_workbench.messages import ChatRequest, Message
+from agent_workbench.structured_outputs import JSONSchema
 
 
 class OpenAIResponse(Protocol):
     """Define the response data required from the OpenAI SDK."""
 
     output_text: str
+
+
+class OpenAIJSONSchemaFormat(TypedDict):
+    """Represent an OpenAI strict JSON Schema response format."""
+
+    type: Literal["json_schema"]
+    name: str
+    schema: JSONSchema
+    strict: bool
+
+
+class OpenAITextConfig(TypedDict):
+    """Represent OpenAI text response configuration."""
+
+    format: OpenAIJSONSchemaFormat
 
 
 class OpenAIResponseCreateArguments(TypedDict):
@@ -25,6 +40,7 @@ class OpenAIResponseCreateArguments(TypedDict):
     temperature: NotRequired[float]
     top_p: NotRequired[float]
     max_output_tokens: NotRequired[int]
+    text: NotRequired[OpenAITextConfig]
 
 
 class OpenAIResponsesResource(Protocol):
@@ -92,6 +108,16 @@ class OpenAIProvider:
             response_arguments["max_output_tokens"] = (
                 request.generation_config.max_output_tokens
             )
+
+        if request.response_format is not None:
+            response_arguments["text"] = {
+                "format": {
+                    "type": "json_schema",
+                    "name": request.response_format.name,
+                    "schema": request.response_format.schema,
+                    "strict": True,
+                }
+            }
 
         try:
             response = self.client.responses.create(

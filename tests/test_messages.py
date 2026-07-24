@@ -5,6 +5,7 @@ from pathlib import Path
 from agent_workbench.context import ContextDocument
 from agent_workbench.generation import GenerationConfig
 from agent_workbench.messages import ChatRequest
+from agent_workbench.structured_outputs import JSONResponseFormat
 
 
 def test_chat_request_has_no_context_documents_by_default() -> None:
@@ -74,3 +75,47 @@ def test_chat_request_preserves_generation_config() -> None:
     )
 
     assert request.generation_config == generation_config
+
+
+def test_chat_request_has_no_response_format_by_default() -> None:
+    """Use unstructured text responses when no format is supplied."""
+
+    request = ChatRequest(messages=[])
+
+    assert request.response_format is None
+
+
+def test_chat_request_preserves_response_format() -> None:
+    """Preserve the supplied provider-independent response format."""
+
+    response_format = JSONResponseFormat(
+        name="software_review",
+        schema={
+            "type": "object",
+            "properties": {
+                "summary": {
+                    "type": "string",
+                },
+                "risk_level": {
+                    "type": "string",
+                    "enum": [
+                        "low",
+                        "medium",
+                        "high",
+                    ],
+                },
+            },
+            "required": [
+                "summary",
+                "risk_level",
+            ],
+            "additionalProperties": False,
+        },
+    )
+
+    request = ChatRequest(
+        messages=[],
+        response_format=response_format,
+    )
+
+    assert request.response_format == response_format

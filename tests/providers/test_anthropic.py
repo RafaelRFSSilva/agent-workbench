@@ -21,6 +21,7 @@ from agent_workbench.errors import CompletionError
 from agent_workbench.generation import GenerationConfig
 from agent_workbench.messages import ChatRequest
 from agent_workbench.providers.anthropic import AnthropicProvider
+from agent_workbench.structured_outputs import JSONResponseFormat
 
 
 def test_complete_returns_concatenated_text_blocks() -> None:
@@ -276,4 +277,78 @@ def test_generation_config_is_translated_to_anthropic_arguments() -> None:
         messages=messages,
         temperature=0.2,
         top_p=0.8,
+    )
+
+
+def test_response_format_is_translated_to_anthropic_output_config() -> None:
+    """Translate the shared response format into Anthropic output config."""
+
+    structured_response = '{"summary":"No critical issues.","risk_level":"low"}'
+    create = Mock(
+        return_value=SimpleNamespace(
+            content=[
+                SimpleNamespace(
+                    type="text",
+                    text=structured_response,
+                )
+            ]
+        )
+    )
+    client = SimpleNamespace(
+        messages=SimpleNamespace(create=create),
+    )
+    provider = AnthropicProvider(
+        model_name="claude-test",
+        client=client,
+        max_tokens=256,
+    )
+    messages = [
+        {
+            "role": "user",
+            "content": "Review this implementation.",
+        }
+    ]
+    schema = {
+        "type": "object",
+        "properties": {
+            "summary": {
+                "type": "string",
+            },
+            "risk_level": {
+                "type": "string",
+                "enum": [
+                    "low",
+                    "medium",
+                    "high",
+                ],
+            },
+        },
+        "required": [
+            "summary",
+            "risk_level",
+        ],
+        "additionalProperties": False,
+    }
+
+    request = ChatRequest(
+        messages=messages,
+        response_format=JSONResponseFormat(
+            name="software_review",
+            schema=schema,
+        ),
+    )
+
+    result = provider.complete(request)
+
+    assert result == structured_response
+    create.assert_called_once_with(
+        model="claude-test",
+        max_tokens=256,
+        messages=messages,
+        output_config={
+            "format": {
+                "type": "json_schema",
+                "schema": schema,
+            }
+        },
     )
