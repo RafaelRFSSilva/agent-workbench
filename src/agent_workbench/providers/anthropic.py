@@ -11,6 +11,7 @@ from anthropic import (
     RateLimitError,
 )
 
+from agent_workbench.context import build_system_instructions
 from agent_workbench.errors import CompletionError
 from agent_workbench.messages import ChatRequest, Message
 
@@ -75,8 +76,13 @@ class AnthropicProvider:
             for message in request.messages
         ]
 
+        system_instructions = build_system_instructions(
+            request.system_prompt,
+            request.context_documents,
+        )
+
         try:
-            if request.system_prompt is None:
+            if system_instructions is None:
                 response = self.client.messages.create(
                     model=self.model_name,
                     max_tokens=self.max_tokens,
@@ -87,7 +93,7 @@ class AnthropicProvider:
                     model=self.model_name,
                     max_tokens=self.max_tokens,
                     messages=request_messages,
-                    system=request.system_prompt,
+                    system=system_instructions,
                 )
         except APIConnectionError as exc:
             raise CompletionError(

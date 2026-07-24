@@ -5,6 +5,7 @@ from typing import Protocol
 
 from openai import APIConnectionError, APIStatusError
 
+from agent_workbench.context import build_system_instructions
 from agent_workbench.errors import CompletionError
 from agent_workbench.messages import ChatRequest, Message
 
@@ -60,8 +61,13 @@ class OpenAIProvider:
             for message in request.messages
         ]
 
+        system_instructions = build_system_instructions(
+            request.system_prompt,
+            request.context_documents,
+        )
+
         try:
-            if request.system_prompt is None:
+            if system_instructions is None:
                 response = self.client.responses.create(
                     model=self.model_name,
                     input=input_messages,
@@ -70,7 +76,7 @@ class OpenAIProvider:
                 response = self.client.responses.create(
                     model=self.model_name,
                     input=input_messages,
-                    instructions=request.system_prompt,
+                    instructions=system_instructions,
                 )
         except APIConnectionError as exc:
             raise CompletionError(

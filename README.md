@@ -38,6 +38,9 @@ Implemented capabilities:
 - Built-in agent profiles loaded from packaged TOML resources
 - Custom agent profiles loaded through `--agent-file`
 - Validation for malformed, incomplete, or unsupported TOML configuration
+- File-based conversation context through the repeatable `--context-file` argument
+- UTF-8 context loading with format, path, content, and size validation
+- Provider-independent context delivery for Ollama, OpenAI, and Anthropic
 
 ## Architecture
 
@@ -206,6 +209,7 @@ System prompts are represented separately from conversation history:
 ```text
 ChatRequest
 ├── system_prompt
+├── context_documents
 └── messages
     ├── user
     └── assistant
@@ -387,6 +391,79 @@ Custom TOML Profile ────┘            ↓
 Both built-in and custom profiles use the same validation and runtime system
 prompt pipeline.
 
+## File-Based Conversation Context
+
+Text files can be supplied as reference material for the active conversation
+through the repeatable `--context-file` argument.
+
+For example, a reviewer can receive both project documentation and
+configuration:
+
+```bash
+uv run agent-workbench \
+  --provider ollama \
+  --model gpt-oss:20b \
+  --agent reviewer \
+  --context-file README.md \
+  --context-file pyproject.toml
+```
+
+Each `--context-file` argument loads one document. Multiple documents retain
+the order in which they were provided.
+
+Supported extensions:
+
+- `.txt`
+- `.md`
+- `.py`
+- `.toml`
+- `.json`
+- `.yaml`
+- `.yml`
+
+Context files:
+
+- Must exist and refer to regular files rather than directories
+- Must use a supported extension
+- Must contain valid UTF-8 text
+- Must contain non-whitespace content
+- Must not exceed 100 KiB individually
+- Are validated before the provider session starts
+
+Loaded files remain separate from conversation history:
+
+```text
+Context File Paths
+        ↓
+Context Document Loader
+        ↓
+ContextDocument
+├── source
+└── content
+        ↓
+RuntimeConfiguration.context_documents
+        ↓
+ChatRequest.context_documents
+        ↓
+Provider Adapter
+        ├── Ollama: system message
+        ├── OpenAI: instructions
+        └── Anthropic: system parameter
+```
+
+Each document is identified by its source path and placed inside a clearly
+delimited context block. The active system prompt remains first, followed by
+instructions that identify the documents as reference data.
+
+Context documents are not inserted into the in-memory `user` and `assistant`
+conversation history. They are attached separately to every model request in
+the session.
+
+This initial implementation sends the complete contents of every selected
+file. It does not use embeddings, chunk selection, a vector database, or
+Retrieval-Augmented Generation. A future RAG pipeline will replace complete
+document delivery with retrieval of relevant chunks.
+
 ## Usage
 
 Start the CLI using the configuration stored in `.env`:
@@ -533,6 +610,9 @@ uv run ruff format --check .
 - Existing runtime environment variables are not overwritten by `.env`.
 - Automated tests use simulated SDK clients and do not make paid API requests.
 - System prompts are runtime instructions and are not persisted automatically.
+- Context files are read locally and are not persisted by the application.
+- Context contents are clearly delimited and identified as reference data.
+- Context file validation occurs before the selected provider is constructed.
 
 ## Roadmap
 
@@ -552,7 +632,7 @@ uv run ruff format --check .
 - [x] Add reusable agent profiles
 - [x] Load built-in agent profiles from TOML resources
 - [x] Support custom agent profile files
-- [ ] Add file-based conversation context
+- [x] Add file-based conversation context
 - [ ] Add an interactive setup wizard
 - [ ] Discover custom profiles from a user profile directory
 - [ ] Coordinate multiple agents through an orchestrator

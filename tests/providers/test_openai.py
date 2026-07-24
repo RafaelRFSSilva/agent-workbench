@@ -1,5 +1,6 @@
 """Tests for the OpenAI provider."""
 
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -7,6 +8,10 @@ import httpx
 import pytest
 from openai import APIConnectionError, APIStatusError
 
+from agent_workbench.context import (
+    CONTEXT_DOCUMENTS_HEADER,
+    ContextDocument,
+)
 from agent_workbench.errors import CompletionError
 from agent_workbench.messages import ChatRequest, Message
 from agent_workbench.providers.openai import OpenAIProvider
@@ -164,3 +169,43 @@ def test_rate_limit_error_is_translated() -> None:
         match="rate limit or account quota was exceeded",
     ):
         provider.complete(ChatRequest(messages=[]))
+
+
+def test_context_documents_are_added_to_instructions() -> None:
+    """Send context documents through OpenAI instructions."""
+
+    client, create_mock = create_fake_client("OpenAI context received")
+    provider = OpenAIProvider(
+        model_name="test-model",
+        client=client,
+    )
+    messages: list[Message] = [
+        {
+            "role": "user",
+            "content": "Summarize the project.",
+        }
+    ]
+
+    request = ChatRequest(
+        messages=messages,
+        context_documents=(
+            ContextDocument(
+                source=Path("README.md"),
+                content="Agent Workbench documentation.",
+            ),
+        ),
+    )
+
+    result = provider.complete(request)
+
+    assert result == "OpenAI context received"
+    create_mock.assert_called_once_with(
+        model="test-model",
+        input=messages,
+        instructions=(
+            f"{CONTEXT_DOCUMENTS_HEADER}\n\n"
+            '<context_document source="README.md">\n'
+            "Agent Workbench documentation.\n"
+            "</context_document>"
+        ),
+    )

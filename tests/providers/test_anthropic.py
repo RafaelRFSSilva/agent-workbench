@@ -1,5 +1,6 @@
 """Tests for the Anthropic provider."""
 
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -12,6 +13,10 @@ from anthropic import (
     RateLimitError,
 )
 
+from agent_workbench.context import (
+    CONTEXT_DOCUMENTS_HEADER,
+    ContextDocument,
+)
 from agent_workbench.errors import CompletionError
 from agent_workbench.messages import ChatRequest
 from agent_workbench.providers.anthropic import AnthropicProvider
@@ -169,3 +174,57 @@ def test_complete_translates_rate_limit_errors() -> None:
         match="rate limit or account quota",
     ):
         provider.complete(ChatRequest(messages=[]))
+
+
+def test_context_documents_are_added_to_system_instructions() -> None:
+    """Send context documents through Anthropic's system parameter."""
+
+    create = Mock(
+        return_value=SimpleNamespace(
+            content=[
+                SimpleNamespace(
+                    type="text",
+                    text="Anthropic context received",
+                )
+            ]
+        )
+    )
+    client = SimpleNamespace(
+        messages=SimpleNamespace(create=create),
+    )
+    provider = AnthropicProvider(
+        model_name="claude-test",
+        client=client,
+        max_tokens=256,
+    )
+    messages = [
+        {
+            "role": "user",
+            "content": "Summarize the project.",
+        }
+    ]
+
+    request = ChatRequest(
+        messages=messages,
+        context_documents=(
+            ContextDocument(
+                source=Path("README.md"),
+                content="Agent Workbench documentation.",
+            ),
+        ),
+    )
+
+    result = provider.complete(request)
+
+    assert result == "Anthropic context received"
+    create.assert_called_once_with(
+        model="claude-test",
+        max_tokens=256,
+        messages=messages,
+        system=(
+            f"{CONTEXT_DOCUMENTS_HEADER}\n\n"
+            '<context_document source="README.md">\n'
+            "Agent Workbench documentation.\n"
+            "</context_document>"
+        ),
+    )

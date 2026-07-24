@@ -996,3 +996,185 @@ other text files to the active agent.
 After context support is stable, add an interactive setup flow for selecting
 the provider, model, agent profile, and context sources without requiring the
 user to memorize command-line arguments.
+
+## 2026-07-24 — File-Based Conversation Context
+
+### Objective
+
+Allow users to supply source code, documentation, configuration, and other
+text files as provider-independent reference material for an interactive
+conversation.
+
+### Implemented
+
+- Added the immutable `ContextDocument` data structure.
+- Added local context file loading through the repeatable `--context-file`
+  command-line argument.
+- Preserved the order in which multiple context files are supplied.
+- Added support for `.txt`, `.md`, `.py`, `.toml`, `.json`, `.yaml`, and `.yml`
+  files.
+- Added validation for missing files and directory paths.
+- Added validation for unsupported file extensions.
+- Added UTF-8 decoding validation.
+- Rejected empty and whitespace-only context files.
+- Added a 100 KiB individual file-size limit.
+- Added context documents to `RuntimeConfiguration`.
+- Added provider-independent context documents to `ChatRequest`.
+- Kept context documents separate from user and assistant conversation history.
+- Added shared formatting for context documents and their source paths.
+- Combined system prompts and context documents through a common instruction
+  builder.
+- Added provider-specific context translation for Ollama, OpenAI, and
+  Anthropic.
+- Added automated tests for file loading, validation, formatting, runtime
+  configuration, CLI forwarding, request behavior, and provider translation.
+
+### Architecture
+
+```text
+--context-file
+      ↓
+CLIArguments.context_files
+      ↓
+Context Document Loader
+      ↓
+ContextDocument
+├── source
+└── content
+      ↓
+RuntimeConfiguration.context_documents
+      ↓
+Interactive CLI
+      ↓
+ChatRequest
+├── system_prompt
+├── context_documents
+└── messages
+      ↓
+Provider Adapter
+      ├── OllamaProvider
+      │       ↓
+      │   system message
+      │
+      ├── OpenAIProvider
+      │       ↓
+      │   instructions parameter
+      │
+      └── AnthropicProvider
+              ↓
+          system parameter
+```
+
+### Context Instruction Structure
+
+The active system prompt remains separate from the loaded documents until the
+provider request is constructed.
+
+When context documents are present, the shared instruction builder produces a
+structure similar to:
+
+```text
+Active system prompt
+
+Reference-data instruction
+
+<context_document source="README.md">
+Document contents
+</context_document>
+
+<context_document source="pyproject.toml">
+Document contents
+</context_document>
+```
+
+Each document is identified by its source path. Characters that could break
+the source attribute are escaped, while the original document contents are
+preserved.
+
+Context documents are labelled as reference data and are not added to the
+`user` and `assistant` conversation history.
+
+### Validation
+
+The implementation was validated through:
+
+- Successful Ruff formatting and static-analysis checks.
+- Ninety-five passing automated tests.
+- Verification of every supported context file extension.
+- Verification that uppercase supported extensions are accepted.
+- Verification that original whitespace and line breaks are preserved.
+- Verification that missing files and directories are rejected.
+- Verification that unsupported file extensions are rejected.
+- Verification that invalid UTF-8 content is rejected.
+- Verification that blank and whitespace-only context files are rejected.
+- Verification that files larger than 100 KiB are rejected.
+- Verification that a file exactly at the 100 KiB limit is accepted.
+- Verification that repeated `--context-file` arguments preserve order.
+- Verification that context documents remain outside conversation history.
+- Verification that Ollama receives context through a system message.
+- Verification that OpenAI receives context through the `instructions`
+  parameter.
+- Verification that Anthropic receives context through the `system` parameter.
+- Verification that automated provider tests use simulated clients and make no
+  paid API requests.
+- A successful real Ollama conversation using one context file and a built-in
+  reviewer profile.
+- A successful real Ollama conversation using two ordered context files.
+- Verification that the model recovered distinct values from both supplied
+  documents.
+- Verification that missing and unsupported files produce clear CLI
+  configuration errors.
+- Confirmation that no temporary validation files remained in the repository.
+
+### Technical Decisions
+
+- Used `pathlib.Path` for filesystem-independent path handling.
+- Used immutable, slotted dataclasses for context documents and shared
+  requests.
+- Used tuples to preserve document order and prevent accidental collection
+  mutation.
+- Used Python standard-library functionality for file loading and context
+  formatting.
+- Applied the individual file-size limit before reading the complete file into
+  memory.
+- Preserved original document content and used whitespace normalization only
+  to detect empty files.
+- Centralized context formatting so all providers receive the same logical
+  representation.
+- Kept provider-specific translation inside each provider adapter.
+- Reused provider-native system instruction channels instead of adding context
+  to user messages.
+- Kept context documents separate from conversation history because they are
+  runtime reference material rather than conversational turns.
+- Sent complete documents in this milestone to establish a simple and testable
+  baseline before introducing retrieval.
+- Avoided embeddings and vector database dependencies until the RAG milestone.
+
+### Current Limitations
+
+- Every selected file is sent in full with every model request.
+- The 100 KiB limit applies independently rather than through a total context
+  budget.
+- Token usage is not estimated before provider requests.
+- Files are selected only through explicit command-line paths.
+- Directories cannot be scanned recursively.
+- Binary documents, PDFs, and office formats are not supported.
+- Context documents are loaded only when the application starts.
+- Context cannot be added or removed during an active session.
+- Embeddings, chunking, semantic retrieval, and vector storage are not
+  implemented.
+- Provider context-window limits are not represented through the shared
+  configuration model.
+- Responses are not streamed.
+- Conversation history remains in memory only.
+- Logging and structured observability are not implemented.
+
+### Next Milestone
+
+Introduce a provider-independent generation configuration model for parameters
+such as temperature, top-p, maximum output tokens, stop sequences, and
+provider-supported options.
+
+After generation configuration is stable, add an interactive setup wizard so
+users can select providers, models, agents, context files, and inference
+presets without memorizing command-line arguments.

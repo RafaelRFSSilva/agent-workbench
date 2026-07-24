@@ -19,6 +19,7 @@ from agent_workbench.config import (
     get_model_name,
     get_provider_name,
 )
+from agent_workbench.context import ContextDocument, load_context_document
 from agent_workbench.errors import ConfigurationError
 
 
@@ -31,6 +32,7 @@ class CLIArguments:
     system_prompt: str | None = None
     agent_name: str | None = None
     agent_file: Path | None = None
+    context_files: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +43,7 @@ class RuntimeConfiguration:
     model_name: str
     system_prompt: str | None = None
     agent_profile: AgentProfile | None = None
+    context_documents: tuple[ContextDocument, ...] = ()
 
 
 def _non_empty_model_name(value: str) -> str:
@@ -72,6 +75,17 @@ def _agent_profile_path(value: str) -> Path:
 
     if not normalized_path:
         raise ArgumentTypeError("agent file path must not be blank")
+
+    return Path(normalized_path).expanduser()
+
+
+def _context_file_path(value: str) -> Path:
+    """Return a normalized context file path."""
+
+    normalized_path = value.strip()
+
+    if not normalized_path:
+        raise ArgumentTypeError("context file path must not be blank")
 
     return Path(normalized_path).expanduser()
 
@@ -116,6 +130,15 @@ def parse_cli_arguments(
         type=_agent_profile_path,
         help="Path to a custom TOML agent profile.",
     )
+
+    parser.add_argument(
+        "--context-file",
+        action="append",
+        type=_context_file_path,
+        default=[],
+        help="Path to a context file. May be supplied multiple times.",
+    )
+
     parsed_arguments = parser.parse_args(argv)
 
     provider_name = (
@@ -130,6 +153,7 @@ def parse_cli_arguments(
         system_prompt=parsed_arguments.system_prompt,
         agent_name=parsed_arguments.agent,
         agent_file=parsed_arguments.agent_file,
+        context_files=tuple(parsed_arguments.context_file),
     )
 
 
@@ -165,6 +189,10 @@ def resolve_runtime_configuration(
         else arguments.system_prompt
     )
 
+    context_documents = tuple(
+        load_context_document(path) for path in arguments.context_files
+    )
+
     provider_name = arguments.provider_name or get_provider_name()
     model_name = arguments.model_name or get_model_name(provider_name)
 
@@ -173,4 +201,5 @@ def resolve_runtime_configuration(
         model_name=model_name,
         system_prompt=system_prompt,
         agent_profile=agent_profile,
+        context_documents=context_documents,
     )
