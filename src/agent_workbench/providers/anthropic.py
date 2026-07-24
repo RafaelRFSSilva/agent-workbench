@@ -1,7 +1,7 @@
 """Anthropic provider implementation."""
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import NotRequired, Protocol, TypedDict, Unpack
 
 from anthropic import (
     APIConnectionError,
@@ -29,16 +29,23 @@ class AnthropicResponse(Protocol):
     content: list[AnthropicContentBlock]
 
 
+class AnthropicMessageCreateArguments(TypedDict):
+    """Represent arguments supplied to the Anthropic Messages API."""
+
+    model: str
+    max_tokens: int
+    messages: list[Message]
+    system: NotRequired[str]
+    temperature: NotRequired[float]
+    top_p: NotRequired[float]
+
+
 class AnthropicMessagesResource(Protocol):
     """Represent the Anthropic Messages API methods used by the provider."""
 
     def create(
         self,
-        *,
-        model: str,
-        max_tokens: int,
-        messages: list[Message],
-        system: str | None = None,
+        **kwargs: Unpack[AnthropicMessageCreateArguments],
     ) -> AnthropicResponse:
         """Create a message completion."""
 
@@ -81,20 +88,31 @@ class AnthropicProvider:
             request.context_documents,
         )
 
+        max_tokens = (
+            request.generation_config.max_output_tokens
+            if request.generation_config.max_output_tokens is not None
+            else self.max_tokens
+        )
+
+        request_arguments: AnthropicMessageCreateArguments = {
+            "model": self.model_name,
+            "max_tokens": max_tokens,
+            "messages": request_messages,
+        }
+
+        if system_instructions is not None:
+            request_arguments["system"] = system_instructions
+
+        if request.generation_config.temperature is not None:
+            request_arguments["temperature"] = request.generation_config.temperature
+
+        if request.generation_config.top_p is not None:
+            request_arguments["top_p"] = request.generation_config.top_p
+
         try:
-            if system_instructions is None:
-                response = self.client.messages.create(
-                    model=self.model_name,
-                    max_tokens=self.max_tokens,
-                    messages=request_messages,
-                )
-            else:
-                response = self.client.messages.create(
-                    model=self.model_name,
-                    max_tokens=self.max_tokens,
-                    messages=request_messages,
-                    system=system_instructions,
-                )
+            response = self.client.messages.create(
+                **request_arguments,
+            )
         except APIConnectionError as exc:
             raise CompletionError(
                 "Unable to connect to Anthropic. Check the network connection."

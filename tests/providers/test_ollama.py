@@ -13,6 +13,7 @@ from agent_workbench.context import (
 from agent_workbench.errors import CompletionError
 from agent_workbench.messages import ChatRequest
 from agent_workbench.providers.ollama import OllamaProvider
+from agent_workbench.generation import GenerationConfig
 
 
 def test_provider_returns_model_response(monkeypatch) -> None:
@@ -151,5 +152,59 @@ def test_context_documents_are_added_as_system_instructions(
                 "content": "Summarize the project.",
             },
         ],
+        "stream": False,
+    }
+
+
+def test_generation_config_is_translated_to_ollama_options(
+    monkeypatch,
+) -> None:
+    """Translate shared generation settings into Ollama options."""
+
+    captured_arguments = {}
+
+    def fake_chat(**kwargs):
+        captured_arguments.update(kwargs)
+
+        return SimpleNamespace(
+            message=SimpleNamespace(
+                content="configured response",
+            )
+        )
+
+    monkeypatch.setattr(
+        "agent_workbench.providers.ollama.chat",
+        fake_chat,
+    )
+
+    provider = OllamaProvider(model_name="test-model")
+    request = ChatRequest(
+        messages=[
+            {
+                "role": "user",
+                "content": "Generate a short response.",
+            }
+        ],
+        generation_config=GenerationConfig(
+            temperature=0.2,
+            top_p=0.8,
+            max_output_tokens=256,
+        ),
+    )
+
+    assert provider.complete(request) == "configured response"
+    assert captured_arguments == {
+        "model": "test-model",
+        "messages": [
+            {
+                "role": "user",
+                "content": "Generate a short response.",
+            }
+        ],
+        "options": {
+            "temperature": 0.2,
+            "top_p": 0.8,
+            "num_predict": 256,
+        },
         "stream": False,
     }

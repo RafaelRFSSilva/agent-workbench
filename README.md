@@ -41,6 +41,12 @@ Implemented capabilities:
 - File-based conversation context through the repeatable `--context-file` argument
 - UTF-8 context loading with format, path, content, and size validation
 - Provider-independent context delivery for Ollama, OpenAI, and Anthropic
+- Provider-independent generation settings through `GenerationConfig`
+- Runtime generation control through `--temperature`, `--top-p`, and
+  `--max-output-tokens`
+- Strict validation of portable generation parameter ranges
+- Provider-specific generation translation for Ollama, OpenAI, and Anthropic
+- Preservation of provider defaults when optional parameters are not supplied
 
 ## Architecture
 
@@ -210,6 +216,7 @@ System prompts are represented separately from conversation history:
 ChatRequest
 ├── system_prompt
 ├── context_documents
+├── generation_config
 └── messages
     ├── user
     └── assistant
@@ -464,6 +471,111 @@ file. It does not use embeddings, chunk selection, a vector database, or
 Retrieval-Augmented Generation. A future RAG pipeline will replace complete
 document delivery with retrieval of relevant chunks.
 
+## Generation Configuration
+
+Generation parameters are represented through the provider-independent
+`GenerationConfig` data structure.
+
+This allows the CLI and conversation layer to configure model generation
+without depending on provider-specific parameter names.
+
+Configure generation behavior through the command line:
+
+```bash
+uv run agent-workbench \
+  --provider ollama \
+  --model gpt-oss:20b \
+  --temperature 0.2 \
+  --top-p 0.8 \
+  --max-output-tokens 512
+```
+
+The supported parameters are:
+
+| CLI argument          | Shared field        | Validation                     |
+| --------------------- | ------------------- | ------------------------------ |
+| `--temperature`       | `temperature`       | Number between `0.0` and `1.0` |
+| `--top-p`             | `top_p`             | Number between `0.0` and `1.0` |
+| `--max-output-tokens` | `max_output_tokens` | Positive integer               |
+
+The shared `0.0` to `1.0` sampling range provides a portable subset that can
+be represented by all currently supported providers.
+
+Invalid values are rejected before a provider request is created.
+
+The configuration follows this provider-independent path:
+
+```text
+Command-Line Arguments
+├── --temperature
+├── --top-p
+└── --max-output-tokens
+        ↓
+CLIArguments
+        ↓
+RuntimeConfiguration.generation_config
+        ↓
+Interactive CLI
+        ↓
+ChatRequest.generation_config
+        ↓
+Provider Adapter
+```
+
+Each provider translates the shared configuration into its native API
+parameters:
+
+```text
+GenerationConfig
+├── Ollama
+│   ├── temperature → options.temperature
+│   ├── top_p → options.top_p
+│   └── max_output_tokens → options.num_predict
+│
+├── OpenAI
+│   ├── temperature → temperature
+│   ├── top_p → top_p
+│   └── max_output_tokens → max_output_tokens
+│
+└── Anthropic
+    ├── temperature → temperature
+    ├── top_p → top_p
+    └── max_output_tokens → max_tokens
+```
+
+Parameters that are not supplied are omitted from Ollama and OpenAI requests,
+allowing those providers to use their model defaults.
+
+The Anthropic Messages API requires `max_tokens` for every request. When
+`--max-output-tokens` is omitted, `AnthropicProvider` preserves its existing
+default output limit of `1024` tokens.
+
+Provider and model capabilities can still vary. A provider may reject a
+generation parameter that is not supported by the selected model.
+
+The current shared configuration intentionally contains only parameters that
+can be translated across Ollama, OpenAI, and Anthropic. Stop sequences,
+provider-specific controls, reasoning settings, seeds, and generation presets
+are not included in this milestone.
+
+A real Ollama validation was performed with:
+
+```text
+Provider: Ollama
+Model: gpt-oss:20b
+Temperature: 0.0
+Top-p: 1.0
+Maximum output tokens: 256
+Expected response: GENERATION-CONFIG-OK
+Actual response: GENERATION-CONFIG-OK
+```
+
+A previous validation using only `32` output tokens produced an empty final
+response. Increasing the limit to `256` allowed the reasoning model to produce
+the expected final content. Very small output budgets may therefore be
+insufficient for models that consume part of the generation budget before
+producing their final answer.
+
 ## Usage
 
 Start the CLI using the configuration stored in `.env`:
@@ -633,6 +745,7 @@ uv run ruff format --check .
 - [x] Load built-in agent profiles from TOML resources
 - [x] Support custom agent profile files
 - [x] Add file-based conversation context
+- [x] Add provider-independent generation configuration
 - [ ] Add an interactive setup wizard
 - [ ] Discover custom profiles from a user profile directory
 - [ ] Coordinate multiple agents through an orchestrator
