@@ -3,8 +3,8 @@
 from argparse import ArgumentParser, ArgumentTypeError
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import cast
 from pathlib import Path
+from typing import cast
 
 from agent_workbench.agents import (
     SUPPORTED_AGENT_NAMES,
@@ -23,6 +23,11 @@ from agent_workbench.context import ContextDocument, load_context_document
 from agent_workbench.errors import ConfigurationError
 from agent_workbench.generation import GenerationConfig
 
+from agent_workbench.structured_outputs import (
+    JSONResponseFormat,
+    load_response_format_file,
+)
+
 
 @dataclass(frozen=True, slots=True)
 class CLIArguments:
@@ -38,6 +43,7 @@ class CLIArguments:
     temperature: float | None = None
     top_p: float | None = None
     max_output_tokens: int | None = None
+    response_format_file: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +56,7 @@ class RuntimeConfiguration:
     agent_profile: AgentProfile | None = None
     context_documents: tuple[ContextDocument, ...] = ()
     generation_config: GenerationConfig = field(default_factory=GenerationConfig)
+    response_format: JSONResponseFormat | None = None
 
 
 def _non_empty_model_name(value: str) -> str:
@@ -92,6 +99,17 @@ def _context_file_path(value: str) -> Path:
 
     if not normalized_path:
         raise ArgumentTypeError("context file path must not be blank")
+
+    return Path(normalized_path).expanduser()
+
+
+def _response_format_file_path(value: str) -> Path:
+    """Return a normalized response format file path."""
+
+    normalized_path = value.strip()
+
+    if not normalized_path:
+        raise ArgumentTypeError("response format file path must not be blank")
 
     return Path(normalized_path).expanduser()
 
@@ -204,6 +222,12 @@ def parse_cli_arguments(
     )
 
     parser.add_argument(
+        "--response-format-file",
+        type=_response_format_file_path,
+        help="Path to a JSON response format definition.",
+    )
+
+    parser.add_argument(
         "--temperature",
         type=_temperature,
         help="Sampling temperature between 0.0 and 1.0.",
@@ -233,6 +257,7 @@ def parse_cli_arguments(
         or parsed_arguments.temperature is not None
         or parsed_arguments.top_p is not None
         or parsed_arguments.max_output_tokens is not None
+        or parsed_arguments.response_format_file is not None
     )
 
     if parsed_arguments.setup and setup_conflicts:
@@ -255,6 +280,7 @@ def parse_cli_arguments(
         temperature=parsed_arguments.temperature,
         top_p=parsed_arguments.top_p,
         max_output_tokens=parsed_arguments.max_output_tokens,
+        response_format_file=parsed_arguments.response_format_file,
     )
 
 
@@ -300,6 +326,12 @@ def resolve_runtime_configuration(
         max_output_tokens=arguments.max_output_tokens,
     )
 
+    response_format = (
+        load_response_format_file(arguments.response_format_file)
+        if arguments.response_format_file is not None
+        else None
+    )
+
     provider_name = arguments.provider_name or get_provider_name()
     model_name = arguments.model_name or get_model_name(provider_name)
 
@@ -310,4 +342,5 @@ def resolve_runtime_configuration(
         agent_profile=agent_profile,
         context_documents=context_documents,
         generation_config=generation_config,
+        response_format=response_format,
     )

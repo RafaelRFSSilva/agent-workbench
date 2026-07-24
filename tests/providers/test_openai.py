@@ -16,6 +16,7 @@ from agent_workbench.errors import CompletionError
 from agent_workbench.generation import GenerationConfig
 from agent_workbench.messages import ChatRequest, Message
 from agent_workbench.providers.openai import OpenAIProvider
+from agent_workbench.structured_outputs import JSONResponseFormat
 
 
 def create_fake_client(outcome: str | Exception) -> tuple[SimpleNamespace, Mock]:
@@ -245,4 +246,66 @@ def test_generation_config_is_translated_to_openai_arguments() -> None:
         temperature=0.2,
         top_p=0.8,
         max_output_tokens=256,
+    )
+
+
+def test_response_format_is_translated_to_openai_text_config() -> None:
+    """Translate the shared response format into OpenAI text configuration."""
+
+    structured_response = '{"summary":"No critical issues.","risk_level":"low"}'
+    client, create_mock = create_fake_client(structured_response)
+    provider = OpenAIProvider(
+        model_name="test-model",
+        client=client,
+    )
+    messages: list[Message] = [
+        {
+            "role": "user",
+            "content": "Review this implementation.",
+        }
+    ]
+    schema = {
+        "type": "object",
+        "properties": {
+            "summary": {
+                "type": "string",
+            },
+            "risk_level": {
+                "type": "string",
+                "enum": [
+                    "low",
+                    "medium",
+                    "high",
+                ],
+            },
+        },
+        "required": [
+            "summary",
+            "risk_level",
+        ],
+        "additionalProperties": False,
+    }
+
+    request = ChatRequest(
+        messages=messages,
+        response_format=JSONResponseFormat(
+            name="software_review",
+            schema=schema,
+        ),
+    )
+
+    result = provider.complete(request)
+
+    assert result == structured_response
+    create_mock.assert_called_once_with(
+        model="test-model",
+        input=messages,
+        text={
+            "format": {
+                "type": "json_schema",
+                "name": "software_review",
+                "schema": schema,
+                "strict": True,
+            }
+        },
     )

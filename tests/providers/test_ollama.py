@@ -14,6 +14,7 @@ from agent_workbench.errors import CompletionError
 from agent_workbench.messages import ChatRequest
 from agent_workbench.providers.ollama import OllamaProvider
 from agent_workbench.generation import GenerationConfig
+from agent_workbench.structured_outputs import JSONResponseFormat
 
 
 def test_provider_returns_model_response(monkeypatch) -> None:
@@ -207,4 +208,77 @@ def test_generation_config_is_translated_to_ollama_options(
             "num_predict": 256,
         },
         "stream": False,
+    }
+
+
+def test_response_format_is_translated_to_ollama_schema(
+    monkeypatch,
+) -> None:
+    """Translate the shared response format into Ollama's format argument."""
+
+    captured_arguments = {}
+
+    def fake_chat(**kwargs):
+        captured_arguments.update(kwargs)
+
+        return SimpleNamespace(
+            message=SimpleNamespace(
+                content='{"summary":"No critical issues.","risk_level":"low"}',
+            )
+        )
+
+    monkeypatch.setattr(
+        "agent_workbench.providers.ollama.chat",
+        fake_chat,
+    )
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "summary": {
+                "type": "string",
+            },
+            "risk_level": {
+                "type": "string",
+                "enum": [
+                    "low",
+                    "medium",
+                    "high",
+                ],
+            },
+        },
+        "required": [
+            "summary",
+            "risk_level",
+        ],
+        "additionalProperties": False,
+    }
+
+    provider = OllamaProvider(model_name="test-model")
+    request = ChatRequest(
+        messages=[
+            {
+                "role": "user",
+                "content": "Review this implementation.",
+            }
+        ],
+        response_format=JSONResponseFormat(
+            name="software_review",
+            schema=schema,
+        ),
+    )
+
+    assert provider.complete(request) == (
+        '{"summary":"No critical issues.","risk_level":"low"}'
+    )
+    assert captured_arguments == {
+        "model": "test-model",
+        "messages": [
+            {
+                "role": "user",
+                "content": "Review this implementation.",
+            }
+        ],
+        "stream": False,
+        "format": schema,
     }

@@ -23,6 +23,11 @@ from agent_workbench.context import ContextDocument, load_context_document
 from agent_workbench.errors import ConfigurationError
 from agent_workbench.generation import GenerationConfig
 
+from agent_workbench.structured_outputs import (
+    JSONResponseFormat,
+    load_response_format_file,
+)
+
 InputFunction = Callable[[str], str]
 OutputFunction = Callable[[str], None]
 
@@ -72,6 +77,11 @@ def run_interactive_setup(
         output_fn=output_fn,
     )
 
+    response_format = _prompt_response_format(
+        input_fn=input_fn,
+        output_fn=output_fn,
+    )
+
     runtime_configuration = resolve_runtime_configuration(
         CLIArguments(
             provider_name=provider_name,
@@ -86,6 +96,7 @@ def run_interactive_setup(
     return replace(
         runtime_configuration,
         context_documents=context_documents,
+        response_format=response_format,
     )
 
 
@@ -325,3 +336,32 @@ def _prompt_optional_positive_integer(
             continue
 
         return parsed_value
+
+
+def _prompt_response_format(
+    *,
+    input_fn: InputFunction,
+    output_fn: OutputFunction,
+) -> JSONResponseFormat | None:
+    """Prompt for an optional validated JSON response format file."""
+
+    output_fn("")
+    output_fn("Structured output:")
+    output_fn("Press Enter to use the normal unstructured text response.")
+
+    while True:
+        selected_value = input_fn("Response format file [none]: ").strip()
+
+        if not selected_value:
+            return None
+
+        format_path = Path(selected_value).expanduser()
+
+        try:
+            response_format = load_response_format_file(format_path)
+        except ConfigurationError as exc:
+            output_fn(f"Invalid response format file: {exc}")
+            continue
+
+        output_fn(f"Loaded response format: {response_format.name}")
+        return response_format

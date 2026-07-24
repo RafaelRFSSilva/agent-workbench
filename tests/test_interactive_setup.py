@@ -1,5 +1,6 @@
 """Tests for interactive runtime configuration setup."""
 
+import json
 from agent_workbench.config import MODEL_ENV_VAR, PROVIDER_ENV_VAR
 from agent_workbench.interactive_setup import run_interactive_setup
 from agent_workbench.generation import GenerationConfig
@@ -22,6 +23,7 @@ def test_interactive_setup_accepts_environment_defaults(
             "",  # Temperature
             "",  # Top-p
             "",  # Maximum output tokens
+            "",  # Response format file
         ]
     )
     output_lines: list[str] = []
@@ -37,6 +39,7 @@ def test_interactive_setup_accepts_environment_defaults(
     assert configuration.system_prompt is None
     assert configuration.context_documents == ()
     assert configuration.generation_config == GenerationConfig()
+    assert configuration.response_format is None
 
 
 def test_interactive_setup_reprompts_for_invalid_provider(
@@ -51,6 +54,7 @@ def test_interactive_setup_reprompts_for_invalid_provider(
         [
             "unsupported",
             "2",
+            "",
             "",
             "",
             "",
@@ -89,6 +93,7 @@ def test_interactive_setup_requires_model_for_new_cloud_provider(
             "",
             "",
             "",
+            "",
         ]
     )
     output_lines: list[str] = []
@@ -120,6 +125,7 @@ def test_interactive_setup_selects_agent_profile_by_number(
             "",
             "",
             "",
+            "",
         ]
     )
 
@@ -147,6 +153,7 @@ def test_interactive_setup_reprompts_for_invalid_agent(
             "",
             "unsupported",
             "tester",
+            "",
             "",
             "",
             "",
@@ -200,6 +207,7 @@ def test_interactive_setup_loads_multiple_context_files(
             "",
             "",
             "",
+            "",
         ]
     )
 
@@ -246,6 +254,7 @@ def test_interactive_setup_reprompts_for_invalid_context_file(
             "",
             "",
             "",
+            "",
         ]
     )
     output_lines: list[str] = []
@@ -278,6 +287,7 @@ def test_interactive_setup_collects_generation_settings(
             "0.2",
             "0.8",
             "256",
+            "",
         ]
     )
 
@@ -315,6 +325,7 @@ def test_interactive_setup_reprompts_for_invalid_generation_settings(
             "0",
             "1.5",
             "128",
+            "",
         ]
     )
     output_lines: list[str] = []
@@ -332,3 +343,121 @@ def test_interactive_setup_reprompts_for_invalid_generation_settings(
     assert output_lines.count("Temperature must be a number between 0.0 and 1.0.") == 2
     assert "Top-p must be a number between 0.0 and 1.0." in output_lines
     assert output_lines.count("Maximum output tokens must be a positive integer.") == 2
+
+
+def test_interactive_setup_loads_response_format_file(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """Load an optional structured response format during setup."""
+
+    monkeypatch.setenv(PROVIDER_ENV_VAR, "ollama")
+    monkeypatch.setenv(MODEL_ENV_VAR, "gpt-oss:20b")
+
+    format_path = tmp_path / "software-review.json"
+    schema = {
+        "type": "object",
+        "properties": {
+            "summary": {
+                "type": "string",
+            },
+        },
+        "required": [
+            "summary",
+        ],
+        "additionalProperties": False,
+    }
+
+    format_path.write_text(
+        json.dumps(
+            {
+                "name": "software_review",
+                "schema": schema,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    user_inputs = iter(
+        [
+            "",  # Provider
+            "",  # Model
+            "",  # Agent
+            "",  # Context files finished
+            "",  # Temperature
+            "",  # Top-p
+            "",  # Maximum output tokens
+            str(format_path),
+        ]
+    )
+    output_lines: list[str] = []
+
+    configuration = run_interactive_setup(
+        input_fn=lambda _: next(user_inputs),
+        output_fn=output_lines.append,
+    )
+
+    assert configuration.response_format is not None
+    assert configuration.response_format.name == "software_review"
+    assert configuration.response_format.schema == schema
+    assert "Loaded response format: software_review" in output_lines
+
+
+def test_interactive_setup_reprompts_for_invalid_response_format(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """Continue prompting after an invalid response format file."""
+
+    monkeypatch.setenv(PROVIDER_ENV_VAR, "ollama")
+    monkeypatch.setenv(MODEL_ENV_VAR, "gpt-oss:20b")
+
+    missing_path = tmp_path / "missing.json"
+    valid_path = tmp_path / "valid.json"
+
+    valid_path.write_text(
+        json.dumps(
+            {
+                "name": "result",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "answer": {
+                            "type": "string",
+                        },
+                    },
+                    "required": [
+                        "answer",
+                    ],
+                    "additionalProperties": False,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    user_inputs = iter(
+        [
+            "",  # Provider
+            "",  # Model
+            "",  # Agent
+            "",  # Context files finished
+            "",  # Temperature
+            "",  # Top-p
+            "",  # Maximum output tokens
+            str(missing_path),
+            str(valid_path),
+        ]
+    )
+    output_lines: list[str] = []
+
+    configuration = run_interactive_setup(
+        input_fn=lambda _: next(user_inputs),
+        output_fn=output_lines.append,
+    )
+
+    assert configuration.response_format is not None
+    assert configuration.response_format.name == "result"
+    assert any(
+        line.startswith("Invalid response format file:") for line in output_lines
+    )

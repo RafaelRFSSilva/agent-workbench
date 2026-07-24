@@ -54,6 +54,14 @@ Implemented capabilities:
 - Interactive configuration of temperature, top-p, and maximum output tokens
 - Repeated prompts after invalid interactive input
 - Preservation of the existing non-interactive CLI workflow
+- Provider-independent structured output configuration through `JSONResponseFormat`
+- Strict JSON Schema response requests for Ollama, OpenAI, and Anthropic
+- Structured output loading through `--response-format-file`
+- Optional structured output selection during interactive setup
+- UTF-8 JSON response format loading with path, size, structure, and field validation
+- Defensive schema storage that prevents external mutation
+- Preservation of normal text responses when no response format is supplied
+
 
 ## Architecture
 
@@ -583,6 +591,256 @@ the expected final content. Very small output budgets may therefore be
 insufficient for models that consume part of the generation budget before
 producing their final answer.
 
+## Structured Outputs
+
+Agent Workbench supports provider-independent structured outputs through the
+`JSONResponseFormat` abstraction.
+
+Structured outputs allow callers to request a model response that follows a
+JSON Schema instead of returning unrestricted natural-language text.
+
+The shared request structure is:
+
+```text
+ChatRequest
+├── messages
+├── system_prompt
+├── context_documents
+├── generation_config
+└── response_format
+    ├── name
+    └── schema
+```
+
+When no response format is supplied, providers preserve their existing
+unstructured text behavior.
+
+### Response Format File
+
+Structured output definitions are loaded from JSON files through:
+
+```bash
+uv run agent-workbench \
+  --provider ollama \
+  --model gpt-oss:20b \
+  --response-format-file ./schemas/software-review.json
+```
+
+A response format file contains exactly two top-level fields:
+
+```json
+{
+  "name": "software_review",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "summary": {
+        "type": "string"
+      },
+      "risk_level": {
+        "type": "string",
+        "enum": [
+          "low",
+          "medium",
+          "high"
+        ]
+      }
+    },
+    "required": [
+      "summary",
+      "risk_level"
+    ],
+    "additionalProperties": false
+  }
+}
+```
+
+The `name` field provides a portable identifier for the response format.
+
+Response format names:
+
+- Must contain between 1 and 64 characters.
+- May contain letters, numbers, underscores, and hyphens.
+- Cannot contain spaces, dots, or other unsupported characters.
+- Are normalized by removing surrounding whitespace.
+
+The `schema` field must be a non-empty JSON object whose top-level type is
+`object`.
+
+### File Validation
+
+Response format files:
+
+- Must exist.
+- Must refer to a regular file rather than a directory.
+- Must use the `.json` extension.
+- Must not exceed 100 KiB.
+- Must contain valid UTF-8 text.
+- Must not be empty or whitespace-only.
+- Must contain valid JSON.
+- Must use a JSON object as the file root.
+- Must contain both `name` and `schema`.
+- Cannot contain unsupported top-level fields.
+- Must use a string for `name`.
+- Must use a JSON object for `schema`.
+
+Schema values must be representable as strict JSON.
+
+The loader rejects:
+
+- Non-string object keys.
+- Python-specific values that cannot be represented in JSON.
+- `NaN`.
+- Positive infinity.
+- Negative infinity.
+
+The current implementation validates the portable response-format envelope and
+basic JSON compatibility. It does not perform complete JSON Schema
+specification validation.
+
+### Immutability
+
+`JSONResponseFormat` is an immutable, slotted dataclass.
+
+A frozen dataclass alone would not prevent mutation of a nested dictionary, so
+the schema is stored internally as canonical JSON:
+
+```text
+Input Schema Dictionary
+        ↓
+Validation
+        ↓
+Canonical JSON Storage
+        ↓
+Independent Dictionary Copy on Access
+```
+
+This prevents later changes to the original dictionary, or to a dictionary
+returned by the `schema` property, from changing the active response format.
+
+Schemas with the same logical content compare equally even when their original
+dictionary key order differs.
+
+### Provider Translation
+
+Each provider translates the shared response format into its native API
+arguments:
+
+```text
+JSONResponseFormat
+├── Ollama
+│   └── format = schema
+│
+├── OpenAI Responses API
+│   └── text.format
+│       ├── type = "json_schema"
+│       ├── name
+│       ├── schema
+│       └── strict = true
+│
+└── Anthropic Messages API
+    └── output_config.format
+        ├── type = "json_schema"
+        └── schema
+```
+
+The portable `name` is required by the OpenAI translation.
+
+Ollama and Anthropic use the schema but do not require the shared name in their
+native request arguments.
+
+Provider-specific translation remains inside each provider adapter. The CLI,
+conversation layer, and `ChatRequest` remain independent of native API field
+names.
+
+### Runtime Pipeline
+
+```text
+--response-format-file
+        ↓
+CLIArguments.response_format_file
+        ↓
+Response Format File Loader
+        ↓
+JSONResponseFormat
+        ↓
+RuntimeConfiguration.response_format
+        ↓
+Interactive CLI
+        ↓
+ChatRequest.response_format
+        ↓
+Provider Adapter
+```
+
+The response format remains separate from conversation history, system
+instructions, context documents, and generation settings.
+
+The model response is currently returned by every provider as a JSON string.
+Agent Workbench does not yet deserialize the response into Python objects or
+validate the returned content again after generation.
+
+### Interactive Setup
+
+The interactive setup also supports an optional response format file:
+
+```text
+Structured output:
+Press Enter to use the normal unstructured text response.
+Response format file [none]: ./schemas/software-review.json
+Loaded response format: software_review
+```
+
+Invalid files are reported and the setup repeats the question without
+restarting the complete configuration flow.
+
+Pressing Enter skips structured output and preserves normal text responses.
+
+### Example Response
+
+A real Ollama validation using `gpt-oss:20b` produced:
+
+```json
+{"risk_level":"low","summary":"Structured output works."}
+```
+
+The validation used:
+
+```text
+Temperature: 0.0
+Top-p: 1.0
+Maximum output tokens: 256
+Response format: software_review
+```
+
+A second real validation through `--setup` produced:
+
+```json
+{"risk_level":"medium","summary":"Setup structured output works."}
+```
+
+JSON object property order is not significant. Both responses contained only
+the allowed properties, included every required property, and respected the
+configured `risk_level` enum.
+
+### Current Limitations
+
+- Only JSON object schemas are accepted as top-level response schemas.
+- Complete JSON Schema specification validation is not implemented.
+- Provider-specific schema feature compatibility is not detected before a
+  request.
+- Model-specific structured output support is not checked before a request.
+- Generated responses remain strings.
+- Generated JSON is not deserialized automatically.
+- Generated JSON is not validated again locally against the schema.
+- Typed Python models are not generated from schemas.
+- Pydantic model input is not supported.
+- Inline JSON Schema command-line input is not supported.
+- Only one response format can be active in a session.
+- The response format cannot be changed during an active conversation.
+- Response format files are not persisted by interactive setup.
+
+
 ## Interactive Runtime Setup
 
 Agent Workbench provides an optional guided setup flow for users who do not
@@ -607,6 +865,8 @@ Context Files
     ↓
 Generation Settings
     ↓
+Structured Output
+    ↓
 Interactive Conversation
 ```
 
@@ -624,7 +884,8 @@ RuntimeConfiguration
 ├── system_prompt
 ├── agent_profile
 ├── context_documents
-└── generation_config
+├── generation_config
+└── response_format
    ↓
 Provider Factory
    ↓
@@ -759,6 +1020,28 @@ The collected values are stored in `GenerationConfig` and translated by the
 selected provider adapter exactly as they are when supplied through direct
 command-line arguments.
 
+### Structured Output Selection
+
+The setup optionally accepts a validated JSON response format file:
+
+```text
+Structured output:
+Press Enter to use the normal unstructured text response.
+Response format file [none]: ./schemas/software-review.json
+Loaded response format: software_review
+```
+
+Pressing Enter starts the conversation without structured output.
+
+The supplied file is loaded through the same
+`load_response_format_file()` function used by the direct command-line
+workflow.
+
+Invalid paths, unsupported extensions, oversized files, malformed JSON,
+invalid fields, and invalid schemas are reported without terminating the setup.
+
+After an invalid value, the setup repeats only the response format question.
+
 ### Argument Compatibility
 
 The interactive setup is an explicit alternative to direct configuration
@@ -776,6 +1059,7 @@ Therefore, `--setup` cannot be combined with:
 --temperature
 --top-p
 --max-output-tokens
+--response-format-file
 ```
 
 This prevents ambiguous configuration sources inside the same session.
@@ -816,6 +1100,11 @@ Press Enter to use the provider or model default.
 Temperature [provider default]: 0.0
 Top-p [provider default]: 1.0
 Maximum output tokens [provider default]: 256
+
+Structured output:
+Press Enter to use the normal unstructured text response.
+Response format file [none]: ./schemas/software-review.json
+Loaded response format: software_review
 ```
 
 ## Usage
@@ -830,6 +1119,27 @@ Start the guided interactive setup:
 
 ```bash
 uv run agent-workbench --setup
+```
+
+Use a JSON Schema response format:
+
+```bash
+uv run agent-workbench \
+  --provider ollama \
+  --model gpt-oss:20b \
+  --response-format-file ./schemas/software-review.json
+```
+
+Combine structured output with generation settings:
+
+```bash
+uv run agent-workbench \
+  --provider ollama \
+  --model gpt-oss:20b \
+  --temperature 0.0 \
+  --top-p 1.0 \
+  --max-output-tokens 256 \
+  --response-format-file ./schemas/software-review.json
 ```
 
 Display the available command-line options:
@@ -1004,7 +1314,7 @@ uv run ruff format --check .
 - [ ] Add a navigable terminal setup wizard
 - [ ] Discover custom profiles from a user profile directory
 - [ ] Coordinate multiple agents through an orchestrator
-- [ ] Add structured outputs
+- [x] Add provider-independent structured outputs
 - [ ] Implement tool calling
 - [ ] Build a local RAG pipeline
 - [ ] Add evaluations, logging, and observability

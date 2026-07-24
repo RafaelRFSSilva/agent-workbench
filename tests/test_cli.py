@@ -10,6 +10,7 @@ from agent_workbench.errors import CompletionError
 from agent_workbench.messages import ChatRequest, Message
 from agent_workbench.agents import get_agent_profile
 from agent_workbench.generation import GenerationConfig
+from agent_workbench.structured_outputs import JSONResponseFormat
 
 
 class FakeProvider:
@@ -27,6 +28,7 @@ class FakeProvider:
         self.system_prompts: list[str | None] = []
         self.context_documents: list[tuple[ContextDocument, ...]] = []
         self.generation_configs: list[GenerationConfig] = []
+        self.response_formats: list[JSONResponseFormat | None] = []
 
     def complete(self, request: ChatRequest) -> str:
         """Return the next configured response or error."""
@@ -35,6 +37,7 @@ class FakeProvider:
         self.system_prompts.append(request.system_prompt)
         self.context_documents.append(request.context_documents)
         self.generation_configs.append(request.generation_config)
+        self.response_formats.append(request.response_format)
 
         outcome = next(self._outcomes)
 
@@ -309,14 +312,80 @@ def test_generation_config_is_forwarded_without_entering_history(
     ]
 
 
+def test_response_format_is_forwarded_without_entering_history(
+    monkeypatch,
+) -> None:
+    """Forward structured output configuration separately from messages."""
+
+    user_inputs = iter(
+        [
+            "Review this implementation.",
+            "/exit",
+        ]
+    )
+    provider = FakeProvider(['{"summary":"No critical issues."}'])
+    response_format = JSONResponseFormat(
+        name="software_review",
+        schema={
+            "type": "object",
+            "properties": {
+                "summary": {
+                    "type": "string",
+                },
+            },
+            "required": [
+                "summary",
+            ],
+            "additionalProperties": False,
+        },
+    )
+
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda _: next(user_inputs),
+    )
+
+    run_cli(
+        provider,
+        response_format=response_format,
+    )
+
+    assert provider.response_formats == [response_format]
+    assert provider.calls == [
+        [
+            {
+                "role": "user",
+                "content": "Review this implementation.",
+            }
+        ]
+    ]
+
+
 def test_main_uses_interactive_runtime_setup(
     monkeypatch,
 ) -> None:
     """Use the setup result before constructing the provider."""
 
+    response_format = JSONResponseFormat(
+        name="result",
+        schema={
+            "type": "object",
+            "properties": {
+                "answer": {
+                    "type": "string",
+                },
+            },
+            "required": [
+                "answer",
+            ],
+            "additionalProperties": False,
+        },
+    )
+
     configuration = RuntimeConfiguration(
         provider_name="ollama",
         model_name="test-model",
+        response_format=response_format,
     )
     provider = FakeProvider()
 
@@ -350,4 +419,5 @@ def test_main_uses_interactive_runtime_setup(
         agent_profile=None,
         context_documents=(),
         generation_config=GenerationConfig(),
+        response_format=response_format,
     )

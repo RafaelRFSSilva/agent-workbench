@@ -1,7 +1,7 @@
 """Anthropic provider implementation."""
 
 from dataclasses import dataclass
-from typing import NotRequired, Protocol, TypedDict, Unpack
+from typing import Literal, NotRequired, Protocol, TypedDict, Unpack
 
 from anthropic import (
     APIConnectionError,
@@ -14,6 +14,7 @@ from anthropic import (
 from agent_workbench.context import build_system_instructions
 from agent_workbench.errors import CompletionError
 from agent_workbench.messages import ChatRequest, Message
+from agent_workbench.structured_outputs import JSONSchema
 
 
 class AnthropicContentBlock(Protocol):
@@ -29,6 +30,19 @@ class AnthropicResponse(Protocol):
     content: list[AnthropicContentBlock]
 
 
+class AnthropicJSONOutputFormat(TypedDict):
+    """Represent an Anthropic JSON Schema output format."""
+
+    type: Literal["json_schema"]
+    schema: JSONSchema
+
+
+class AnthropicOutputConfig(TypedDict):
+    """Represent Anthropic output configuration."""
+
+    format: AnthropicJSONOutputFormat
+
+
 class AnthropicMessageCreateArguments(TypedDict):
     """Represent arguments supplied to the Anthropic Messages API."""
 
@@ -38,6 +52,7 @@ class AnthropicMessageCreateArguments(TypedDict):
     system: NotRequired[str]
     temperature: NotRequired[float]
     top_p: NotRequired[float]
+    output_config: NotRequired[AnthropicOutputConfig]
 
 
 class AnthropicMessagesResource(Protocol):
@@ -108,6 +123,14 @@ class AnthropicProvider:
 
         if request.generation_config.top_p is not None:
             request_arguments["top_p"] = request.generation_config.top_p
+
+        if request.response_format is not None:
+            request_arguments["output_config"] = {
+                "format": {
+                    "type": "json_schema",
+                    "schema": request.response_format.schema,
+                }
+            }
 
         try:
             response = self.client.messages.create(

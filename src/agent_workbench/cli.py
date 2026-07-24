@@ -16,6 +16,7 @@ from agent_workbench.providers.base import ChatProvider
 from agent_workbench.providers.factory import create_provider
 from agent_workbench.agents import AgentProfile
 from agent_workbench.generation import GenerationConfig
+from agent_workbench.structured_outputs import JSONResponseFormat
 
 EXIT_COMMANDS = {"/exit", "/quit"}
 
@@ -26,6 +27,7 @@ def run_cli(
     agent_profile: AgentProfile | None = None,
     context_documents: tuple[ContextDocument, ...] = (),
     generation_config: GenerationConfig | None = None,
+    response_format: JSONResponseFormat | None = None,
 ) -> None:
     """Run an interactive conversation using the provided model provider."""
 
@@ -73,6 +75,7 @@ def run_cli(
                     system_prompt=system_prompt,
                     context_documents=context_documents,
                     generation_config=active_generation_config,
+                    response_format=response_format,
                 )
             )
         except CompletionError as exc:
@@ -116,6 +119,7 @@ def main(
         agent_profile=runtime_configuration.agent_profile,
         context_documents=runtime_configuration.context_documents,
         generation_config=runtime_configuration.generation_config,
+        response_format=runtime_configuration.response_format,
     )
 
 
