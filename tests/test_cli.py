@@ -1,6 +1,9 @@
 """Tests for the Agent Workbench command-line interface."""
 
+from pathlib import Path
+
 from agent_workbench.cli import run_cli
+from agent_workbench.context import ContextDocument
 from agent_workbench.errors import CompletionError
 from agent_workbench.messages import ChatRequest, Message
 from agent_workbench.agents import get_agent_profile
@@ -19,12 +22,14 @@ class FakeProvider:
         self._outcomes = iter(outcomes or [])
         self.calls: list[list[Message]] = []
         self.system_prompts: list[str | None] = []
+        self.context_documents: list[tuple[ContextDocument, ...]] = []
 
     def complete(self, request: ChatRequest) -> str:
         """Return the next configured response or error."""
 
         self.calls.append([message.copy() for message in request.messages])
         self.system_prompts.append(request.system_prompt)
+        self.context_documents.append(request.context_documents)
 
         outcome = next(self._outcomes)
 
@@ -214,3 +219,47 @@ def test_agent_profile_is_displayed(
 
     assert "Agent: Reviewer" in captured.out
     assert agent_profile.description in captured.out
+
+
+def test_context_documents_are_forwarded_without_entering_history(
+    monkeypatch,
+) -> None:
+    """Forward context documents separately from conversation messages."""
+
+    user_inputs = iter(
+        [
+            "Review the supplied project files.",
+            "/exit",
+        ]
+    )
+    provider = FakeProvider(["review complete"])
+    context_documents = (
+        ContextDocument(
+            source=Path("README.md"),
+            content="Project documentation.",
+        ),
+        ContextDocument(
+            source=Path("pyproject.toml"),
+            content='name = "agent-workbench"',
+        ),
+    )
+
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda _: next(user_inputs),
+    )
+
+    run_cli(
+        provider,
+        context_documents=context_documents,
+    )
+
+    assert provider.context_documents == [context_documents]
+    assert provider.calls == [
+        [
+            {
+                "role": "user",
+                "content": "Review the supplied project files.",
+            }
+        ]
+    ]

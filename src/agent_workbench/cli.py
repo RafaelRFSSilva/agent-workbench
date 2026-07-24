@@ -8,6 +8,7 @@ from agent_workbench.arguments import (
 from agent_workbench.config import (
     load_environment,
 )
+from agent_workbench.context import ContextDocument
 from agent_workbench.errors import CompletionError, ConfigurationError
 from agent_workbench.messages import ChatRequest, Message
 from agent_workbench.providers.base import ChatProvider
@@ -21,6 +22,7 @@ def run_cli(
     provider: ChatProvider,
     system_prompt: str | None = None,
     agent_profile: AgentProfile | None = None,
+    context_documents: tuple[ContextDocument, ...] = (),
 ) -> None:
     """Run an interactive conversation using the provided model provider."""
 
@@ -65,6 +67,7 @@ def run_cli(
                 ChatRequest(
                     messages=request_messages,
                     system_prompt=system_prompt,
+                    context_documents=context_documents,
                 )
             )
         except CompletionError as exc:
@@ -102,6 +105,7 @@ def main(
         provider,
         system_prompt=runtime_configuration.system_prompt,
         agent_profile=runtime_configuration.agent_profile,
+        context_documents=runtime_configuration.context_documents,
     )
 
 

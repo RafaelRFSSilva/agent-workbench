@@ -3,6 +3,8 @@
 from dataclasses import dataclass
 from typing import Literal, TypedDict
 
+from agent_workbench.context import ContextDocument
+
 
 class Message(TypedDict):
     """Represent a conversation message exchanged with a language model."""
@@ -17,3 +19,4 @@ class ChatRequest:
 
     messages: list[Message]
     system_prompt: str | None = None
+    context_documents: tuple[ContextDocument, ...] = ()

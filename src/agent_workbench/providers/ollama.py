@@ -5,6 +5,7 @@ from typing import Literal, TypedDict
 
 from ollama import ResponseError, chat
 
+from agent_workbench.context import build_system_instructions
 from agent_workbench.errors import CompletionError
 from agent_workbench.messages import ChatRequest
 
@@ -33,11 +34,16 @@ class OllamaProvider:
 
         request_messages: list[OllamaMessage] = []
 
-        if request.system_prompt is not None:
+        system_instructions = build_system_instructions(
+            request.system_prompt,
+            request.context_documents,
+        )
+
+        if system_instructions is not None:
             request_messages.append(
                 {
                     "role": "system",
-                    "content": request.system_prompt,
+                    "content": system_instructions,
                 }
             )
 

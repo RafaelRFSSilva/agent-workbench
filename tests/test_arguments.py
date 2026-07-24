@@ -299,3 +299,70 @@ def test_agent_file_and_system_prompt_cannot_be_combined(
                 agent_file=profile_path,
             )
         )
+
+
+def test_parse_cli_arguments_accepts_repeated_context_files() -> None:
+    """Parse context files while preserving their supplied order."""
+
+    arguments = parse_cli_arguments(
+        [
+            "--context-file",
+            "README.md",
+            "--context-file",
+            "pyproject.toml",
+        ]
+    )
+
+    assert arguments.context_files == (
+        Path("README.md"),
+        Path("pyproject.toml"),
+    )
+
+
+def test_parse_cli_arguments_rejects_blank_context_file() -> None:
+    """Reject a blank context file path."""
+
+    with pytest.raises(SystemExit) as exc_info:
+        parse_cli_arguments(
+            [
+                "--context-file",
+                "   ",
+            ]
+        )
+
+    assert exc_info.value.code == 2
+
+
+def test_runtime_configuration_loads_context_documents_in_order(
+    tmp_path,
+) -> None:
+    """Load context documents while preserving CLI order."""
+
+    first_path = tmp_path / "first.md"
+    second_path = tmp_path / "second.py"
+
+    first_path.write_text(
+        "First document.",
+        encoding="utf-8",
+    )
+    second_path.write_text(
+        "Second document.",
+        encoding="utf-8",
+    )
+
+    configuration = resolve_runtime_configuration(
+        CLIArguments(
+            provider_name="ollama",
+            model_name="gpt-oss:20b",
+            context_files=(first_path, second_path),
+        )
+    )
+
+    assert [document.source for document in configuration.context_documents] == [
+        first_path,
+        second_path,
+    ]
+    assert [document.content for document in configuration.context_documents] == [
+        "First document.",
+        "Second document.",
+    ]
