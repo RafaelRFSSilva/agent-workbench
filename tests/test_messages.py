@@ -6,6 +6,7 @@ from agent_workbench.context import ContextDocument
 from agent_workbench.generation import GenerationConfig
 from agent_workbench.messages import ChatRequest
 from agent_workbench.structured_outputs import JSONResponseFormat
+from agent_workbench.tools import ToolDefinition
 
 
 def test_chat_request_has_no_context_documents_by_default() -> None:
@@ -119,3 +120,54 @@ def test_chat_request_preserves_response_format() -> None:
     )
 
     assert request.response_format == response_format
+
+
+def test_chat_request_has_no_tools_by_default() -> None:
+    """Create a chat request without available tools."""
+
+    request = ChatRequest(messages=[])
+
+    assert request.tools == ()
+
+
+def test_chat_request_preserves_tool_order() -> None:
+    """Preserve tool definitions in their supplied order."""
+
+    calculator = ToolDefinition(
+        name="calculator",
+        description="Evaluate a mathematical expression.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "expression": {
+                    "type": "string",
+                }
+            },
+            "required": [
+                "expression",
+            ],
+            "additionalProperties": False,
+        },
+    )
+    project_information = ToolDefinition(
+        name="project_information",
+        description="Return static project information.",
+        input_schema={
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+    )
+
+    request = ChatRequest(
+        messages=[],
+        tools=(
+            calculator,
+            project_information,
+        ),
+    )
+
+    assert request.tools == (
+        calculator,
+        project_information,
+    )

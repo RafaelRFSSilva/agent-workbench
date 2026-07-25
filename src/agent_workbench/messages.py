@@ -6,6 +6,7 @@ from typing import Literal, TypedDict
 from agent_workbench.context import ContextDocument
 from agent_workbench.generation import GenerationConfig
 from agent_workbench.structured_outputs import JSONResponseFormat
+from agent_workbench.tools import ToolDefinition
 
 
 class Message(TypedDict):
@@ -24,3 +25,4 @@ class ChatRequest:
     context_documents: tuple[ContextDocument, ...] = ()
     generation_config: GenerationConfig = field(default_factory=GenerationConfig)
     response_format: JSONResponseFormat | None = None
+    tools: tuple[ToolDefinition, ...] = ()
