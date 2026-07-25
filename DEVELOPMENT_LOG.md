@@ -1980,3 +1980,88 @@ abstraction.
 
 After tool calling is stable, continue toward Retrieval-Augmented Generation,
 agent orchestration, evaluation, observability, and deployment.
+
+## 2026-07-25 — Documentation Restructure
+
+### Objective
+
+Reduce the size and repetition of the main README while creating focused
+documentation for the current architecture, implemented capabilities, product
+vision, project configuration, and future roadmap.
+
+### Implemented
+
+- Reduced `README.md` from approximately 1,333 lines to 450 lines.
+- Converted the README into a concise project entry point.
+- Added `docs/getting-started.md`.
+- Added `docs/architecture.md`.
+- Added `docs/runtime-configuration.md`.
+- Added `docs/agent-profiles.md`.
+- Added `docs/context-files.md`.
+- Added `docs/structured-outputs.md`.
+- Added `docs/product-vision.md`.
+- Added `docs/project-configuration.md`.
+- Added `docs/roadmap.md`.
+- Documented the current provider-independent CLI architecture.
+- Documented the long-term multi-agent VS Code workspace vision.
+- Documented future project-local configuration through `.agent-workbench/`.
+- Documented the intended relationship between native tools and MCP.
+- Documented future local project retrieval and RAG.
+- Documented future isolated execution through Git branches and worktrees.
+- Documented future voice prompt input through editable speech-to-text
+  transcripts.
+- Clearly separated implemented capabilities from planned functionality.
+- Defined provider-independent tool calling as the next implementation
+  milestone.
+
+### Validation
+
+The documentation restructure was validated through:
+
+- One hundred and ninety-two passing automated tests.
+- Successful Ruff static-analysis checks.
+- Successful Ruff formatting checks.
+- Successful Git whitespace validation.
+- Verification that every Markdown code fence is balanced.
+- Verification that all relative Markdown documentation links resolve.
+- Verification that documented CLI arguments match the current CLI help.
+- Verification that all nine expected documents exist inside `docs/`.
+
+### Technical Decisions
+
+- Kept `README.md` focused on project introduction, quick start, essential
+  examples, documentation links, security, and current limitations.
+- Moved detailed feature documentation into dedicated files.
+- Kept product vision separate from current implementation documentation.
+- Kept future project configuration explicitly marked as proposed.
+- Preserved provider independence across agents, context, generation,
+  structured outputs, future tools, and MCP.
+- Defined MCP as an extension of the shared tool and permission layers rather
+  than a replacement for them.
+- Kept voice input as a future interface capability that does not block the
+  tool-calling or orchestration milestones.
+- Kept `DEVELOPMENT_LOG.md` as the chronological engineering record.
+- Future development-log entries should remain shorter and focused on
+  implementation decisions, validation, and limitations.
+
+### Current Documentation Structure
+
+- `README.md` — concise project entry point.
+- `docs/getting-started.md` — installation and usage guide.
+- `docs/architecture.md` — current and planned architecture.
+- `docs/runtime-configuration.md` — runtime configuration behavior.
+- `docs/agent-profiles.md` — built-in and custom agent roles.
+- `docs/context-files.md` — explicit context and future workspace retrieval.
+- `docs/structured-outputs.md` — portable JSON Schema outputs.
+- `docs/product-vision.md` — complete product direction.
+- `docs/project-configuration.md` — proposed project-local configuration.
+- `docs/roadmap.md` — completed and planned milestones.
+- `DEVELOPMENT_LOG.md` — chronological implementation history.
+
+### Next Milestone
+
+Introduce provider-independent tool calling through shared tool definition,
+invocation, result, registry, and execution-loop abstractions.
+
+The initial implementation should use a safe deterministic tool and should not
+yet introduce unrestricted filesystem or shell access.
