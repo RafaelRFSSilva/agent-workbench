@@ -1,5 +1,6 @@
 """Ollama provider implementation."""
 
+import json
 from dataclasses import dataclass
 from typing import Literal, NotRequired, TypedDict
 
@@ -7,8 +8,9 @@ from ollama import ResponseError, chat
 
 from agent_workbench.context import build_system_instructions
 from agent_workbench.errors import CompletionError
-from agent_workbench.messages import ChatRequest
+from agent_workbench.messages import ChatRequest, ChatResponse
 from agent_workbench.structured_outputs import JSONSchema
+from agent_workbench.tools import ToolInvocation, ToolResult
 
 
 class OllamaMessage(TypedDict):
@@ -18,14 +20,86 @@ class OllamaMessage(TypedDict):
     content: str
 
 
+class OllamaToolCallFunction(TypedDict):
+    """Represent a previous function call supplied to Ollama."""
+
+    name: str
+    arguments: dict[str, object]
+
+
+class OllamaToolCall(TypedDict):
+    """Represent a previous tool call supplied to Ollama."""
+
+    function: OllamaToolCallFunction
+
+
+class OllamaAssistantToolMessage(TypedDict):
+    """Represent an assistant tool-call message supplied to Ollama."""
+
+    role: Literal["assistant"]
+    content: str
+    tool_calls: list[OllamaToolCall]
+
+
+class OllamaToolResultMessage(TypedDict):
+    """Represent a tool result message supplied to Ollama."""
+
+    role: Literal["tool"]
+    content: str
+    tool_name: str
+
+
+type OllamaInputMessage = (
+    OllamaMessage | OllamaAssistantToolMessage | OllamaToolResultMessage
+)
+
+
+class OllamaFunctionDefinition(TypedDict):
+    """Represent a function supplied to Ollama."""
+
+    name: str
+    description: str
+    parameters: JSONSchema
+
+
+class OllamaToolDefinition(TypedDict):
+    """Represent a tool supplied to Ollama."""
+
+    type: Literal["function"]
+    function: OllamaFunctionDefinition
+
+
 class OllamaChatArguments(TypedDict):
     """Represent arguments supplied to the Ollama chat API."""
 
     model: str
-    messages: list[OllamaMessage]
+    messages: list[OllamaInputMessage]
     stream: bool
     options: NotRequired[dict[str, float | int]]
     format: NotRequired[JSONSchema]
+    tools: NotRequired[list[OllamaToolDefinition]]
+
+
+def _serialize_tool_result(result: ToolResult) -> str:
+    """Serialize a provider-independent tool result for Ollama input."""
+
+    if result.status == "success":
+        result_data = {
+            "status": "success",
+            "output": result.output,
+        }
+    else:
+        result_data = {
+            "status": "error",
+            "error": result.error,
+        }
+
+    return json.dumps(
+        result_data,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,10 +114,10 @@ class OllamaProvider:
 
         return "Ollama"
 
-    def complete(self, request: ChatRequest) -> str:
+    def complete(self, request: ChatRequest) -> ChatResponse:
         """Generate a response using the configured Ollama model."""
 
-        request_messages: list[OllamaMessage] = []
+        request_messages: list[OllamaInputMessage] = []
 
         system_instructions = build_system_instructions(
             request.system_prompt,
@@ -65,6 +139,39 @@ class OllamaProvider:
                     "content": message["content"],
                 }
             )
+
+        for interaction in request.tool_interactions:
+            tool_calls: list[OllamaToolCall] = []
+
+            for invocation in interaction.response.tool_invocations:
+                tool_calls.append(
+                    {
+                        "function": {
+                            "name": invocation.tool_name,
+                            "arguments": invocation.arguments,
+                        },
+                    }
+                )
+
+            request_messages.append(
+                {
+                    "role": "assistant",
+                    "content": interaction.response.text,
+                    "tool_calls": tool_calls,
+                }
+            )
+
+            for invocation, result in zip(
+                interaction.response.tool_invocations,
+                interaction.results,
+            ):
+                request_messages.append(
+                    {
+                        "role": "tool",
+                        "content": _serialize_tool_result(result),
+                        "tool_name": invocation.tool_name,
+                    }
+                )
 
         generation_options: dict[str, float | int] = {}
 
@@ -91,6 +198,19 @@ class OllamaProvider:
         if request.response_format is not None:
             chat_arguments["format"] = request.response_format.schema
 
+        if request.tools:
+            chat_arguments["tools"] = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.input_schema,
+                    },
+                }
+                for tool in request.tools
+            ]
+
         try:
             response = chat(**chat_arguments)
         except ConnectionError as exc:
@@ -106,4 +226,18 @@ class OllamaProvider:
 
             raise CompletionError(f"Ollama request failed: {exc.error}") from exc
 
-        return response.message.content or ""
+        tool_calls = getattr(response.message, "tool_calls", None) or ()
+
+        tool_invocations = tuple(
+            ToolInvocation(
+                id=f"ollama-tool-call-{index}",
+                tool_name=tool_call.function.name,
+                arguments=dict(tool_call.function.arguments),
+            )
+            for index, tool_call in enumerate(tool_calls, start=1)
+        )
+
+        return ChatResponse(
+            text=response.message.content or "",
+            tool_invocations=tool_invocations,
+        )

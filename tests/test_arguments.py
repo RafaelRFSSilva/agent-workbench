@@ -518,6 +518,49 @@ def test_parse_cli_arguments_accepts_interactive_setup() -> None:
     assert arguments.model_name is None
 
 
+def test_tools_are_disabled_by_default() -> None:
+    """Keep built-in tools disabled without an explicit CLI flag."""
+
+    arguments = parse_cli_arguments([])
+
+    assert arguments.enable_tools is False
+
+
+def test_parse_cli_arguments_enables_built_in_tools() -> None:
+    """Enable built-in tools when explicitly requested."""
+
+    arguments = parse_cli_arguments(["--enable-tools"])
+
+    assert arguments.enable_tools is True
+
+
+def test_runtime_configuration_preserves_tool_enablement() -> None:
+    """Carry the explicit tool setting into runtime configuration."""
+
+    configuration = resolve_runtime_configuration(
+        CLIArguments(
+            provider_name="ollama",
+            model_name="gpt-oss:20b",
+            enable_tools=True,
+        )
+    )
+
+    assert configuration.enable_tools is True
+
+
+def test_runtime_configuration_disables_tools_by_default() -> None:
+    """Keep built-in tools disabled in resolved runtime configuration."""
+
+    configuration = resolve_runtime_configuration(
+        CLIArguments(
+            provider_name="ollama",
+            model_name="gpt-oss:20b",
+        )
+    )
+
+    assert configuration.enable_tools is False
+
+
 @pytest.mark.parametrize(
     "conflicting_arguments",
     [
@@ -542,6 +585,9 @@ def test_parse_cli_arguments_accepts_interactive_setup() -> None:
         [
             "--response-format-file",
             "schema.json",
+        ],
+        [
+            "--enable-tools",
         ],
     ],
 )

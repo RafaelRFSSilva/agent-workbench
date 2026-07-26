@@ -5,6 +5,7 @@ from agent_workbench.arguments import (
     parse_cli_arguments,
     resolve_runtime_configuration,
 )
+from agent_workbench.built_in_tools import create_built_in_tool_registry
 from agent_workbench.config import (
     load_environment,
 )
@@ -17,8 +18,11 @@ from agent_workbench.providers.factory import create_provider
 from agent_workbench.agents import AgentProfile
 from agent_workbench.generation import GenerationConfig
 from agent_workbench.structured_outputs import JSONResponseFormat
+from agent_workbench.tool_calling import run_tool_calling_loop
+from agent_workbench.tool_registry import ToolRegistry
 
 EXIT_COMMANDS = {"/exit", "/quit"}
+DEFAULT_MAX_TOOL_ROUNDS = 8
 
 
 def run_cli(
@@ -28,6 +32,8 @@ def run_cli(
     context_documents: tuple[ContextDocument, ...] = (),
     generation_config: GenerationConfig | None = None,
     response_format: JSONResponseFormat | None = None,
+    tool_registry: ToolRegistry | None = None,
+    max_tool_rounds: int = DEFAULT_MAX_TOOL_ROUNDS,
 ) -> None:
     """Run an interactive conversation using the provided model provider."""
 
@@ -69,26 +75,35 @@ def run_cli(
         request_messages = [*messages, user_message]
 
         try:
-            assistant_reply = provider.complete(
-                ChatRequest(
-                    messages=request_messages,
-                    system_prompt=system_prompt,
-                    context_documents=context_documents,
-                    generation_config=active_generation_config,
-                    response_format=response_format,
-                )
+            request = ChatRequest(
+                messages=request_messages,
+                system_prompt=system_prompt,
+                context_documents=context_documents,
+                generation_config=active_generation_config,
+                response_format=response_format,
+                tools=tool_registry.definitions if tool_registry is not None else (),
             )
+
+            if tool_registry is None:
+                assistant_response = provider.complete(request)
+            else:
+                assistant_response = run_tool_calling_loop(
+                    provider,
+                    request,
+                    tool_registry,
+                    max_tool_rounds,
+                )
         except CompletionError as exc:
             print(f"Error: {exc}\n")
             continue
 
         assistant_message: Message = {
             "role": "assistant",
-            "content": assistant_reply,
+            "content": assistant_response.text,
         }
         messages = [*request_messages, assistant_message]
 
-        print(f"Assistant: {assistant_reply}\n")
+        print(f"Assistant: {assistant_response.text}\n")
 
 
 def main(
@@ -113,14 +128,25 @@ def main(
         print(f"Configuration error: {exc}")
         return
 
-    run_cli(
-        provider,
-        system_prompt=runtime_configuration.system_prompt,
-        agent_profile=runtime_configuration.agent_profile,
-        context_documents=runtime_configuration.context_documents,
-        generation_config=runtime_configuration.generation_config,
-        response_format=runtime_configuration.response_format,
-    )
+    if runtime_configuration.enable_tools:
+        run_cli(
+            provider,
+            system_prompt=runtime_configuration.system_prompt,
+            agent_profile=runtime_configuration.agent_profile,
+            context_documents=runtime_configuration.context_documents,
+            generation_config=runtime_configuration.generation_config,
+            response_format=runtime_configuration.response_format,
+            tool_registry=create_built_in_tool_registry(),
+        )
+    else:
+        run_cli(
+            provider,
+            system_prompt=runtime_configuration.system_prompt,
+            agent_profile=runtime_configuration.agent_profile,
+            context_documents=runtime_configuration.context_documents,
+            generation_config=runtime_configuration.generation_config,
+            response_format=runtime_configuration.response_format,
+        )
 
 
 if __name__ == "__main__":

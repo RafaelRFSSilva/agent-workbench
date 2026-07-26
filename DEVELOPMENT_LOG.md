@@ -2065,3 +2065,46 @@ invocation, result, registry, and execution-loop abstractions.
 
 The initial implementation should use a safe deterministic tool and should not
 yet introduce unrestricted filesystem or shell access.
+
+## 2026-07-26 — Provider-Independent Tool Calling
+
+### Implemented
+
+- Added immutable provider-independent `ToolDefinition`, `ToolInvocation`, and
+  `ToolResult` models.
+- Extended shared requests, responses, and validated interaction rounds for
+  ordered tool-calling history.
+- Added translations for tool definitions, calls, results, and history in the
+  Ollama, OpenAI Responses API, and Anthropic Messages API adapters.
+- Added synchronous `ToolRegistry` execution and `run_tool_calling_loop()`.
+- Added opt-in CLI tool enablement through `--enable-tools`.
+- Added the first built-in tool: a restricted AST-based calculator.
+
+### Architectural Decisions
+
+- Kept tool definitions, invocations, results, registration, and execution
+  provider-independent; providers only translate native request and response
+  formats.
+- Represented each completed request/response cycle as a validated
+  `ToolInteractionRound`, preserving invocation and result ordering.
+- Kept the CLI default unchanged: tools are disabled unless the user supplies
+  `--enable-tools`.
+- Kept execution synchronous and bounded new loop rounds with a positive
+  maximum-round limit.
+- Restricted the calculator to explicitly allowed arithmetic AST nodes and
+  finite JSON-compatible results; it does not use dynamic code execution.
+
+### Validation
+
+- Ran a real localhost Ollama smoke test against installed `gpt-oss:20b`.
+- The first model response invoked `calculator` with `(17 * 23) + 5`.
+- The registry returned `{"expression": "(17 * 23) + 5", "result": 396}`.
+- The final model response was `396`.
+- The complete automated suite passed with 328 tests.
+
+### Current Limitations
+
+- Only the opt-in calculator is built in.
+- Filesystem, network, MCP, asynchronous, and user-defined tools are not
+  implemented.
+- Internal tool rounds are not persisted across separate CLI user turns.

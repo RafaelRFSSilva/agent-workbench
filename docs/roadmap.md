@@ -23,12 +23,14 @@ Agent Workbench currently provides:
 - Portable generation configuration.
 - Prompt-based interactive setup.
 - Provider-independent structured outputs.
+- Provider-independent tool calling with an opt-in calculator.
 - Automated tests, Ruff checks, and GitHub Actions.
 
 The current application manages one conversation at a time.
 
-It does not yet provide tool execution, project-wide workspace access, RAG,
-multiple simultaneous agents, MCP integration, or a VS Code interface.
+It does not yet provide filesystem or network tools, project-wide workspace
+access, RAG, asynchronous execution, user-defined tools, multiple simultaneous
+agents, MCP integration, or a VS Code interface.
 
 ## Development Direction
 
@@ -85,7 +87,7 @@ Completed.
 
 ### Status
 
-Next implementation milestone.
+Completed.
 
 ### Objective
 
@@ -110,25 +112,26 @@ ToolResult
 └── error
 ```
 
-### Planned Work
+### Completed Work
 
-- [ ] Define immutable shared tool models.
-- [ ] Add tool definitions to `ChatRequest`.
-- [ ] Represent provider tool calls in shared responses.
-- [ ] Translate tools for Ollama.
-- [ ] Translate tools for OpenAI.
-- [ ] Translate tools for Anthropic.
-- [ ] Add invocation validation.
-- [ ] Add unknown-tool handling.
-- [ ] Add a deterministic execution loop.
-- [ ] Add maximum-iteration protection.
-- [ ] Add clear tool errors.
-- [ ] Add automated and real local validation.
+- [x] Define immutable shared `ToolDefinition`, `ToolInvocation`, and
+  `ToolResult` models.
+- [x] Add ordered tool definitions and interaction history to `ChatRequest`.
+- [x] Add ordered tool invocations to `ChatResponse`.
+- [x] Validate complete ordered `ToolInteractionRound` associations.
+- [x] Translate tool definitions, calls, and history for Ollama, OpenAI, and
+  Anthropic.
+- [x] Add provider-independent `ToolRegistry` registration and synchronous
+  execution with unknown-tool and safe handler-error results.
+- [x] Add `run_tool_calling_loop()` with positive maximum-round protection.
+- [x] Integrate the loop into the CLI without changing default no-tool
+  behavior.
+- [x] Add opt-in `--enable-tools` and the safe built-in calculator.
+- [x] Add automated tests and a real local Ollama smoke test.
 
-The first tool should be safe and deterministic.
-
-Filesystem and shell access should not be part of the initial tool-calling
-milestone.
+The initial calculator is deliberately limited to basic arithmetic. Filesystem,
+shell, network, MCP, asynchronous, and user-defined tools remain outside this
+completed milestone.
 
 ## Phase 3 — Workspace Tools
 
@@ -501,33 +504,20 @@ Security must be implemented throughout the roadmap.
 
 The next implementation milestone is:
 
-> Provider-independent tool calling.
+> Safe read-only workspace tools.
 
-The first version should prove this loop:
-
-```text
-Model receives tool definitions
-        ↓
-Model requests one safe tool
-        ↓
-Application validates and executes it
-        ↓
-Application returns a ToolResult
-        ↓
-Model produces the final answer
-```
+The completed provider-independent tool-calling loop provides the execution
+boundary; the next phase must add explicit workspace scope, permissions, path
+containment, and visible activity before exposing project files.
 
 ## Near-Term Sequence
 
-1. Complete this documentation restructure.
-2. Implement provider-independent tool calling.
-3. Add a safe tool registry and executor.
-4. Add read-only workspace tools.
-5. Introduce agent sessions.
-6. Build local project retrieval.
-7. Add initial multi-agent orchestration.
-8. Add project configuration and MCP.
-9. Build the terminal and VS Code experiences.
+1. Add read-only workspace tools.
+2. Introduce agent sessions.
+3. Build local project retrieval.
+4. Add initial multi-agent orchestration.
+5. Add project configuration and MCP.
+6. Build the terminal and VS Code experiences.
 
 ## Related Documentation
 

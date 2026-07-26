@@ -27,10 +27,12 @@ Implemented capabilities:
 - Provider-independent generation settings.
 - Prompt-based interactive setup.
 - Provider-independent structured outputs.
+- Provider-independent tool calling with opt-in built-in tools.
 - Automated tests, Ruff checks, and GitHub Actions.
 
-Tool execution, project-wide access, RAG, MCP, multiple simultaneous agents,
-and the VS Code interface are planned but not yet implemented.
+Filesystem and network tools, project-wide access, RAG, MCP, asynchronous
+execution, user-defined tools, multiple simultaneous agents, and the VS Code
+interface are planned but not yet implemented.
 
 ## Product Direction
 
@@ -345,6 +347,27 @@ Provider responses currently remain strings containing JSON.
 
 See [Structured Outputs](docs/structured-outputs.md).
 
+## Tool Calling
+
+Tools are disabled by default. Enable the available built-in tools explicitly:
+
+```bash
+uv run agent-workbench --provider ollama --model gpt-oss:20b --enable-tools
+```
+
+The initial built-in tool is `calculator`. It evaluates basic arithmetic with
+integer and finite floating-point literals, parentheses, unary `+` and `-`,
+and binary `+`, `-`, `*`, `/`, `//`, and `%`. It rejects names, function calls,
+collections, comparisons, booleans, bitwise operators, non-finite values, and
+other Python syntax. Expressions are limited in length and AST complexity.
+
+Tool calling is synchronous. A model may request tools during one CLI user
+turn; the CLI displays and retains only the final assistant text. Internal tool
+rounds are not persisted across separate user turns.
+
+See [Architecture](docs/architecture.md) for the shared tool models and
+provider translations.
+
 ## Configuration Precedence
 
 ```text
@@ -384,10 +407,10 @@ Completed foundations:
 - [x] Generation configuration.
 - [x] Prompt-based setup.
 - [x] Structured outputs.
+- [x] Provider-independent tool calling and opt-in calculator.
 
 Next milestones:
 
-- [ ] Provider-independent tool calling.
 - [ ] Safe workspace tools.
 - [ ] Agent sessions.
 - [ ] Local project retrieval and RAG.
@@ -426,8 +449,10 @@ command confirmation, repository and MCP trust, and visible audit traces.
 
 Agent Workbench does not yet provide:
 
-- Tool calling or filesystem tools.
+- Filesystem or network tools.
 - Shell command execution.
+- User-defined tools.
+- Asynchronous tool execution.
 - Project indexing or RAG.
 - Persistent conversations.
 - Multiple simultaneous agents.
