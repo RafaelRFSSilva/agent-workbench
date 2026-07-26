@@ -47,7 +47,8 @@ The current architecture is designed to provide:
 * Explicit conversation context.
 * Portable generation configuration.
 * Portable structured output configuration.
-* A foundation for tool calling and multiple agent sessions.
+* Provider-independent tool calling and a foundation for multiple agent
+  sessions.
 
 The command-line interface is the first application client.
 
@@ -112,7 +113,10 @@ agent_workbench/
 ├── messages.py
 ├── profiles/
 ├── providers/
-└── structured_outputs.py
+├── structured_outputs.py
+├── tool_calling.py
+├── tool_registry.py
+└── built_in_tools.py
 ```
 
 The exact package structure may evolve as tool calling, sessions, workspace
@@ -157,6 +161,7 @@ CLIArguments
 ├── top_p
 ├── max_output_tokens
 ├── response_format_file
+├── enable_tools
 └── setup
 ```
 
@@ -179,7 +184,8 @@ RuntimeConfiguration
 ├── agent_profile
 ├── context_documents
 ├── generation_config
-└── response_format
+├── response_format
+└── enable_tools
 ```
 
 This object provides a shared representation of one configured conversation
@@ -266,14 +272,14 @@ Conceptually:
 
 ```text
 ChatProvider
-└── chat(request: ChatRequest) -> str
+└── complete(request: ChatRequest) -> ChatResponse
 ```
 
 Each provider adapter is responsible for:
 
 * Translating the shared request.
 * Calling its native SDK.
-* Extracting the final response text.
+* Extracting response text and tool invocations.
 * Translating provider-specific errors.
 * Preserving shared application behavior.
 
@@ -298,7 +304,9 @@ ChatRequest
 ├── system_prompt
 ├── context_documents
 ├── generation_config
-└── response_format
+├── response_format
+├── tools
+└── tool_interactions
 ```
 
 The request separates different types of information instead of combining
@@ -306,6 +314,11 @@ everything into one prompt string.
 
 This distinction is important for provider translation and future agent
 execution.
+
+`ChatResponse` contains the final or intermediate assistant `text` and ordered
+`tool_invocations`. A `ToolInteractionRound` pairs one tool-requesting
+`ChatResponse` with its ordered `ToolResult` values. The shared round model
+validates that every result corresponds to one invocation in the same order.
 
 ## Conversation Messages
 
@@ -572,7 +585,7 @@ OllamaProvider
     ↓
 ollama.chat(...)
     ↓
-Response Text
+ChatResponse
 ```
 
 The adapter translates:
@@ -582,6 +595,7 @@ The adapter translates:
 * Context documents.
 * Generation parameters.
 * JSON Schema format configuration.
+* Tool definitions, tool-call history, and tool results.
 
 ### OpenAI
 
@@ -592,7 +606,7 @@ OpenAIProvider
     ↓
 OpenAI Responses API
     ↓
-Response Text
+ChatResponse
 ```
 
 The adapter translates:
@@ -601,6 +615,7 @@ The adapter translates:
 * System instructions into `instructions`.
 * Generation configuration.
 * Strict structured output configuration through `text.format`.
+* Function definitions, function-call inputs, and function-call outputs.
 
 ### Anthropic
 
@@ -611,7 +626,7 @@ AnthropicProvider
     ↓
 Anthropic Messages API
     ↓
-Response Text
+ChatResponse
 ```
 
 The adapter translates:
@@ -620,6 +635,7 @@ The adapter translates:
 * System instructions and context into the system parameter.
 * Generation configuration.
 * Structured output configuration through `output_config.format`.
+* Tool definitions, `tool_use` blocks, and `tool_result` blocks.
 
 ## Error Boundaries
 
@@ -671,6 +687,7 @@ The test suite verifies:
 * Conversation history.
 * Interactive setup behavior.
 * Provider factory behavior.
+* Tool translation, execution ordering, history, and CLI integration.
 
 Real provider validation is performed separately from the automated unit
 suite.
@@ -691,6 +708,12 @@ Application Layer
 ├── Context documents
 ├── Generation configuration
 └── Structured output configuration
+
+Tool Execution Layer
+├── ToolRegistry
+├── synchronous handlers
+├── ToolInteractionRound
+└── run_tool_calling_loop
 
 Provider Layer
 ├── Ollama adapter
@@ -743,46 +766,51 @@ functionality.
 
 ## Tool Calling Boundary
 
-The next major provider-independent abstraction is tool calling.
-
-A future request may contain:
-
-```text
-ChatRequest
-├── messages
-├── system_prompt
-├── context_documents
-├── generation_config
-├── response_format
-└── tools
-```
-
-A shared tool architecture may use:
+Tool calling is provider-independent. `ToolDefinition` describes a named tool,
+its description, and JSON object input schema. `ToolInvocation` carries the
+provider-native call identifier, tool name, and JSON object arguments.
+`ToolResult` associates a successful JSON-compatible output or safe error with
+one invocation identifier.
 
 ```text
-ToolDefinition
-ToolInvocation
-ToolResult
+ChatRequest.tools
+        ↓
+Provider-specific tool definition translation
+        ↓
+ChatResponse.tool_invocations
+        ↓
+ToolRegistry synchronous handler execution
+        ↓
+ToolInteractionRound
+        ↓
+Provider-specific interaction-history translation
+        ↓
+Final ChatResponse
 ```
 
-Provider adapters will translate tool definitions and invocations.
+`run_tool_calling_loop()` repeatedly completes a request, executes ordered
+invocations through `ToolRegistry`, appends validated interaction rounds, and
+stops on a response without tool invocations. Its positive maximum-round
+argument protects against unbounded new tool rounds; pre-existing rounds are
+forwarded without re-execution.
 
-Tool execution itself should remain outside provider adapters.
+Provider adapters retain native protocol details:
 
-```text
-Model Requests Tool
-        ↓
-Provider Adapter Translation
-        ↓
-Application Tool Executor
-        ↓
-Tool Result
-        ↓
-Next Model Request
-```
+* Ollama translates function definitions, assistant `tool_calls`, and ordered
+  `tool` result messages. It has no native call identifier, so validated round
+  ordering preserves correlation.
+* OpenAI translates Responses API function tools, `function_call` items, and
+  `function_call_output` items.
+* Anthropic translates Messages API tools, assistant `tool_use` blocks, and
+  user `tool_result` blocks.
 
-This distinction prevents providers from controlling application execution
-directly.
+The CLI keeps tools opt-in through `--enable-tools`. Its current built-in
+registry contains a safe synchronous calculator; no tool registry is created
+when the flag is absent. Internal tool rounds remain inside a single loop and
+are not persisted in normal CLI history across later user turns.
+
+This separation keeps provider adapters declarative and prevents them from
+directly executing application capabilities.
 
 ## Workspace Boundary
 
@@ -890,7 +918,6 @@ The current architecture does not yet provide:
 
 * Fully autonomous agents.
 * Multiple simultaneous agent sessions.
-* Tool execution.
 * Filesystem exploration.
 * Source-code modification.
 * Shell execution.
@@ -901,6 +928,10 @@ The current architecture does not yet provide:
 * A VS Code extension.
 * Background execution.
 * Cloud deployment.
+
+The current tool implementation is synchronous and contains only the opt-in
+calculator. It does not include filesystem, network, MCP, asynchronous, or
+user-defined tools.
 
 The presence of future-oriented abstractions in documentation does not imply
 that these capabilities are already implemented.

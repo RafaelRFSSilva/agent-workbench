@@ -15,6 +15,7 @@ Agent Workbench currently supports:
 * Portable generation configuration.
 * Portable structured outputs.
 * Prompt-based interactive runtime setup.
+* Opt-in provider-independent tool calling.
 
 The current application runs as a command-line interface.
 
@@ -469,6 +470,38 @@ The provider response remains a string containing JSON.
 
 Agent Workbench does not currently deserialize or locally validate the
 generated response after generation.
+
+## Enable the Built-In Calculator
+
+Tools are disabled by default. Enable the built-in tool registry explicitly:
+
+```bash
+uv run agent-workbench --provider ollama --model gpt-oss:20b --enable-tools
+```
+
+Ask the model to use the calculator, for example:
+
+```text
+Use the calculator tool to evaluate (17 * 23) + 5 before answering.
+```
+
+The built-in registry currently exposes only `calculator`. It accepts one
+`expression` string and returns the original expression with a numeric result.
+It supports integer and finite floating-point literals, parentheses, unary
+`+` and `-`, and binary `+`, `-`, `*`, `/`, `//`, and `%`.
+
+The calculator deliberately rejects names, variables, function calls,
+attribute access, collections, comparisons, booleans, bitwise operators, and
+all other Python syntax. It uses a restricted AST evaluator rather than
+dynamic code execution, limits expression length and AST complexity, rejects
+division or modulo by zero, and rejects non-finite results.
+
+Tool execution is synchronous. During a tool-enabled CLI turn, the application
+executes requested tools and displays only the final assistant text. The
+internal tool rounds are not persisted across separate user turns.
+
+Filesystem, network, MCP, asynchronous, and user-defined tools are not
+included yet.
 
 ## Configuration Precedence
 
