@@ -10,7 +10,7 @@ from agent_workbench.context import build_system_instructions
 from agent_workbench.errors import CompletionError, ConfigurationError
 from agent_workbench.messages import ChatRequest, ChatResponse, Message
 from agent_workbench.structured_outputs import JSONSchema
-from agent_workbench.tools import ToolInvocation
+from agent_workbench.tools import ToolInvocation, ToolResult
 
 
 class OpenAIResponseOutputItem(Protocol):
@@ -54,11 +54,31 @@ class OpenAIFunctionToolDefinition(TypedDict):
     strict: bool
 
 
+class OpenAIFunctionCallInput(TypedDict):
+    """Represent a previous function call supplied to OpenAI."""
+
+    type: Literal["function_call"]
+    call_id: str
+    name: str
+    arguments: str
+
+
+class OpenAIFunctionCallOutputInput(TypedDict):
+    """Represent a previous function-call output supplied to OpenAI."""
+
+    type: Literal["function_call_output"]
+    call_id: str
+    output: str
+
+
+type OpenAIInputItem = Message | OpenAIFunctionCallInput | OpenAIFunctionCallOutputInput
+
+
 class OpenAIResponseCreateArguments(TypedDict):
     """Represent arguments supplied to the OpenAI Responses API."""
 
     model: str
-    input: list[Message]
+    input: list[OpenAIInputItem]
     instructions: NotRequired[str]
     temperature: NotRequired[float]
     top_p: NotRequired[float]
@@ -85,6 +105,28 @@ class OpenAIClient(Protocol):
     responses: OpenAIResponsesResource
 
 
+def _serialize_tool_result(result: ToolResult) -> str:
+    """Serialize a provider-independent tool result for OpenAI input."""
+
+    if result.status == "success":
+        result_data = {
+            "status": "success",
+            "output": result.output,
+        }
+    else:
+        result_data = {
+            "status": "error",
+            "error": result.error,
+        }
+
+    return json.dumps(
+        result_data,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class OpenAIProvider:
     """Generate chat completions through the OpenAI Responses API."""
@@ -101,13 +143,46 @@ class OpenAIProvider:
     def complete(self, request: ChatRequest) -> ChatResponse:
         """Generate a response using the configured OpenAI model."""
 
-        input_messages: list[Message] = [
+        input_items: list[OpenAIInputItem] = [
             {
                 "role": message["role"],
                 "content": message["content"],
             }
             for message in request.messages
         ]
+
+        for interaction in request.tool_interactions:
+            if interaction.response.text:
+                input_items.append(
+                    {
+                        "role": "assistant",
+                        "content": interaction.response.text,
+                    }
+                )
+
+            for invocation in interaction.response.tool_invocations:
+                input_items.append(
+                    {
+                        "type": "function_call",
+                        "call_id": invocation.id,
+                        "name": invocation.tool_name,
+                        "arguments": json.dumps(
+                            invocation.arguments,
+                            allow_nan=False,
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        ),
+                    }
+                )
+
+            for result in interaction.results:
+                input_items.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": result.invocation_id,
+                        "output": _serialize_tool_result(result),
+                    }
+                )
 
         system_instructions = build_system_instructions(
             request.system_prompt,
@@ -116,7 +191,7 @@ class OpenAIProvider:
 
         response_arguments: OpenAIResponseCreateArguments = {
             "model": self.model_name,
-            "input": input_messages,
+            "input": input_items,
         }
 
         if system_instructions is not None:

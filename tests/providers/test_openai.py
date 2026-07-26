@@ -14,10 +14,15 @@ from agent_workbench.context import (
 )
 from agent_workbench.errors import CompletionError
 from agent_workbench.generation import GenerationConfig
-from agent_workbench.messages import ChatRequest, ChatResponse, Message
+from agent_workbench.messages import (
+    ChatRequest,
+    ChatResponse,
+    Message,
+    ToolInteractionRound,
+)
 from agent_workbench.providers.openai import OpenAIProvider
 from agent_workbench.structured_outputs import JSONResponseFormat
-from agent_workbench.tools import ToolDefinition, ToolInvocation
+from agent_workbench.tools import ToolDefinition, ToolInvocation, ToolResult
 
 
 def create_fake_client(outcome: str | Exception) -> tuple[SimpleNamespace, Mock]:
@@ -491,3 +496,180 @@ def test_malformed_function_arguments_raise_completion_error(
         match="malformed tool invocation",
     ):
         provider.complete(ChatRequest(messages=[]))
+
+
+def test_tool_interactions_are_translated_to_openai_input_items() -> None:
+    """Translate ordered shared tool interactions into Responses API input."""
+
+    client, create_mock = create_fake_client("Tool interactions processed")
+    provider = OpenAIProvider(
+        model_name="test-model",
+        client=client,
+    )
+    first_result = ToolResult(
+        invocation_id="call-1",
+        status="success",
+        output={
+            "value": 4,
+        },
+    )
+    first_round = ToolInteractionRound(
+        response=ChatResponse(
+            text="I will calculate and inspect the project.",
+            tool_invocations=(
+                ToolInvocation(
+                    id="call-1",
+                    tool_name="calculator",
+                    arguments={
+                        "expression": "2 + 2",
+                    },
+                ),
+                ToolInvocation(
+                    id="call-2",
+                    tool_name="project_information",
+                    arguments={},
+                ),
+            ),
+        ),
+        results=(
+            first_result,
+            ToolResult(
+                invocation_id="call-2",
+                status="error",
+                error="Project information is unavailable.",
+            ),
+        ),
+    )
+    second_round = ToolInteractionRound(
+        response=ChatResponse(
+            tool_invocations=(
+                ToolInvocation(
+                    id="call-3",
+                    tool_name="identity",
+                    arguments={},
+                ),
+                ToolInvocation(
+                    id="call-4",
+                    tool_name="increment",
+                    arguments={
+                        "left": 2,
+                        "right": 3,
+                    },
+                ),
+                ToolInvocation(
+                    id="call-5",
+                    tool_name="list_files",
+                    arguments={},
+                ),
+            ),
+        ),
+        results=(
+            ToolResult(
+                invocation_id="call-3",
+                status="success",
+            ),
+            ToolResult(
+                invocation_id="call-4",
+                status="success",
+                output=5,
+            ),
+            ToolResult(
+                invocation_id="call-5",
+                status="success",
+                output=[
+                    "README.md",
+                    {
+                        "count": 2,
+                    },
+                ],
+            ),
+        ),
+    )
+    messages: list[Message] = [
+        {
+            "role": "user",
+            "content": "Calculate and inspect the project.",
+        }
+    ]
+
+    result = provider.complete(
+        ChatRequest(
+            messages=messages,
+            tool_interactions=(
+                first_round,
+                second_round,
+            ),
+        )
+    )
+
+    assert result == ChatResponse(text="Tool interactions processed")
+    assert first_result.output == {
+        "value": 4,
+    }
+    create_mock.assert_called_once_with(
+        model="test-model",
+        input=[
+            *messages,
+            {
+                "role": "assistant",
+                "content": "I will calculate and inspect the project.",
+            },
+            {
+                "type": "function_call",
+                "call_id": "call-1",
+                "name": "calculator",
+                "arguments": '{"expression":"2 + 2"}',
+            },
+            {
+                "type": "function_call",
+                "call_id": "call-2",
+                "name": "project_information",
+                "arguments": "{}",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call-1",
+                "output": '{"output":{"value":4},"status":"success"}',
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call-2",
+                "output": (
+                    '{"error":"Project information is unavailable.","status":"error"}'
+                ),
+            },
+            {
+                "type": "function_call",
+                "call_id": "call-3",
+                "name": "identity",
+                "arguments": "{}",
+            },
+            {
+                "type": "function_call",
+                "call_id": "call-4",
+                "name": "increment",
+                "arguments": '{"left":2,"right":3}',
+            },
+            {
+                "type": "function_call",
+                "call_id": "call-5",
+                "name": "list_files",
+                "arguments": "{}",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call-3",
+                "output": '{"output":null,"status":"success"}',
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call-4",
+                "output": '{"output":5,"status":"success"}',
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call-5",
+                "output": ('{"output":["README.md",{"count":2}],"status":"success"}'),
+            },
+        ],
+    )
