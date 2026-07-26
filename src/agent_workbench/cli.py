@@ -17,8 +17,11 @@ from agent_workbench.providers.factory import create_provider
 from agent_workbench.agents import AgentProfile
 from agent_workbench.generation import GenerationConfig
 from agent_workbench.structured_outputs import JSONResponseFormat
+from agent_workbench.tool_calling import run_tool_calling_loop
+from agent_workbench.tool_registry import ToolRegistry
 
 EXIT_COMMANDS = {"/exit", "/quit"}
+DEFAULT_MAX_TOOL_ROUNDS = 8
 
 
 def run_cli(
@@ -28,6 +31,8 @@ def run_cli(
     context_documents: tuple[ContextDocument, ...] = (),
     generation_config: GenerationConfig | None = None,
     response_format: JSONResponseFormat | None = None,
+    tool_registry: ToolRegistry | None = None,
+    max_tool_rounds: int = DEFAULT_MAX_TOOL_ROUNDS,
 ) -> None:
     """Run an interactive conversation using the provided model provider."""
 
@@ -69,15 +74,24 @@ def run_cli(
         request_messages = [*messages, user_message]
 
         try:
-            assistant_response = provider.complete(
-                ChatRequest(
-                    messages=request_messages,
-                    system_prompt=system_prompt,
-                    context_documents=context_documents,
-                    generation_config=active_generation_config,
-                    response_format=response_format,
-                )
+            request = ChatRequest(
+                messages=request_messages,
+                system_prompt=system_prompt,
+                context_documents=context_documents,
+                generation_config=active_generation_config,
+                response_format=response_format,
+                tools=tool_registry.definitions if tool_registry is not None else (),
             )
+
+            if tool_registry is None:
+                assistant_response = provider.complete(request)
+            else:
+                assistant_response = run_tool_calling_loop(
+                    provider,
+                    request,
+                    tool_registry,
+                    max_tool_rounds,
+                )
         except CompletionError as exc:
             print(f"Error: {exc}\n")
             continue
