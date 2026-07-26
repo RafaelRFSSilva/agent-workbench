@@ -904,6 +904,7 @@ def test_main_injects_workspace_tools_when_workspace_is_enabled(
     assert [definition.name for definition in registry.definitions] == [
         "list_files",
         "read_file",
+        "search_text",
     ]
 
 
@@ -942,6 +943,7 @@ def test_main_combines_calculator_and_workspace_tools_in_order(
         "calculator",
         "list_files",
         "read_file",
+        "search_text",
     ]
 
 

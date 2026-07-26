@@ -12,6 +12,21 @@ MAX_DIRECTORY_ENTRIES = 128
 MAX_FILE_SIZE_BYTES = 100 * 1024
 """Maximum UTF-8 file size returned by read_file."""
 
+MAX_SEARCH_QUERY_LENGTH = 256
+"""Maximum number of characters accepted in a search query."""
+
+MAX_SEARCH_FILES = 512
+"""Maximum regular files inspected by one search."""
+
+MAX_SEARCH_FILE_BYTES = MAX_FILE_SIZE_BYTES
+"""Maximum bytes inspected from one searched file."""
+
+MAX_SEARCH_MATCHES = 256
+"""Maximum matching lines returned by one search."""
+
+MAX_SEARCH_LINE_LENGTH = 1_000
+"""Maximum characters returned for one matching line."""
+
 _PATH_INPUT_SCHEMA: JSONObject = {
     "type": "object",
     "properties": {
@@ -35,6 +50,27 @@ READ_FILE_DEFINITION = ToolDefinition(
     input_schema=_PATH_INPUT_SCHEMA,
 )
 
+SEARCH_TEXT_DEFINITION = ToolDefinition(
+    name="search_text",
+    description="Search UTF-8 text files inside the authorized workspace.",
+    input_schema={
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+            },
+            "path": {
+                "type": "string",
+            },
+            "case_sensitive": {
+                "type": "boolean",
+            },
+        },
+        "required": ["query"],
+        "additionalProperties": False,
+    },
+)
+
 
 def register_workspace_tools(
     registry: ToolRegistry,
@@ -49,6 +85,10 @@ def register_workspace_tools(
     registry.register(
         READ_FILE_DEFINITION,
         lambda arguments: read_workspace_file(workspace, arguments),
+    )
+    registry.register(
+        SEARCH_TEXT_DEFINITION,
+        lambda arguments: search_workspace_text(workspace, arguments),
     )
 
 
@@ -131,6 +171,70 @@ def read_workspace_file(
     }
 
 
+def search_workspace_text(
+    workspace: Workspace,
+    arguments: object,
+) -> JSONObject:
+    """Search bounded UTF-8 text content inside the authorized workspace."""
+
+    query, requested_path, case_sensitive = _get_search_arguments(arguments)
+    search_path = workspace.resolve(requested_path)
+    search_root = _workspace_relative_path(workspace, search_path)
+    comparable_query = query if case_sensitive else query.lower()
+    matches: list[JSONObject] = []
+    files_inspected = 0
+    truncated = False
+
+    for file_path in _iter_search_files(search_path):
+        if files_inspected >= MAX_SEARCH_FILES:
+            truncated = True
+            break
+
+        files_inspected += 1
+        content = _read_search_file(file_path)
+
+        if content is None:
+            try:
+                if file_path.stat().st_size > MAX_SEARCH_FILE_BYTES:
+                    truncated = True
+            except OSError:
+                pass
+            continue
+
+        canonical_file_path = workspace.resolve(file_path.relative_to(workspace.root))
+        relative_file_path = _workspace_relative_path(workspace, canonical_file_path)
+
+        for line_number, line in enumerate(content.splitlines(), start=1):
+            comparable_line = line if case_sensitive else line.lower()
+            match_index = comparable_line.find(comparable_query)
+
+            if match_index < 0:
+                continue
+
+            if len(matches) >= MAX_SEARCH_MATCHES:
+                return {
+                    "path": search_root,
+                    "matches": matches,
+                    "truncated": True,
+                }
+
+            limited_line, line_was_truncated = _limit_search_line(line, match_index)
+            truncated = truncated or line_was_truncated
+            matches.append(
+                {
+                    "path": relative_file_path,
+                    "line_number": line_number,
+                    "line": limited_line,
+                }
+            )
+
+    return {
+        "path": search_root,
+        "matches": matches,
+        "truncated": truncated,
+    }
+
+
 def _get_requested_path(tool_name: str, arguments: object) -> Path:
     """Validate and convert a tool path argument."""
 
@@ -143,6 +247,92 @@ def _get_requested_path(tool_name: str, arguments: object) -> Path:
         raise ValueError(f"{tool_name} requires a path string.")
 
     return Path(path)
+
+
+def _get_search_arguments(arguments: object) -> tuple[str, Path, bool]:
+    """Validate and normalize portable search arguments."""
+
+    if not isinstance(arguments, dict) or not {"query"} <= set(arguments):
+        raise ValueError("search_text requires search arguments.")
+
+    if set(arguments) - {"query", "path", "case_sensitive"}:
+        raise ValueError("search_text requires search arguments.")
+
+    query = arguments["query"]
+
+    if not isinstance(query, str) or not query.strip():
+        raise ValueError("search_text requires a non-blank query.")
+
+    if len(query) > MAX_SEARCH_QUERY_LENGTH:
+        raise ValueError(
+            f"search query exceeds the {MAX_SEARCH_QUERY_LENGTH}-character limit."
+        )
+
+    path = arguments.get("path", ".")
+    case_sensitive = arguments.get("case_sensitive", False)
+
+    if not isinstance(path, str) or not isinstance(case_sensitive, bool):
+        raise ValueError("search_text requires search arguments.")
+
+    return query, Path(path), case_sensitive
+
+
+def _iter_search_files(search_path: Path):
+    """Yield regular search files in deterministic relative path order."""
+
+    if search_path.is_file():
+        yield search_path
+        return
+
+    if not search_path.is_dir():
+        raise ValueError("search_text requires a regular file or directory.")
+
+    try:
+        children = sorted(search_path.iterdir(), key=lambda child: child.name)
+    except OSError:
+        return
+
+    for child in children:
+        if child.is_symlink():
+            continue
+
+        if child.is_file():
+            yield child
+        elif child.is_dir():
+            yield from _iter_search_files(child)
+
+
+def _read_search_file(file_path: Path) -> str | None:
+    """Return bounded valid UTF-8 content, skipping unreadable files safely."""
+
+    try:
+        if file_path.stat().st_size > MAX_SEARCH_FILE_BYTES:
+            return None
+
+        with file_path.open("rb") as source:
+            content_bytes = source.read(MAX_SEARCH_FILE_BYTES + 1)
+    except OSError:
+        return None
+
+    if len(content_bytes) > MAX_SEARCH_FILE_BYTES:
+        return None
+
+    try:
+        return content_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def _limit_search_line(line: str, match_index: int) -> tuple[str, bool]:
+    """Return a bounded matching line while retaining the literal match."""
+
+    if len(line) <= MAX_SEARCH_LINE_LENGTH:
+        return line, False
+
+    maximum_content_length = MAX_SEARCH_LINE_LENGTH - 3
+    start = min(match_index, len(line) - maximum_content_length)
+
+    return f"{line[start : start + maximum_content_length]}...", True
 
 
 def _workspace_relative_path(workspace: Workspace, path: Path) -> str:

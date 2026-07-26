@@ -12,9 +12,15 @@ from agent_workbench.workspace import Workspace
 from agent_workbench.workspace_tools import (
     MAX_DIRECTORY_ENTRIES,
     MAX_FILE_SIZE_BYTES,
+    MAX_SEARCH_FILE_BYTES,
+    MAX_SEARCH_FILES,
+    MAX_SEARCH_LINE_LENGTH,
+    MAX_SEARCH_MATCHES,
+    MAX_SEARCH_QUERY_LENGTH,
     list_workspace_files,
     read_workspace_file,
     register_workspace_tools,
+    search_workspace_text,
 )
 
 
@@ -44,7 +50,7 @@ def create_existing_definition() -> ToolDefinition:
 def test_registers_workspace_tools_in_order_with_exact_schemas(
     tmp_path: Path,
 ) -> None:
-    """Register list_files before read_file with their portable schemas."""
+    """Register workspace tools in deterministic order with portable schemas."""
 
     _, workspace = create_workspace(tmp_path)
     registry = ToolRegistry()
@@ -54,10 +60,12 @@ def test_registers_workspace_tools_in_order_with_exact_schemas(
     assert tuple(definition.name for definition in registry.definitions) == (
         "list_files",
         "read_file",
+        "search_text",
     )
     assert tuple(definition.description for definition in registry.definitions) == (
         "List the direct entries of a directory inside the authorized workspace.",
         "Read a UTF-8 text file inside the authorized workspace.",
+        "Search UTF-8 text files inside the authorized workspace.",
     )
     assert tuple(definition.input_schema for definition in registry.definitions) == (
         {
@@ -75,9 +83,25 @@ def test_registers_workspace_tools_in_order_with_exact_schemas(
             "properties": {
                 "path": {
                     "type": "string",
-                }
+                },
             },
             "required": ["path"],
+            "additionalProperties": False,
+        },
+        {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                },
+                "path": {
+                    "type": "string",
+                },
+                "case_sensitive": {
+                    "type": "boolean",
+                },
+            },
+            "required": ["query"],
             "additionalProperties": False,
         },
     )
@@ -98,6 +122,7 @@ def test_preserves_existing_registry_tools(tmp_path: Path) -> None:
         "existing",
         "list_files",
         "read_file",
+        "search_text",
     )
 
 
@@ -392,3 +417,254 @@ def test_handlers_do_not_mutate_arguments_or_returned_data(tmp_path: Path) -> No
             }
         ],
     }
+
+
+def test_searches_root_and_nested_files_in_deterministic_path_order(
+    tmp_path: Path,
+) -> None:
+    """Search root and nested text files in workspace-relative path order."""
+
+    root, workspace = create_workspace(tmp_path)
+    (root / "zeta.txt").write_text("needle zeta\n", encoding="utf-8")
+    nested_path = root / "alpha" / "notes.txt"
+    nested_path.parent.mkdir()
+    nested_path.write_text("needle alpha\n", encoding="utf-8")
+
+    result = search_workspace_text(workspace, {"query": "needle"})
+
+    assert result == {
+        "path": ".",
+        "matches": [
+            {
+                "path": "alpha/notes.txt",
+                "line_number": 1,
+                "line": "needle alpha",
+            },
+            {
+                "path": "zeta.txt",
+                "line_number": 1,
+                "line": "needle zeta",
+            },
+        ],
+        "truncated": False,
+    }
+
+
+def test_searches_a_single_file_and_nested_directory(tmp_path: Path) -> None:
+    """Accept either a single canonical file or a nested directory."""
+
+    root, workspace = create_workspace(tmp_path)
+    file_path = root / "docs" / "notes.txt"
+    file_path.parent.mkdir()
+    file_path.write_text("first\nneedle\n", encoding="utf-8")
+
+    file_result = search_workspace_text(
+        workspace,
+        {"query": "needle", "path": "docs/./notes.txt"},
+    )
+    directory_result = search_workspace_text(
+        workspace,
+        {"query": "needle", "path": "docs"},
+    )
+
+    expected_matches = [
+        {
+            "path": "docs/notes.txt",
+            "line_number": 2,
+            "line": "needle",
+        }
+    ]
+    assert file_result == {
+        "path": "docs/notes.txt",
+        "matches": expected_matches,
+        "truncated": False,
+    }
+    assert directory_result == {
+        "path": "docs",
+        "matches": expected_matches,
+        "truncated": False,
+    }
+
+
+def test_search_includes_hidden_files_and_honors_case_sensitivity(
+    tmp_path: Path,
+) -> None:
+    """Search hidden files with explicit case-sensitive matching control."""
+
+    root, workspace = create_workspace(tmp_path)
+    (root / ".hidden.txt").write_text("Needle\n", encoding="utf-8")
+
+    insensitive_result = search_workspace_text(workspace, {"query": "needle"})
+    sensitive_result = search_workspace_text(
+        workspace,
+        {"query": "needle", "case_sensitive": True},
+    )
+
+    assert insensitive_result["matches"] == [
+        {
+            "path": ".hidden.txt",
+            "line_number": 1,
+            "line": "Needle",
+        }
+    ]
+    assert sensitive_result["matches"] == []
+
+
+def test_search_returns_one_match_per_matching_line(tmp_path: Path) -> None:
+    """Preserve matching line order without duplicating repeated occurrences."""
+
+    root, workspace = create_workspace(tmp_path)
+    (root / "notes.txt").write_text(
+        "needle needle\nother\nneedle\n",
+        encoding="utf-8",
+    )
+
+    result = search_workspace_text(workspace, {"query": "needle"})
+
+    assert result["matches"] == [
+        {
+            "path": "notes.txt",
+            "line_number": 1,
+            "line": "needle needle",
+        },
+        {
+            "path": "notes.txt",
+            "line_number": 3,
+            "line": "needle",
+        },
+    ]
+
+
+def test_search_rejects_blank_queries_and_invalid_arguments(tmp_path: Path) -> None:
+    """Require one non-blank query and only the documented fields."""
+
+    _, workspace = create_workspace(tmp_path)
+
+    with pytest.raises(ValueError, match="requires a non-blank query"):
+        search_workspace_text(workspace, {"query": "   "})
+
+    with pytest.raises(ValueError, match="requires search arguments"):
+        search_workspace_text(workspace, {"query": "needle", "unknown": True})
+
+
+def test_search_delegates_traversal_and_external_symlink_rejection(
+    tmp_path: Path,
+) -> None:
+    """Keep traversal and external-symlink containment in Workspace."""
+
+    root, workspace = create_workspace(tmp_path)
+    external_path = tmp_path / "external.txt"
+    external_path.write_text("needle", encoding="utf-8")
+    (root / "external-link.txt").symlink_to(external_path)
+
+    with pytest.raises(WorkspacePathError, match="resolves outside the workspace"):
+        search_workspace_text(workspace, {"query": "needle", "path": "../external.txt"})
+
+    with pytest.raises(WorkspacePathError, match="resolves outside the workspace"):
+        search_workspace_text(
+            workspace,
+            {"query": "needle", "path": "external-link.txt"},
+        )
+
+
+def test_search_does_not_follow_directory_symlinks_during_recursion(
+    tmp_path: Path,
+) -> None:
+    """Skip directory symlinks encountered while walking a directory."""
+
+    root, workspace = create_workspace(tmp_path)
+    target_directory = root / "target"
+    target_directory.mkdir()
+    (target_directory / "secret.txt").write_text("needle", encoding="utf-8")
+    (root / "directory-link").symlink_to(target_directory, target_is_directory=True)
+
+    result = search_workspace_text(workspace, {"query": "needle", "path": "."})
+
+    assert result["matches"] == [
+        {
+            "path": "target/secret.txt",
+            "line_number": 1,
+            "line": "needle",
+        }
+    ]
+
+
+def test_search_skips_invalid_utf8_and_uses_internal_file_symlink_target(
+    tmp_path: Path,
+) -> None:
+    """Ignore invalid text and permit a directly requested internal file symlink."""
+
+    root, workspace = create_workspace(tmp_path)
+    target = root / "data" / "notes.txt"
+    target.parent.mkdir()
+    target.write_text("needle", encoding="utf-8")
+    (root / "notes-link.txt").symlink_to(target)
+    (root / "invalid.bin").write_bytes(b"\xffneedle")
+
+    root_result = search_workspace_text(workspace, {"query": "needle"})
+    symlink_result = search_workspace_text(
+        workspace,
+        {"query": "needle", "path": "notes-link.txt"},
+    )
+
+    assert root_result["matches"] == [
+        {
+            "path": "data/notes.txt",
+            "line_number": 1,
+            "line": "needle",
+        }
+    ]
+    assert symlink_result["path"] == "data/notes.txt"
+    assert symlink_result["matches"] == root_result["matches"]
+
+
+def test_search_enforces_query_file_byte_match_and_line_limits(
+    tmp_path: Path,
+) -> None:
+    """Bound all search inputs and returned result data deterministically."""
+
+    root, workspace = create_workspace(tmp_path)
+
+    with pytest.raises(ValueError, match="query exceeds"):
+        search_workspace_text(workspace, {"query": "a" * (MAX_SEARCH_QUERY_LENGTH + 1)})
+
+    for index in range(MAX_SEARCH_FILES + 1):
+        content = "needle\n" if index == MAX_SEARCH_FILES else "other\n"
+        (root / f"file-{index:03d}.txt").write_text(content, encoding="utf-8")
+
+    file_limited_result = search_workspace_text(workspace, {"query": "needle"})
+
+    assert file_limited_result["matches"] == []
+    assert file_limited_result["truncated"] is True
+
+    for path in root.iterdir():
+        path.unlink()
+    (root / "large.txt").write_bytes(b"needle" + b"a" * MAX_SEARCH_FILE_BYTES)
+
+    byte_limited_result = search_workspace_text(workspace, {"query": "needle"})
+
+    assert byte_limited_result["matches"] == []
+    assert byte_limited_result["truncated"] is True
+
+    (root / "large.txt").unlink()
+    (root / "matches.txt").write_text(
+        "".join("needle\n" for _ in range(MAX_SEARCH_MATCHES + 1)),
+        encoding="utf-8",
+    )
+
+    match_limited_result = search_workspace_text(workspace, {"query": "needle"})
+
+    assert len(match_limited_result["matches"]) == MAX_SEARCH_MATCHES
+    assert match_limited_result["truncated"] is True
+
+    (root / "matches.txt").unlink()
+    (root / "line.txt").write_text(
+        "needle" + "a" * MAX_SEARCH_LINE_LENGTH,
+        encoding="utf-8",
+    )
+
+    line_limited_result = search_workspace_text(workspace, {"query": "needle"})
+
+    assert len(line_limited_result["matches"][0]["line"]) == MAX_SEARCH_LINE_LENGTH
+    assert line_limited_result["truncated"] is True
+    assert str(root) not in str(line_limited_result)
