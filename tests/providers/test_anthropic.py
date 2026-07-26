@@ -19,10 +19,14 @@ from agent_workbench.context import (
 )
 from agent_workbench.errors import CompletionError
 from agent_workbench.generation import GenerationConfig
-from agent_workbench.messages import ChatRequest, ChatResponse
+from agent_workbench.messages import (
+    ChatRequest,
+    ChatResponse,
+    ToolInteractionRound,
+)
 from agent_workbench.providers.anthropic import AnthropicProvider
 from agent_workbench.structured_outputs import JSONResponseFormat
-from agent_workbench.tools import ToolDefinition, ToolInvocation
+from agent_workbench.tools import ToolDefinition, ToolInvocation, ToolResult
 
 
 def test_complete_returns_concatenated_text_blocks() -> None:
@@ -533,3 +537,214 @@ def test_malformed_tool_use_blocks_raise_completion_error(
         match="malformed tool invocation",
     ):
         provider.complete(ChatRequest(messages=[]))
+
+
+def test_tool_interactions_are_translated_to_anthropic_messages() -> None:
+    """Translate ordered shared tool interactions into Anthropic messages."""
+
+    create = Mock(return_value=SimpleNamespace(content=[]))
+    client = SimpleNamespace(
+        messages=SimpleNamespace(create=create),
+    )
+    provider = AnthropicProvider(
+        model_name="claude-test",
+        client=client,
+        max_tokens=256,
+    )
+    first_result = ToolResult(
+        invocation_id="toolu-1",
+        status="success",
+        output={
+            "value": 4,
+        },
+    )
+    first_round = ToolInteractionRound(
+        response=ChatResponse(
+            text="I will calculate and inspect the project.",
+            tool_invocations=(
+                ToolInvocation(
+                    id="toolu-1",
+                    tool_name="calculator",
+                    arguments={
+                        "expression": "2 + 2",
+                    },
+                ),
+                ToolInvocation(
+                    id="toolu-2",
+                    tool_name="project_information",
+                    arguments={},
+                ),
+            ),
+        ),
+        results=(
+            first_result,
+            ToolResult(
+                invocation_id="toolu-2",
+                status="error",
+                error="Project information is unavailable.",
+            ),
+        ),
+    )
+    second_round = ToolInteractionRound(
+        response=ChatResponse(
+            tool_invocations=(
+                ToolInvocation(
+                    id="toolu-3",
+                    tool_name="identity",
+                    arguments={},
+                ),
+                ToolInvocation(
+                    id="toolu-4",
+                    tool_name="increment",
+                    arguments={
+                        "left": 2,
+                        "right": 3,
+                    },
+                ),
+                ToolInvocation(
+                    id="toolu-5",
+                    tool_name="list_files",
+                    arguments={},
+                ),
+            ),
+        ),
+        results=(
+            ToolResult(
+                invocation_id="toolu-3",
+                status="success",
+            ),
+            ToolResult(
+                invocation_id="toolu-4",
+                status="success",
+                output=5,
+            ),
+            ToolResult(
+                invocation_id="toolu-5",
+                status="success",
+                output=[
+                    "README.md",
+                    {
+                        "count": 2,
+                    },
+                ],
+            ),
+        ),
+    )
+    messages = [
+        {
+            "role": "user",
+            "content": "Calculate and inspect the project.",
+        }
+    ]
+
+    result = provider.complete(
+        ChatRequest(
+            messages=messages,
+            tool_interactions=(
+                first_round,
+                second_round,
+            ),
+        )
+    )
+
+    assert result == ChatResponse()
+    assert first_result.output == {
+        "value": 4,
+    }
+    create.assert_called_once_with(
+        model="claude-test",
+        max_tokens=256,
+        messages=[
+            *messages,
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "I will calculate and inspect the project.",
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "toolu-1",
+                        "name": "calculator",
+                        "input": {
+                            "expression": "2 + 2",
+                        },
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "toolu-2",
+                        "name": "project_information",
+                        "input": {},
+                    },
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu-1",
+                        "content": '{"output":{"value":4},"status":"success"}',
+                    },
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu-2",
+                        "content": (
+                            '{"error":"Project information is unavailable.",'
+                            '"status":"error"}'
+                        ),
+                        "is_error": True,
+                    },
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu-3",
+                        "name": "identity",
+                        "input": {},
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "toolu-4",
+                        "name": "increment",
+                        "input": {
+                            "left": 2,
+                            "right": 3,
+                        },
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "toolu-5",
+                        "name": "list_files",
+                        "input": {},
+                    },
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu-3",
+                        "content": '{"output":null,"status":"success"}',
+                    },
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu-4",
+                        "content": '{"output":5,"status":"success"}',
+                    },
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu-5",
+                        "content": (
+                            '{"output":["README.md",{"count":2}],"status":"success"}'
+                        ),
+                    },
+                ],
+            },
+        ],
+    )

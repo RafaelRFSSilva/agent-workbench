@@ -1,5 +1,6 @@
 """Anthropic provider implementation."""
 
+import json
 from dataclasses import dataclass
 from typing import Literal, NotRequired, Protocol, TypedDict, Unpack, cast
 
@@ -13,9 +14,9 @@ from anthropic import (
 
 from agent_workbench.context import build_system_instructions
 from agent_workbench.errors import CompletionError, ConfigurationError
-from agent_workbench.messages import ChatRequest, ChatResponse, Message
+from agent_workbench.messages import ChatRequest, ChatResponse
 from agent_workbench.structured_outputs import JSONSchema
-from agent_workbench.tools import ToolInvocation
+from agent_workbench.tools import ToolInvocation, ToolResult
 
 
 class AnthropicContentBlock(Protocol):
@@ -65,12 +66,49 @@ class AnthropicToolDefinition(TypedDict):
     input_schema: JSONSchema
 
 
+class AnthropicTextInputBlock(TypedDict):
+    """Represent a text block supplied to Anthropic."""
+
+    type: Literal["text"]
+    text: str
+
+
+class AnthropicToolUseInputBlock(TypedDict):
+    """Represent a previous tool-use block supplied to Anthropic."""
+
+    type: Literal["tool_use"]
+    id: str
+    name: str
+    input: dict[str, object]
+
+
+class AnthropicToolResultInputBlock(TypedDict):
+    """Represent a previous tool-result block supplied to Anthropic."""
+
+    type: Literal["tool_result"]
+    tool_use_id: str
+    content: str
+    is_error: NotRequired[bool]
+
+
+type AnthropicInputContentBlock = (
+    AnthropicTextInputBlock | AnthropicToolUseInputBlock | AnthropicToolResultInputBlock
+)
+
+
+class AnthropicInputMessage(TypedDict):
+    """Represent a message supplied to the Anthropic Messages API."""
+
+    role: Literal["user", "assistant"]
+    content: str | list[AnthropicInputContentBlock]
+
+
 class AnthropicMessageCreateArguments(TypedDict):
     """Represent arguments supplied to the Anthropic Messages API."""
 
     model: str
     max_tokens: int
-    messages: list[Message]
+    messages: list[AnthropicInputMessage]
     system: NotRequired[str]
     temperature: NotRequired[float]
     top_p: NotRequired[float]
@@ -96,6 +134,28 @@ class AnthropicClient(Protocol):
     messages: AnthropicMessagesResource
 
 
+def _serialize_tool_result(result: ToolResult) -> str:
+    """Serialize a provider-independent tool result for Anthropic input."""
+
+    if result.status == "success":
+        result_data = {
+            "status": "success",
+            "output": result.output,
+        }
+    else:
+        result_data = {
+            "status": "error",
+            "error": result.error,
+        }
+
+    return json.dumps(
+        result_data,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class AnthropicProvider:
     """Generate chat completions through the Anthropic Messages API."""
@@ -113,13 +173,62 @@ class AnthropicProvider:
     def complete(self, request: ChatRequest) -> ChatResponse:
         """Return an assistant reply for the supplied chat request."""
 
-        request_messages: list[Message] = [
+        request_messages: list[AnthropicInputMessage] = [
             {
                 "role": message["role"],
                 "content": message["content"],
             }
             for message in request.messages
         ]
+
+        for interaction in request.tool_interactions:
+            assistant_content: list[AnthropicInputContentBlock] = []
+
+            if interaction.response.text:
+                assistant_content.append(
+                    {
+                        "type": "text",
+                        "text": interaction.response.text,
+                    }
+                )
+
+            for invocation in interaction.response.tool_invocations:
+                assistant_content.append(
+                    {
+                        "type": "tool_use",
+                        "id": invocation.id,
+                        "name": invocation.tool_name,
+                        "input": invocation.arguments,
+                    }
+                )
+
+            request_messages.append(
+                {
+                    "role": "assistant",
+                    "content": assistant_content,
+                }
+            )
+
+            result_content: list[AnthropicInputContentBlock] = []
+
+            for result in interaction.results:
+                tool_result: AnthropicToolResultInputBlock = {
+                    "type": "tool_result",
+                    "tool_use_id": result.invocation_id,
+                    "content": _serialize_tool_result(result),
+                }
+
+                if result.status == "error":
+                    tool_result["is_error"] = True
+
+                result_content.append(tool_result)
+
+            request_messages.append(
+                {
+                    "role": "user",
+                    "content": result_content,
+                }
+            )
 
         system_instructions = build_system_instructions(
             request.system_prompt,
