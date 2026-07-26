@@ -1,7 +1,7 @@
 """Anthropic provider implementation."""
 
 from dataclasses import dataclass
-from typing import Literal, NotRequired, Protocol, TypedDict, Unpack
+from typing import Literal, NotRequired, Protocol, TypedDict, Unpack, cast
 
 from anthropic import (
     APIConnectionError,
@@ -12,16 +12,30 @@ from anthropic import (
 )
 
 from agent_workbench.context import build_system_instructions
-from agent_workbench.errors import CompletionError
+from agent_workbench.errors import CompletionError, ConfigurationError
 from agent_workbench.messages import ChatRequest, ChatResponse, Message
 from agent_workbench.structured_outputs import JSONSchema
+from agent_workbench.tools import ToolInvocation
 
 
 class AnthropicContentBlock(Protocol):
     """Represent a content block returned by Anthropic."""
 
     type: str
+
+
+class AnthropicTextBlock(AnthropicContentBlock, Protocol):
+    """Represent a text block returned by Anthropic."""
+
     text: str
+
+
+class AnthropicToolUseBlock(AnthropicContentBlock, Protocol):
+    """Represent a tool-use block returned by Anthropic."""
+
+    id: str
+    name: str
+    input: dict[str, object]
 
 
 class AnthropicResponse(Protocol):
@@ -43,6 +57,14 @@ class AnthropicOutputConfig(TypedDict):
     format: AnthropicJSONOutputFormat
 
 
+class AnthropicToolDefinition(TypedDict):
+    """Represent a tool supplied to Anthropic."""
+
+    name: str
+    description: str
+    input_schema: JSONSchema
+
+
 class AnthropicMessageCreateArguments(TypedDict):
     """Represent arguments supplied to the Anthropic Messages API."""
 
@@ -53,6 +75,7 @@ class AnthropicMessageCreateArguments(TypedDict):
     temperature: NotRequired[float]
     top_p: NotRequired[float]
     output_config: NotRequired[AnthropicOutputConfig]
+    tools: NotRequired[list[AnthropicToolDefinition]]
 
 
 class AnthropicMessagesResource(Protocol):
@@ -132,6 +155,16 @@ class AnthropicProvider:
                 }
             }
 
+        if request.tools:
+            request_arguments["tools"] = [
+                {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "input_schema": tool.input_schema,
+                }
+                for tool in request.tools
+            ]
+
         try:
             response = self.client.messages.create(
                 **request_arguments,
@@ -157,8 +190,33 @@ class AnthropicProvider:
                 f"Anthropic API request failed with status {exc.status_code}."
             ) from exc
 
+        text_blocks: list[str] = []
+        tool_invocations: list[ToolInvocation] = []
+
+        for block in response.content:
+            if block.type == "text":
+                text_blocks.append(cast(AnthropicTextBlock, block).text)
+                continue
+
+            if block.type != "tool_use":
+                continue
+
+            tool_use_block = cast(AnthropicToolUseBlock, block)
+
+            try:
+                tool_invocation = ToolInvocation(
+                    id=tool_use_block.id,
+                    tool_name=tool_use_block.name,
+                    arguments=tool_use_block.input,
+                )
+            except (AttributeError, ConfigurationError) as exc:
+                raise CompletionError(
+                    "Anthropic returned a malformed tool invocation."
+                ) from exc
+
+            tool_invocations.append(tool_invocation)
+
         return ChatResponse(
-            text="".join(
-                block.text for block in response.content if block.type == "text"
-            ),
+            text="".join(text_blocks),
+            tool_invocations=tuple(tool_invocations),
         )

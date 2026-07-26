@@ -22,6 +22,7 @@ from agent_workbench.generation import GenerationConfig
 from agent_workbench.messages import ChatRequest, ChatResponse
 from agent_workbench.providers.anthropic import AnthropicProvider
 from agent_workbench.structured_outputs import JSONResponseFormat
+from agent_workbench.tools import ToolDefinition, ToolInvocation
 
 
 def test_complete_returns_concatenated_text_blocks() -> None:
@@ -31,7 +32,6 @@ def test_complete_returns_concatenated_text_blocks() -> None:
         return_value=SimpleNamespace(
             content=[
                 SimpleNamespace(type="text", text="Hello"),
-                SimpleNamespace(type="tool_use"),
                 SimpleNamespace(type="text", text=" world"),
             ]
         )
@@ -361,3 +361,175 @@ def test_response_format_is_translated_to_anthropic_output_config() -> None:
             }
         },
     )
+
+
+def test_tools_are_translated_to_anthropic_tools() -> None:
+    """Translate shared tool definitions into Anthropic tools."""
+
+    create = Mock(return_value=SimpleNamespace(content=[]))
+    client = SimpleNamespace(
+        messages=SimpleNamespace(create=create),
+    )
+    provider = AnthropicProvider(
+        model_name="claude-test",
+        client=client,
+        max_tokens=256,
+    )
+    calculator_schema = {
+        "type": "object",
+        "properties": {
+            "expression": {
+                "type": "string",
+            }
+        },
+        "required": [
+            "expression",
+        ],
+        "additionalProperties": False,
+    }
+    project_information_schema = {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": False,
+    }
+
+    request = ChatRequest(
+        messages=[
+            {
+                "role": "user",
+                "content": "Calculate two plus two and describe the project.",
+            }
+        ],
+        tools=(
+            ToolDefinition(
+                name="calculator",
+                description="Evaluate a mathematical expression.",
+                input_schema=calculator_schema,
+            ),
+            ToolDefinition(
+                name="project_information",
+                description="Return project information.",
+                input_schema=project_information_schema,
+            ),
+        ),
+    )
+
+    assert provider.complete(request) == ChatResponse()
+    create.assert_called_once_with(
+        model="claude-test",
+        max_tokens=256,
+        messages=request.messages,
+        tools=[
+            {
+                "name": "calculator",
+                "description": "Evaluate a mathematical expression.",
+                "input_schema": calculator_schema,
+            },
+            {
+                "name": "project_information",
+                "description": "Return project information.",
+                "input_schema": project_information_schema,
+            },
+        ],
+    )
+
+
+def test_tool_use_blocks_are_translated_to_tool_invocations() -> None:
+    """Translate Anthropic tool-use blocks into shared tool invocations."""
+
+    create = Mock(
+        return_value=SimpleNamespace(
+            content=[
+                SimpleNamespace(type="text", text="Calling the requested tools. "),
+                SimpleNamespace(
+                    type="tool_use",
+                    id="toolu_calculator",
+                    name="calculator",
+                    input={
+                        "expression": "2 + 2",
+                    },
+                ),
+                SimpleNamespace(type="text", text="Waiting for results."),
+                SimpleNamespace(
+                    type="tool_use",
+                    id="toolu_project_information",
+                    name="project_information",
+                    input={},
+                ),
+            ]
+        )
+    )
+    client = SimpleNamespace(
+        messages=SimpleNamespace(create=create),
+    )
+    provider = AnthropicProvider(
+        model_name="claude-test",
+        client=client,
+    )
+
+    result = provider.complete(
+        ChatRequest(
+            messages=[
+                {
+                    "role": "user",
+                    "content": "Calculate two plus two and describe the project.",
+                }
+            ]
+        )
+    )
+
+    assert result == ChatResponse(
+        text="Calling the requested tools. Waiting for results.",
+        tool_invocations=(
+            ToolInvocation(
+                id="toolu_calculator",
+                tool_name="calculator",
+                arguments={
+                    "expression": "2 + 2",
+                },
+            ),
+            ToolInvocation(
+                id="toolu_project_information",
+                tool_name="project_information",
+                arguments={},
+            ),
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "tool_use",
+    [
+        SimpleNamespace(
+            type="tool_use",
+            id="",
+            name="calculator",
+            input={},
+        ),
+        SimpleNamespace(
+            type="tool_use",
+            id="toolu_calculator",
+            name="calculator",
+            input=[],
+        ),
+    ],
+)
+def test_malformed_tool_use_blocks_raise_completion_error(
+    tool_use: SimpleNamespace,
+) -> None:
+    """Reject malformed Anthropic tool-use data as a provider response error."""
+
+    create = Mock(return_value=SimpleNamespace(content=[tool_use]))
+    client = SimpleNamespace(
+        messages=SimpleNamespace(create=create),
+    )
+    provider = AnthropicProvider(
+        model_name="claude-test",
+        client=client,
+    )
+
+    with pytest.raises(
+        CompletionError,
+        match="malformed tool invocation",
+    ):
+        provider.complete(ChatRequest(messages=[]))
