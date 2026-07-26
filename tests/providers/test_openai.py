@@ -17,6 +17,7 @@ from agent_workbench.generation import GenerationConfig
 from agent_workbench.messages import ChatRequest, ChatResponse, Message
 from agent_workbench.providers.openai import OpenAIProvider
 from agent_workbench.structured_outputs import JSONResponseFormat
+from agent_workbench.tools import ToolDefinition, ToolInvocation
 
 
 def create_fake_client(outcome: str | Exception) -> tuple[SimpleNamespace, Mock]:
@@ -27,7 +28,10 @@ def create_fake_client(outcome: str | Exception) -> tuple[SimpleNamespace, Mock]
     if isinstance(outcome, Exception):
         create_mock.side_effect = outcome
     else:
-        create_mock.return_value = SimpleNamespace(output_text=outcome)
+        create_mock.return_value = SimpleNamespace(
+            output_text=outcome,
+            output=[],
+        )
 
     client = SimpleNamespace(
         responses=SimpleNamespace(create=create_mock),
@@ -317,3 +321,173 @@ def test_response_format_is_translated_to_openai_text_config() -> None:
             }
         },
     )
+
+
+def test_tools_are_translated_to_openai_functions() -> None:
+    """Translate shared tool definitions into OpenAI functions."""
+
+    client, create_mock = create_fake_client("")
+    provider = OpenAIProvider(
+        model_name="test-model",
+        client=client,
+    )
+    calculator_schema = {
+        "type": "object",
+        "properties": {
+            "expression": {
+                "type": "string",
+            }
+        },
+        "required": [
+            "expression",
+        ],
+        "additionalProperties": False,
+    }
+    project_information_schema = {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": False,
+    }
+
+    request = ChatRequest(
+        messages=[
+            {
+                "role": "user",
+                "content": "Calculate two plus two and describe the project.",
+            }
+        ],
+        tools=(
+            ToolDefinition(
+                name="calculator",
+                description="Evaluate a mathematical expression.",
+                input_schema=calculator_schema,
+            ),
+            ToolDefinition(
+                name="project_information",
+                description="Return project information.",
+                input_schema=project_information_schema,
+            ),
+        ),
+    )
+
+    assert provider.complete(request) == ChatResponse()
+    create_mock.assert_called_once_with(
+        model="test-model",
+        input=request.messages,
+        tools=[
+            {
+                "type": "function",
+                "name": "calculator",
+                "description": "Evaluate a mathematical expression.",
+                "parameters": calculator_schema,
+                "strict": True,
+            },
+            {
+                "type": "function",
+                "name": "project_information",
+                "description": "Return project information.",
+                "parameters": project_information_schema,
+                "strict": True,
+            },
+        ],
+    )
+
+
+def test_function_calls_are_translated_to_tool_invocations() -> None:
+    """Translate OpenAI function calls into shared tool invocations."""
+
+    response = SimpleNamespace(
+        output_text="Calling the requested tools.",
+        output=[
+            SimpleNamespace(
+                type="function_call",
+                call_id="call_calculator",
+                name="calculator",
+                arguments='{"expression":"2 + 2"}',
+            ),
+            SimpleNamespace(
+                type="message",
+            ),
+            SimpleNamespace(
+                type="function_call",
+                call_id="call_project_information",
+                name="project_information",
+                arguments="{}",
+            ),
+        ],
+    )
+    create_mock = Mock(return_value=response)
+    client = SimpleNamespace(
+        responses=SimpleNamespace(create=create_mock),
+    )
+    provider = OpenAIProvider(
+        model_name="test-model",
+        client=client,
+    )
+
+    result = provider.complete(
+        ChatRequest(
+            messages=[
+                {
+                    "role": "user",
+                    "content": "Calculate two plus two and describe the project.",
+                }
+            ],
+        )
+    )
+
+    assert result == ChatResponse(
+        text="Calling the requested tools.",
+        tool_invocations=(
+            ToolInvocation(
+                id="call_calculator",
+                tool_name="calculator",
+                arguments={
+                    "expression": "2 + 2",
+                },
+            ),
+            ToolInvocation(
+                id="call_project_information",
+                tool_name="project_information",
+                arguments={},
+            ),
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        '{"expression":',
+        '["2 + 2"]',
+    ],
+)
+def test_malformed_function_arguments_raise_completion_error(
+    arguments: str,
+) -> None:
+    """Reject malformed OpenAI function arguments as provider response errors."""
+
+    response = SimpleNamespace(
+        output_text="",
+        output=[
+            SimpleNamespace(
+                type="function_call",
+                call_id="call_calculator",
+                name="calculator",
+                arguments=arguments,
+            )
+        ],
+    )
+    client = SimpleNamespace(
+        responses=SimpleNamespace(create=Mock(return_value=response)),
+    )
+    provider = OpenAIProvider(
+        model_name="test-model",
+        client=client,
+    )
+
+    with pytest.raises(
+        CompletionError,
+        match="malformed tool invocation",
+    ):
+        provider.complete(ChatRequest(messages=[]))

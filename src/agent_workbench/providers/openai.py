@@ -1,19 +1,32 @@
 """OpenAI provider implementation."""
 
+import json
 from dataclasses import dataclass
 from typing import Literal, NotRequired, Protocol, TypedDict, Unpack
+
 from openai import APIConnectionError, APIStatusError
 
 from agent_workbench.context import build_system_instructions
-from agent_workbench.errors import CompletionError
+from agent_workbench.errors import CompletionError, ConfigurationError
 from agent_workbench.messages import ChatRequest, ChatResponse, Message
 from agent_workbench.structured_outputs import JSONSchema
+from agent_workbench.tools import ToolInvocation
+
+
+class OpenAIResponseOutputItem(Protocol):
+    """Define an output item returned by the OpenAI Responses API."""
+
+    type: str
+    call_id: str
+    name: str
+    arguments: str
 
 
 class OpenAIResponse(Protocol):
     """Define the response data required from the OpenAI SDK."""
 
     output_text: str
+    output: list[OpenAIResponseOutputItem]
 
 
 class OpenAIJSONSchemaFormat(TypedDict):
@@ -31,6 +44,16 @@ class OpenAITextConfig(TypedDict):
     format: OpenAIJSONSchemaFormat
 
 
+class OpenAIFunctionToolDefinition(TypedDict):
+    """Represent a function tool supplied to OpenAI."""
+
+    type: Literal["function"]
+    name: str
+    description: str
+    parameters: JSONSchema
+    strict: bool
+
+
 class OpenAIResponseCreateArguments(TypedDict):
     """Represent arguments supplied to the OpenAI Responses API."""
 
@@ -41,6 +64,7 @@ class OpenAIResponseCreateArguments(TypedDict):
     top_p: NotRequired[float]
     max_output_tokens: NotRequired[int]
     text: NotRequired[OpenAITextConfig]
+    tools: NotRequired[list[OpenAIFunctionToolDefinition]]
 
 
 class OpenAIResponsesResource(Protocol):
@@ -119,6 +143,18 @@ class OpenAIProvider:
                 }
             }
 
+        if request.tools:
+            response_arguments["tools"] = [
+                {
+                    "type": "function",
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.input_schema,
+                    "strict": True,
+                }
+                for tool in request.tools
+            ]
+
         try:
             response = self.client.responses.create(
                 **response_arguments,
@@ -148,6 +184,36 @@ class OpenAIProvider:
                 f"OpenAI request failed with status code {exc.status_code}."
             ) from exc
 
+        tool_invocations: list[ToolInvocation] = []
+
+        for output_item in response.output:
+            if output_item.type != "function_call":
+                continue
+
+            try:
+                arguments = json.loads(output_item.arguments)
+            except (json.JSONDecodeError, TypeError) as exc:
+                raise CompletionError(
+                    "OpenAI returned a malformed tool invocation."
+                ) from exc
+
+            if not isinstance(arguments, dict):
+                raise CompletionError("OpenAI returned a malformed tool invocation.")
+
+            try:
+                tool_invocation = ToolInvocation(
+                    id=output_item.call_id,
+                    tool_name=output_item.name,
+                    arguments=arguments,
+                )
+            except ConfigurationError as exc:
+                raise CompletionError(
+                    "OpenAI returned a malformed tool invocation."
+                ) from exc
+
+            tool_invocations.append(tool_invocation)
+
         return ChatResponse(
             text=response.output_text or "",
+            tool_invocations=tuple(tool_invocations),
         )
