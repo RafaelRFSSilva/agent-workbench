@@ -27,12 +27,13 @@ Implemented capabilities:
 - Provider-independent generation settings.
 - Prompt-based interactive setup.
 - Provider-independent structured outputs.
-- Provider-independent tool calling with opt-in built-in tools.
+- Provider-independent tool calling with opt-in calculator and read-only
+  workspace tools.
 - Automated tests, Ruff checks, and GitHub Actions.
 
-Filesystem and network tools, project-wide access, RAG, MCP, asynchronous
-execution, user-defined tools, multiple simultaneous agents, and the VS Code
-interface are planned but not yet implemented.
+Write-capable filesystem and network tools, RAG, MCP, asynchronous execution,
+user-defined tools, multiple simultaneous agents, and the VS Code interface
+are planned but not yet implemented.
 
 ## Product Direction
 
@@ -365,6 +366,37 @@ Tool calling is synchronous. A model may request tools during one CLI user
 turn; the CLI displays and retains only the final assistant text. Internal tool
 rounds are not persisted across separate user turns.
 
+### Read-Only Workspace Tools
+
+Authorize one workspace explicitly with `--workspace` to expose `list_files`
+and `read_file`; no workspace tools are available without it:
+
+```bash
+uv run agent-workbench \
+  --provider ollama \
+  --model gpt-oss:20b \
+  --workspace .
+```
+
+Combine it with `--enable-tools` to expose all tools in deterministic order:
+`calculator`, `list_files`, then `read_file`.
+
+```bash
+uv run agent-workbench \
+  --provider ollama \
+  --model gpt-oss:20b \
+  --enable-tools \
+  --workspace .
+```
+
+The workspace root and every requested path are resolved canonically. Absolute
+paths, traversal, prefix-confusion paths, and symlinks escaping the root are
+rejected; symlinks that resolve within the root remain available. `list_files`
+returns sorted direct children, including hidden entries, with a 128-entry
+limit. `read_file` returns UTF-8 files up to 100 KiB using canonical relative
+paths. These tools are read-only: they do not edit, delete, search recursively,
+glob, access the network, or use MCP.
+
 See [Architecture](docs/architecture.md) for the shared tool models and
 provider translations.
 
@@ -407,11 +439,11 @@ Completed foundations:
 - [x] Generation configuration.
 - [x] Prompt-based setup.
 - [x] Structured outputs.
-- [x] Provider-independent tool calling and opt-in calculator.
+- [x] Provider-independent tool calling, calculator, and safe read-only
+  workspace tools.
 
 Next milestones:
 
-- [ ] Safe workspace tools.
 - [ ] Agent sessions.
 - [ ] Local project retrieval and RAG.
 - [ ] Multi-agent orchestration.
