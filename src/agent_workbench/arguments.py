@@ -45,6 +45,7 @@ class CLIArguments:
     max_output_tokens: int | None = None
     response_format_file: Path | None = None
     enable_tools: bool = False
+    workspace_root: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,6 +60,7 @@ class RuntimeConfiguration:
     generation_config: GenerationConfig = field(default_factory=GenerationConfig)
     response_format: JSONResponseFormat | None = None
     enable_tools: bool = False
+    workspace_root: Path | None = None
 
 
 def _non_empty_model_name(value: str) -> str:
@@ -112,6 +114,17 @@ def _response_format_file_path(value: str) -> Path:
 
     if not normalized_path:
         raise ArgumentTypeError("response format file path must not be blank")
+
+    return Path(normalized_path).expanduser()
+
+
+def _workspace_path(value: str) -> Path:
+    """Return a normalized workspace root path."""
+
+    normalized_path = value.strip()
+
+    if not normalized_path:
+        raise ArgumentTypeError("workspace path must not be blank")
 
     return Path(normalized_path).expanduser()
 
@@ -253,6 +266,12 @@ def parse_cli_arguments(
         help="Enable the available built-in tools.",
     )
 
+    parser.add_argument(
+        "--workspace",
+        type=_workspace_path,
+        help="Authorized workspace root for read-only tools.",
+    )
+
     parsed_arguments = parser.parse_args(argv)
 
     setup_conflicts = (
@@ -267,6 +286,7 @@ def parse_cli_arguments(
         or parsed_arguments.max_output_tokens is not None
         or parsed_arguments.response_format_file is not None
         or parsed_arguments.enable_tools
+        or parsed_arguments.workspace is not None
     )
 
     if parsed_arguments.setup and setup_conflicts:
@@ -291,6 +311,7 @@ def parse_cli_arguments(
         max_output_tokens=parsed_arguments.max_output_tokens,
         response_format_file=parsed_arguments.response_format_file,
         enable_tools=parsed_arguments.enable_tools,
+        workspace_root=parsed_arguments.workspace,
     )
 
 
@@ -354,4 +375,5 @@ def resolve_runtime_configuration(
         generation_config=generation_config,
         response_format=response_format,
         enable_tools=arguments.enable_tools,
+        workspace_root=arguments.workspace_root,
     )

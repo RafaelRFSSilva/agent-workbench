@@ -14,6 +14,8 @@ from agent_workbench.generation import GenerationConfig
 from agent_workbench.structured_outputs import JSONResponseFormat
 from agent_workbench.tool_registry import ToolRegistry
 from agent_workbench.tools import ToolDefinition, ToolInvocation
+from agent_workbench.workspace import Workspace
+from agent_workbench.workspace_tools import register_workspace_tools
 
 
 class FakeProvider:
@@ -746,6 +748,61 @@ def test_cli_executes_the_built_in_calculator_and_displays_final_text(
     assert "Assistant: The answer is 4." in captured.out
 
 
+def test_cli_executes_workspace_list_and_read_tools(
+    monkeypatch,
+    tmp_path,
+    capsys,
+) -> None:
+    """Complete a list-and-read workspace flow through the CLI loop."""
+
+    (tmp_path / "README.md").write_text("WORKSPACE-731", encoding="utf-8")
+    registry = ToolRegistry()
+    register_workspace_tools(registry, Workspace(tmp_path))
+    provider = FakeProvider(
+        [
+            create_tool_response(
+                ToolInvocation(
+                    id="list-call",
+                    tool_name="list_files",
+                    arguments={"path": "."},
+                )
+            ),
+            create_tool_response(
+                ToolInvocation(
+                    id="read-call",
+                    tool_name="read_file",
+                    arguments={"path": "README.md"},
+                )
+            ),
+            "The code word is WORKSPACE-731.",
+        ]
+    )
+    user_inputs = iter(["Inspect the workspace.", "/exit"])
+
+    monkeypatch.setattr("builtins.input", lambda _: next(user_inputs))
+
+    run_cli(provider, tool_registry=registry, max_tool_rounds=2)
+
+    captured = capsys.readouterr()
+
+    assert provider.requests[1].tool_interactions[0].results[0].output == {
+        "path": ".",
+        "entries": [
+            {
+                "name": "README.md",
+                "path": "README.md",
+                "type": "file",
+            }
+        ],
+    }
+    assert provider.requests[2].tool_interactions[1].results[0].output == {
+        "path": "README.md",
+        "content": "WORKSPACE-731",
+        "size_bytes": 13,
+    }
+    assert "Assistant: The code word is WORKSPACE-731." in captured.out
+
+
 def test_main_does_not_inject_tools_by_default(monkeypatch) -> None:
     """Leave the CLI untooled unless enablement is explicit."""
 
@@ -811,7 +868,114 @@ def test_main_injects_the_built_in_registry_when_tools_are_enabled(
     _, keyword_arguments = run_cli_mock.call_args
     registry = keyword_arguments["tool_registry"]
 
-    assert registry.definitions[0].name == "calculator"
+    assert [definition.name for definition in registry.definitions] == ["calculator"]
+
+
+def test_main_injects_workspace_tools_when_workspace_is_enabled(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """Pass only workspace tools to the CLI when a workspace is supplied."""
+
+    configuration = RuntimeConfiguration(
+        provider_name="ollama",
+        model_name="test-model",
+        workspace_root=tmp_path,
+    )
+    provider = FakeProvider()
+    run_cli_mock = Mock()
+
+    monkeypatch.setattr("agent_workbench.cli.load_environment", Mock())
+    monkeypatch.setattr(
+        "agent_workbench.cli.resolve_runtime_configuration",
+        Mock(return_value=configuration),
+    )
+    monkeypatch.setattr(
+        "agent_workbench.cli.create_provider",
+        Mock(return_value=provider),
+    )
+    monkeypatch.setattr("agent_workbench.cli.run_cli", run_cli_mock)
+
+    main(["--workspace", str(tmp_path)])
+
+    _, keyword_arguments = run_cli_mock.call_args
+    registry = keyword_arguments["tool_registry"]
+
+    assert [definition.name for definition in registry.definitions] == [
+        "list_files",
+        "read_file",
+    ]
+
+
+def test_main_combines_calculator_and_workspace_tools_in_order(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """Register all enabled tools in their documented deterministic order."""
+
+    configuration = RuntimeConfiguration(
+        provider_name="ollama",
+        model_name="test-model",
+        enable_tools=True,
+        workspace_root=tmp_path,
+    )
+    provider = FakeProvider()
+    run_cli_mock = Mock()
+
+    monkeypatch.setattr("agent_workbench.cli.load_environment", Mock())
+    monkeypatch.setattr(
+        "agent_workbench.cli.resolve_runtime_configuration",
+        Mock(return_value=configuration),
+    )
+    monkeypatch.setattr(
+        "agent_workbench.cli.create_provider",
+        Mock(return_value=provider),
+    )
+    monkeypatch.setattr("agent_workbench.cli.run_cli", run_cli_mock)
+
+    main(["--enable-tools", "--workspace", str(tmp_path)])
+
+    _, keyword_arguments = run_cli_mock.call_args
+    registry = keyword_arguments["tool_registry"]
+
+    assert [definition.name for definition in registry.definitions] == [
+        "calculator",
+        "list_files",
+        "read_file",
+    ]
+
+
+def test_main_reports_invalid_workspace_configuration(
+    monkeypatch,
+    tmp_path,
+    capsys,
+) -> None:
+    """Use normal configuration-error handling for invalid workspace roots."""
+
+    configuration = RuntimeConfiguration(
+        provider_name="ollama",
+        model_name="test-model",
+        workspace_root=tmp_path / "missing",
+    )
+    run_cli_mock = Mock()
+
+    monkeypatch.setattr("agent_workbench.cli.load_environment", Mock())
+    monkeypatch.setattr(
+        "agent_workbench.cli.resolve_runtime_configuration",
+        Mock(return_value=configuration),
+    )
+    monkeypatch.setattr(
+        "agent_workbench.cli.create_provider",
+        Mock(return_value=FakeProvider()),
+    )
+    monkeypatch.setattr("agent_workbench.cli.run_cli", run_cli_mock)
+
+    main(["--workspace", str(tmp_path / "missing")])
+
+    assert (
+        "Configuration error: Workspace root does not exist:" in capsys.readouterr().out
+    )
+    run_cli_mock.assert_not_called()
 
 
 def test_main_uses_interactive_runtime_setup(

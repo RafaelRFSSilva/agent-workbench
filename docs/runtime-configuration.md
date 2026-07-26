@@ -14,6 +14,7 @@ A configured session currently contains:
 - Zero or more context documents.
 - Optional generation settings.
 - An optional structured response format.
+- An optional authorized workspace root.
 
 The same runtime configuration model is used by:
 
@@ -37,7 +38,9 @@ RuntimeConfiguration
 ├── agent_profile
 ├── context_documents
 ├── generation_config
-└── response_format
+├── response_format
+├── enable_tools
+└── workspace_root
 ```
 
 This is the final application configuration used before provider construction.
@@ -638,6 +641,8 @@ points.
 | `--top-p` | Configure portable top-p |
 | `--max-output-tokens` | Configure the output-token limit |
 | `--response-format-file` | Load a JSON response format |
+| `--enable-tools` | Enable the built-in calculator |
+| `--workspace PATH` | Authorize read-only tools for one workspace root |
 | `--setup` | Start prompt-based interactive setup |
 
 Display the current CLI help:
@@ -713,11 +718,15 @@ Runtime configuration follows these security principles:
 - Existing environment variables are not overwritten.
 - Context files are validated before provider construction.
 - Response format files are validated before provider construction.
+- Workspace roots are validated before tool registration and provider use.
 - Unsupported argument combinations are rejected.
 - Automated tests use simulated provider clients.
 - Project files are not modified by runtime configuration.
 
-Future workspace tools will require a separate permission model.
+The `--workspace` option grants only the current read-only `list_files` and
+`read_file` tools. It does not grant write, delete, command, network, MCP, or
+recursive-search access. The prompt-based setup keeps its default workspace
+root of `None`; use direct CLI configuration to authorize a workspace.
 
 ## Current Limitations
 
@@ -733,6 +742,8 @@ The application does not persist:
 - Per-project configuration.
 - Tool permissions.
 - MCP configuration.
+
+Internal tool rounds are also not persisted across separate CLI user turns.
 
 The current prompt-based setup does not support:
 

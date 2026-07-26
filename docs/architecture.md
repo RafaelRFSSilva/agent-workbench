@@ -804,9 +804,11 @@ Provider adapters retain native protocol details:
 * Anthropic translates Messages API tools, assistant `tool_use` blocks, and
   user `tool_result` blocks.
 
-The CLI keeps tools opt-in through `--enable-tools`. Its current built-in
-registry contains a safe synchronous calculator; no tool registry is created
-when the flag is absent. Internal tool rounds remain inside a single loop and
+The CLI keeps tools opt-in. `--enable-tools` registers the safe synchronous
+calculator, while `--workspace PATH` authorizes the read-only `list_files` and
+`read_file` tools for one root. With both options, one registry is built in
+this order: `calculator`, `list_files`, `read_file`. Without either option, no
+tool registry is created. Internal tool rounds remain inside a single loop and
 are not persisted in normal CLI history across later user turns.
 
 This separation keeps provider adapters declarative and prevents them from
@@ -814,7 +816,11 @@ directly executing application capabilities.
 
 ## Workspace Boundary
 
-Future workspace access should be explicit.
+Workspace access is explicit through `Workspace(root)`, a frozen slotted model
+that stores a canonical existing directory. It resolves requested paths
+strictly before containment checks, rejecting absolute paths, traversal,
+prefix-confusion, and symlink escapes. Symlinks resolving inside the root are
+permitted.
 
 ```text
 Workspace
@@ -825,7 +831,14 @@ Workspace
 └── available tools
 ```
 
-Agents should not receive unrestricted access automatically.
+`list_files` returns deterministic sorted direct children, including hidden
+entries, and caps a directory at 128 entries. `read_file` accepts strict UTF-8
+only and caps content at 100 KiB. Both report canonical relative paths. They
+are read-only and do not provide recursive search, globbing, network, MCP,
+write, deletion, or execution capabilities.
+
+Agents should not receive unrestricted access automatically. Filesystem race
+protection between resolution and later access is not yet guaranteed.
 
 Read access, write access, command execution, network access, and Git
 operations should be represented separately.

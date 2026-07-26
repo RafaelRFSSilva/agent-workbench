@@ -524,6 +524,17 @@ def test_tools_are_disabled_by_default() -> None:
     arguments = parse_cli_arguments([])
 
     assert arguments.enable_tools is False
+    assert arguments.workspace_root is None
+
+
+def test_parse_cli_arguments_accepts_workspace_paths() -> None:
+    """Preserve relative and absolute workspace paths for runtime validation."""
+
+    relative_arguments = parse_cli_arguments(["--workspace", "project"])
+    absolute_arguments = parse_cli_arguments(["--workspace", "/tmp/project"])
+
+    assert relative_arguments.workspace_root == Path("project")
+    assert absolute_arguments.workspace_root == Path("/tmp/project")
 
 
 def test_parse_cli_arguments_enables_built_in_tools() -> None:
@@ -546,6 +557,21 @@ def test_runtime_configuration_preserves_tool_enablement() -> None:
     )
 
     assert configuration.enable_tools is True
+
+
+def test_runtime_configuration_preserves_workspace_root() -> None:
+    """Carry the optional workspace root into runtime configuration."""
+
+    workspace_root = Path("project")
+    configuration = resolve_runtime_configuration(
+        CLIArguments(
+            provider_name="ollama",
+            model_name="gpt-oss:20b",
+            workspace_root=workspace_root,
+        )
+    )
+
+    assert configuration.workspace_root == workspace_root
 
 
 def test_runtime_configuration_disables_tools_by_default() -> None:
@@ -588,6 +614,10 @@ def test_runtime_configuration_disables_tools_by_default() -> None:
         ],
         [
             "--enable-tools",
+        ],
+        [
+            "--workspace",
+            "project",
         ],
     ],
 )

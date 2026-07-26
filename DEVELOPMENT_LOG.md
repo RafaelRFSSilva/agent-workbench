@@ -1,5 +1,42 @@
 # Development Log
 
+## 2026-07-27 — Safe Read-Only Workspace Tools
+
+### Implemented
+
+- Added a canonical `Workspace` root with strict containment checks.
+- Added provider-independent `list_files` and `read_file` tools.
+- Added explicit CLI authorization through `--workspace PATH`.
+- Kept calculator-only enablement under `--enable-tools`; combined registries
+  are ordered `calculator`, `list_files`, `read_file`.
+
+### Security Decisions
+
+- Reject absolute paths, traversal, prefix-confusion paths, and symlinks that
+  resolve outside the canonical workspace root.
+- Permit symlinks that resolve inside the root.
+- Limit listings to 128 sorted direct entries, including hidden entries.
+- Limit reads to strict UTF-8 files of at most 100 KiB and return canonical
+  relative paths.
+- Keep tools read-only; no write, deletion, recursive search, globbing,
+  network, MCP, or command execution capability was added.
+
+### Validation
+
+- Ran a real localhost Ollama smoke test against installed `gpt-oss:20b`.
+- The model invoked `list_files` for `.` and `read_file` for `README.md`.
+- The final response contained `WORKSPACE-731`.
+- A direct `../outside.txt` registry invocation returned an error ToolResult
+  without exposing outside content.
+- The complete automated suite passed with 372 tests before documentation.
+
+### Current Limitations
+
+- Tool execution is synchronous and internal tool rounds do not persist across
+  separate CLI user turns.
+- Filesystem race protection between path resolution and later access is not
+  yet guaranteed.
+
 This document records the incremental development of Agent Workbench,
 including architecture decisions, implementation milestones, validation,
 and known limitations.

@@ -7,3 +7,7 @@ class CompletionError(RuntimeError):
 
 class ConfigurationError(RuntimeError):
     """Represent an invalid application configuration."""
+
+
+class WorkspacePathError(RuntimeError):
+    """Represent an unsafe or invalid requested workspace path."""

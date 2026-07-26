@@ -15,12 +15,13 @@ Agent Workbench currently supports:
 * Portable generation configuration.
 * Portable structured outputs.
 * Prompt-based interactive runtime setup.
-* Opt-in provider-independent tool calling.
+* Opt-in provider-independent tool calling, including safe read-only workspace
+  inspection.
 
 The current application runs as a command-line interface.
 
-Multi-agent orchestration, workspace tools, MCP integration, project retrieval,
-and the VS Code interface are future milestones.
+Multi-agent orchestration, workspace writes, MCP integration, project
+retrieval, and the VS Code interface are future milestones.
 
 ## Requirements
 
@@ -500,8 +501,43 @@ Tool execution is synchronous. During a tool-enabled CLI turn, the application
 executes requested tools and displays only the final assistant text. The
 internal tool rounds are not persisted across separate user turns.
 
-Filesystem, network, MCP, asynchronous, and user-defined tools are not
-included yet.
+## Inspect an Authorized Workspace
+
+Workspace tools are disabled unless you explicitly authorize one root with
+`--workspace`:
+
+```bash
+uv run agent-workbench \
+  --provider ollama \
+  --model gpt-oss:20b \
+  --workspace .
+```
+
+This exposes `list_files` and `read_file`. `list_files` returns sorted direct
+children only, including hidden entries, with file, directory, symlink, and
+other classifications; it refuses directories with more than 128 entries.
+`read_file` reads strict UTF-8 text up to 100 KiB and returns its canonical
+workspace-relative path.
+
+The workspace root and requested paths are resolved canonically. Absolute
+paths, traversal, prefix-confusion paths, and symlinks escaping the root are
+rejected. Internal symlinks remain available. The tools do not write, edit,
+delete, recurse, glob, access the network, or use MCP.
+
+Combine workspace inspection with the calculator:
+
+```bash
+uv run agent-workbench \
+  --provider ollama \
+  --model gpt-oss:20b \
+  --enable-tools \
+  --workspace .
+```
+
+The combined registry is deterministic: `calculator`, `list_files`, then
+`read_file`. Tool execution remains synchronous, and internal tool rounds are
+not persisted across separate CLI user turns. Filesystem race protection
+between path resolution and later access is not yet guaranteed.
 
 ## Configuration Precedence
 

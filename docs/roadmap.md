@@ -23,14 +23,15 @@ Agent Workbench currently provides:
 - Portable generation configuration.
 - Prompt-based interactive setup.
 - Provider-independent structured outputs.
-- Provider-independent tool calling with an opt-in calculator.
+- Provider-independent tool calling with an opt-in calculator and safe
+  read-only workspace tools.
 - Automated tests, Ruff checks, and GitHub Actions.
 
 The current application manages one conversation at a time.
 
-It does not yet provide filesystem or network tools, project-wide workspace
-access, RAG, asynchronous execution, user-defined tools, multiple simultaneous
-agents, MCP integration, or a VS Code interface.
+It does not yet provide write-capable filesystem or network tools, RAG,
+asynchronous execution, user-defined tools, multiple simultaneous agents, MCP
+integration, or a VS Code interface.
 
 ## Development Direction
 
@@ -135,6 +136,11 @@ completed milestone.
 
 ## Phase 3 — Workspace Tools
 
+### Status
+
+Read-only workspace inspection is completed. Write, execution, search, and
+Git inspection remain future work.
+
 ### Objective
 
 Allow authorised agents to inspect project files when needed instead of
@@ -142,10 +148,15 @@ requiring every file to be attached manually.
 
 ### Read-Only Tools
 
-- [ ] Define a workspace-root abstraction.
-- [ ] Add path containment and symlink protection.
-- [ ] Add `list_files`.
-- [ ] Add `read_file`.
+- [x] Define a canonical workspace-root abstraction.
+- [x] Add absolute-path, containment, traversal, prefix-confusion, and symlink
+  escape protection.
+- [x] Add direct-child `list_files` with deterministic sorting, hidden-entry
+  visibility, classifications, and a 128-entry limit.
+- [x] Add strict UTF-8 `read_file` with canonical relative paths and a 100 KiB
+  limit.
+- [x] Authorize workspace tools explicitly with `--workspace PATH`; preserve
+  deterministic combined order with `--enable-tools`.
 - [ ] Add `search_text`.
 - [ ] Add `search_symbols`.
 - [ ] Add `inspect_git_status`.
@@ -478,8 +489,8 @@ Local-only operation remains a core requirement.
 Security must be implemented throughout the roadmap.
 
 - [ ] Secret isolation.
-- [ ] Workspace path containment.
-- [ ] Symlink escape protection.
+- [x] Workspace path containment.
+- [x] Symlink escape protection.
 - [ ] Tool permissions.
 - [ ] Command confirmation.
 - [ ] Destructive-action protection.
@@ -504,20 +515,19 @@ Security must be implemented throughout the roadmap.
 
 The next implementation milestone is:
 
-> Safe read-only workspace tools.
+> Agent sessions.
 
-The completed provider-independent tool-calling loop provides the execution
-boundary; the next phase must add explicit workspace scope, permissions, path
-containment, and visible activity before exposing project files.
+The completed workspace boundary provides explicit canonical read-only access.
+The next phase should introduce reusable session state and broader permissions
+without weakening that boundary.
 
 ## Near-Term Sequence
 
-1. Add read-only workspace tools.
-2. Introduce agent sessions.
-3. Build local project retrieval.
-4. Add initial multi-agent orchestration.
-5. Add project configuration and MCP.
-6. Build the terminal and VS Code experiences.
+1. Introduce agent sessions.
+2. Build local project retrieval.
+3. Add initial multi-agent orchestration.
+4. Add project configuration and MCP.
+5. Build the terminal and VS Code experiences.
 
 ## Related Documentation
 
