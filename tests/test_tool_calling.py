@@ -151,6 +151,44 @@ def test_executes_one_tool_round_and_returns_final_response() -> None:
     )
 
 
+def test_reports_completed_rounds_to_an_optional_observer() -> None:
+    """Expose completed provider-independent rounds without changing requests."""
+
+    calculator = create_calculator_definition()
+    registry = ToolRegistry()
+    registry.register(calculator, lambda arguments: {"value": 4})
+    requested_response = create_tool_response(
+        ToolInvocation(
+            id="call-1",
+            tool_name="calculator",
+            arguments={"expression": "2 + 2"},
+        )
+    )
+    observed_rounds: list[ToolInteractionRound] = []
+    provider = FakeProvider([requested_response, ChatResponse(text="4")])
+
+    run_tool_calling_loop(
+        provider,
+        ChatRequest(messages=[]),
+        registry,
+        max_tool_rounds=1,
+        tool_round_observer=observed_rounds.append,
+    )
+
+    assert observed_rounds == [
+        ToolInteractionRound(
+            response=requested_response,
+            results=(
+                ToolResult(
+                    invocation_id="call-1",
+                    status="success",
+                    output={"value": 4},
+                ),
+            ),
+        )
+    ]
+
+
 def test_executes_multiple_invocations_in_provider_order() -> None:
     """Execute every requested invocation in the provider response order."""
 

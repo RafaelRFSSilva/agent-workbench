@@ -538,6 +538,105 @@ def test_cli_executes_one_tool_and_displays_only_the_final_response(
     assert "ToolResult" not in captured.out
 
 
+def test_cli_displays_opt_in_compact_tool_traces_before_final_response(
+    monkeypatch,
+    capsys,
+) -> None:
+    """Display ordered JSON-safe traces only when explicitly enabled."""
+
+    calculator = create_calculator_definition()
+    registry = ToolRegistry()
+    registry.register(calculator, lambda arguments: {"value": 4})
+    provider = FakeProvider(
+        [
+            create_tool_response(
+                ToolInvocation(
+                    id="call-1",
+                    tool_name="calculator",
+                    arguments={"expression": "2 + 2"},
+                )
+            ),
+            "The answer is 4.",
+        ]
+    )
+    user_inputs = iter(["Calculate.", "/exit"])
+
+    monkeypatch.setattr("builtins.input", lambda _: next(user_inputs))
+
+    run_cli(
+        provider,
+        tool_registry=registry,
+        max_tool_rounds=1,
+        show_tool_traces=True,
+    )
+
+    captured = capsys.readouterr()
+
+    assert "Tool trace: calculator (call-1)" in captured.out
+    assert 'arguments={"expression":"2 + 2"}' in captured.out
+    assert 'result={"output":{"value":4},"status":"success"}' in captured.out
+    assert captured.out.index("Tool trace:") < captured.out.index(
+        "Assistant: The answer is 4."
+    )
+    assert "ToolInvocation(" not in captured.out
+    assert "ToolResult(" not in captured.out
+
+
+def test_cli_traces_multiple_rounds_and_keeps_trace_text_out_of_history(
+    monkeypatch,
+    capsys,
+) -> None:
+    """Trace ordered successes and errors without changing message history."""
+
+    calculator = create_calculator_definition()
+    registry = ToolRegistry()
+    registry.register(calculator, lambda arguments: {"value": 4})
+    provider = FakeProvider(
+        [
+            create_tool_response(
+                ToolInvocation(
+                    id="call-1",
+                    tool_name="calculator",
+                    arguments={"expression": "2 + 2"},
+                )
+            ),
+            create_tool_response(
+                ToolInvocation(
+                    id="call-2",
+                    tool_name="unknown",
+                    arguments={"path": "/host/.env"},
+                )
+            ),
+            "Completed.",
+            "Acknowledged.",
+        ]
+    )
+    user_inputs = iter(["Use tools.", "Continue.", "/exit"])
+
+    monkeypatch.setattr("builtins.input", lambda _: next(user_inputs))
+
+    run_cli(
+        provider,
+        tool_registry=registry,
+        max_tool_rounds=2,
+        show_tool_traces=True,
+    )
+
+    captured = capsys.readouterr()
+
+    assert captured.out.index("Tool trace: calculator (call-1)") < captured.out.index(
+        "Tool trace: unknown (call-2)"
+    )
+    assert 'result={"error":"Unknown tool \'unknown\'.","status":"error"}' in (
+        captured.out
+    )
+    assert "[redacted absolute path]" in captured.out
+    assert "/host/.env" not in captured.out
+    assert "ToolInvocation(" not in captured.out
+    assert "ToolResult(" not in captured.out
+    assert "Tool trace:" not in str(provider.calls[3])
+
+
 def test_cli_executes_multiple_invocations_in_provider_order(
     monkeypatch,
 ) -> None:
@@ -905,6 +1004,8 @@ def test_main_injects_workspace_tools_when_workspace_is_enabled(
         "list_files",
         "read_file",
         "search_text",
+        "inspect_git_status",
+        "inspect_git_diff",
     ]
 
 
@@ -944,7 +1045,36 @@ def test_main_combines_calculator_and_workspace_tools_in_order(
         "list_files",
         "read_file",
         "search_text",
+        "inspect_git_status",
+        "inspect_git_diff",
     ]
+
+
+def test_main_forwards_opt_in_tool_trace_configuration(monkeypatch) -> None:
+    """Forward trace enablement only for a configured tool registry."""
+
+    configuration = RuntimeConfiguration(
+        provider_name="ollama",
+        model_name="test-model",
+        enable_tools=True,
+        show_tool_traces=True,
+    )
+    run_cli_mock = Mock()
+
+    monkeypatch.setattr("agent_workbench.cli.load_environment", Mock())
+    monkeypatch.setattr(
+        "agent_workbench.cli.resolve_runtime_configuration",
+        Mock(return_value=configuration),
+    )
+    monkeypatch.setattr(
+        "agent_workbench.cli.create_provider",
+        Mock(return_value=FakeProvider()),
+    )
+    monkeypatch.setattr("agent_workbench.cli.run_cli", run_cli_mock)
+
+    main(["--enable-tools", "--show-tool-traces"])
+
+    assert run_cli_mock.call_args.kwargs["show_tool_traces"] is True
 
 
 def test_main_reports_invalid_workspace_configuration(
