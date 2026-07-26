@@ -3,6 +3,7 @@
 from pathlib import Path
 from unittest.mock import Mock
 
+from agent_workbench.built_in_tools import create_built_in_tool_registry
 from agent_workbench.cli import main, run_cli
 from agent_workbench.arguments import RuntimeConfiguration
 from agent_workbench.context import ContextDocument
@@ -706,6 +707,111 @@ def test_cli_history_contains_only_user_and_final_assistant_messages(
             "content": "Continue.",
         },
     ]
+
+
+def test_cli_executes_the_built_in_calculator_and_displays_final_text(
+    monkeypatch,
+    capsys,
+) -> None:
+    """Complete a CLI tool-calling flow through the built-in registry."""
+
+    provider = FakeProvider(
+        [
+            create_tool_response(
+                ToolInvocation(
+                    id="calculator-call",
+                    tool_name="calculator",
+                    arguments={"expression": "2 + 2"},
+                )
+            ),
+            "The answer is 4.",
+        ]
+    )
+    user_inputs = iter(["Calculate two plus two.", "/exit"])
+
+    monkeypatch.setattr("builtins.input", lambda _: next(user_inputs))
+
+    run_cli(
+        provider,
+        tool_registry=create_built_in_tool_registry(),
+        max_tool_rounds=1,
+    )
+
+    captured = capsys.readouterr()
+
+    assert provider.requests[1].tool_interactions[0].results[0].output == {
+        "expression": "2 + 2",
+        "result": 4,
+    }
+    assert "Assistant: The answer is 4." in captured.out
+
+
+def test_main_does_not_inject_tools_by_default(monkeypatch) -> None:
+    """Leave the CLI untooled unless enablement is explicit."""
+
+    configuration = RuntimeConfiguration(
+        provider_name="ollama",
+        model_name="test-model",
+    )
+    provider = FakeProvider()
+    resolve_mock = Mock(return_value=configuration)
+    create_provider_mock = Mock(return_value=provider)
+    run_cli_mock = Mock()
+
+    monkeypatch.setattr("agent_workbench.cli.load_environment", Mock())
+    monkeypatch.setattr(
+        "agent_workbench.cli.resolve_runtime_configuration",
+        resolve_mock,
+    )
+    monkeypatch.setattr(
+        "agent_workbench.cli.create_provider",
+        create_provider_mock,
+    )
+    monkeypatch.setattr("agent_workbench.cli.run_cli", run_cli_mock)
+
+    main([])
+
+    run_cli_mock.assert_called_once_with(
+        provider,
+        system_prompt=None,
+        agent_profile=None,
+        context_documents=(),
+        generation_config=GenerationConfig(),
+        response_format=None,
+    )
+
+
+def test_main_injects_the_built_in_registry_when_tools_are_enabled(
+    monkeypatch,
+) -> None:
+    """Pass the built-in registry to the CLI for an enabled configuration."""
+
+    configuration = RuntimeConfiguration(
+        provider_name="ollama",
+        model_name="test-model",
+        enable_tools=True,
+    )
+    provider = FakeProvider()
+    run_cli_mock = Mock()
+
+    monkeypatch.setattr("agent_workbench.cli.load_environment", Mock())
+    monkeypatch.setattr(
+        "agent_workbench.cli.resolve_runtime_configuration",
+        Mock(return_value=configuration),
+    )
+    monkeypatch.setattr(
+        "agent_workbench.cli.create_provider",
+        Mock(return_value=provider),
+    )
+    monkeypatch.setattr("agent_workbench.cli.run_cli", run_cli_mock)
+
+    main(["--enable-tools"])
+
+    run_cli_mock.assert_called_once()
+    _, keyword_arguments = run_cli_mock.call_args
+    registry = keyword_arguments["tool_registry"]
+
+    assert registry.definitions[0].name == "calculator"
 
 
 def test_main_uses_interactive_runtime_setup(

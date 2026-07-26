@@ -44,6 +44,7 @@ class CLIArguments:
     top_p: float | None = None
     max_output_tokens: int | None = None
     response_format_file: Path | None = None
+    enable_tools: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +58,7 @@ class RuntimeConfiguration:
     context_documents: tuple[ContextDocument, ...] = ()
     generation_config: GenerationConfig = field(default_factory=GenerationConfig)
     response_format: JSONResponseFormat | None = None
+    enable_tools: bool = False
 
 
 def _non_empty_model_name(value: str) -> str:
@@ -245,6 +247,12 @@ def parse_cli_arguments(
         help="Maximum number of tokens generated in each response.",
     )
 
+    parser.add_argument(
+        "--enable-tools",
+        action="store_true",
+        help="Enable the available built-in tools.",
+    )
+
     parsed_arguments = parser.parse_args(argv)
 
     setup_conflicts = (
@@ -258,6 +266,7 @@ def parse_cli_arguments(
         or parsed_arguments.top_p is not None
         or parsed_arguments.max_output_tokens is not None
         or parsed_arguments.response_format_file is not None
+        or parsed_arguments.enable_tools
     )
 
     if parsed_arguments.setup and setup_conflicts:
@@ -281,6 +290,7 @@ def parse_cli_arguments(
         top_p=parsed_arguments.top_p,
         max_output_tokens=parsed_arguments.max_output_tokens,
         response_format_file=parsed_arguments.response_format_file,
+        enable_tools=parsed_arguments.enable_tools,
     )
 
 
@@ -343,4 +353,5 @@ def resolve_runtime_configuration(
         context_documents=context_documents,
         generation_config=generation_config,
         response_format=response_format,
+        enable_tools=arguments.enable_tools,
     )

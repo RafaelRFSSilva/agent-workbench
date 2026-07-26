@@ -5,6 +5,7 @@ from agent_workbench.arguments import (
     parse_cli_arguments,
     resolve_runtime_configuration,
 )
+from agent_workbench.built_in_tools import create_built_in_tool_registry
 from agent_workbench.config import (
     load_environment,
 )
@@ -127,14 +128,25 @@ def main(
         print(f"Configuration error: {exc}")
         return
 
-    run_cli(
-        provider,
-        system_prompt=runtime_configuration.system_prompt,
-        agent_profile=runtime_configuration.agent_profile,
-        context_documents=runtime_configuration.context_documents,
-        generation_config=runtime_configuration.generation_config,
-        response_format=runtime_configuration.response_format,
-    )
+    if runtime_configuration.enable_tools:
+        run_cli(
+            provider,
+            system_prompt=runtime_configuration.system_prompt,
+            agent_profile=runtime_configuration.agent_profile,
+            context_documents=runtime_configuration.context_documents,
+            generation_config=runtime_configuration.generation_config,
+            response_format=runtime_configuration.response_format,
+            tool_registry=create_built_in_tool_registry(),
+        )
+    else:
+        run_cli(
+            provider,
+            system_prompt=runtime_configuration.system_prompt,
+            agent_profile=runtime_configuration.agent_profile,
+            context_documents=runtime_configuration.context_documents,
+            generation_config=runtime_configuration.generation_config,
+            response_format=runtime_configuration.response_format,
+        )
 
 
 if __name__ == "__main__":
