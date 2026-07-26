@@ -1,5 +1,6 @@
 """Ollama provider implementation."""
 
+import json
 from dataclasses import dataclass
 from typing import Literal, NotRequired, TypedDict
 
@@ -9,7 +10,7 @@ from agent_workbench.context import build_system_instructions
 from agent_workbench.errors import CompletionError
 from agent_workbench.messages import ChatRequest, ChatResponse
 from agent_workbench.structured_outputs import JSONSchema
-from agent_workbench.tools import ToolInvocation
+from agent_workbench.tools import ToolInvocation, ToolResult
 
 
 class OllamaMessage(TypedDict):
@@ -17,6 +18,40 @@ class OllamaMessage(TypedDict):
 
     role: Literal["system", "user", "assistant"]
     content: str
+
+
+class OllamaToolCallFunction(TypedDict):
+    """Represent a previous function call supplied to Ollama."""
+
+    name: str
+    arguments: dict[str, object]
+
+
+class OllamaToolCall(TypedDict):
+    """Represent a previous tool call supplied to Ollama."""
+
+    function: OllamaToolCallFunction
+
+
+class OllamaAssistantToolMessage(TypedDict):
+    """Represent an assistant tool-call message supplied to Ollama."""
+
+    role: Literal["assistant"]
+    content: str
+    tool_calls: list[OllamaToolCall]
+
+
+class OllamaToolResultMessage(TypedDict):
+    """Represent a tool result message supplied to Ollama."""
+
+    role: Literal["tool"]
+    content: str
+    tool_name: str
+
+
+type OllamaInputMessage = (
+    OllamaMessage | OllamaAssistantToolMessage | OllamaToolResultMessage
+)
 
 
 class OllamaFunctionDefinition(TypedDict):
@@ -38,11 +73,33 @@ class OllamaChatArguments(TypedDict):
     """Represent arguments supplied to the Ollama chat API."""
 
     model: str
-    messages: list[OllamaMessage]
+    messages: list[OllamaInputMessage]
     stream: bool
     options: NotRequired[dict[str, float | int]]
     format: NotRequired[JSONSchema]
     tools: NotRequired[list[OllamaToolDefinition]]
+
+
+def _serialize_tool_result(result: ToolResult) -> str:
+    """Serialize a provider-independent tool result for Ollama input."""
+
+    if result.status == "success":
+        result_data = {
+            "status": "success",
+            "output": result.output,
+        }
+    else:
+        result_data = {
+            "status": "error",
+            "error": result.error,
+        }
+
+    return json.dumps(
+        result_data,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,7 +117,7 @@ class OllamaProvider:
     def complete(self, request: ChatRequest) -> ChatResponse:
         """Generate a response using the configured Ollama model."""
 
-        request_messages: list[OllamaMessage] = []
+        request_messages: list[OllamaInputMessage] = []
 
         system_instructions = build_system_instructions(
             request.system_prompt,
@@ -82,6 +139,39 @@ class OllamaProvider:
                     "content": message["content"],
                 }
             )
+
+        for interaction in request.tool_interactions:
+            tool_calls: list[OllamaToolCall] = []
+
+            for invocation in interaction.response.tool_invocations:
+                tool_calls.append(
+                    {
+                        "function": {
+                            "name": invocation.tool_name,
+                            "arguments": invocation.arguments,
+                        },
+                    }
+                )
+
+            request_messages.append(
+                {
+                    "role": "assistant",
+                    "content": interaction.response.text,
+                    "tool_calls": tool_calls,
+                }
+            )
+
+            for invocation, result in zip(
+                interaction.response.tool_invocations,
+                interaction.results,
+            ):
+                request_messages.append(
+                    {
+                        "role": "tool",
+                        "content": _serialize_tool_result(result),
+                        "tool_name": invocation.tool_name,
+                    }
+                )
 
         generation_options: dict[str, float | int] = {}
 
