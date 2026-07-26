@@ -20,6 +20,8 @@ from agent_workbench.generation import GenerationConfig
 from agent_workbench.structured_outputs import JSONResponseFormat
 from agent_workbench.tool_calling import run_tool_calling_loop
 from agent_workbench.tool_registry import ToolRegistry
+from agent_workbench.workspace import Workspace
+from agent_workbench.workspace_tools import register_workspace_tools
 
 EXIT_COMMANDS = {"/exit", "/quit"}
 DEFAULT_MAX_TOOL_ROUNDS = 8
@@ -124,11 +126,23 @@ def main(
             runtime_configuration.provider_name,
             runtime_configuration.model_name,
         )
+
+        tool_registry = (
+            create_built_in_tool_registry()
+            if runtime_configuration.enable_tools
+            else None
+        )
+
+        if runtime_configuration.workspace_root is not None:
+            workspace = Workspace(runtime_configuration.workspace_root)
+            if tool_registry is None:
+                tool_registry = ToolRegistry()
+            register_workspace_tools(tool_registry, workspace)
     except ConfigurationError as exc:
         print(f"Configuration error: {exc}")
         return
 
-    if runtime_configuration.enable_tools:
+    if tool_registry is not None:
         run_cli(
             provider,
             system_prompt=runtime_configuration.system_prompt,
@@ -136,7 +150,7 @@ def main(
             context_documents=runtime_configuration.context_documents,
             generation_config=runtime_configuration.generation_config,
             response_format=runtime_configuration.response_format,
-            tool_registry=create_built_in_tool_registry(),
+            tool_registry=tool_registry,
         )
     else:
         run_cli(

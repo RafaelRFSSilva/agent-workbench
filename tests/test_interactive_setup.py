@@ -41,6 +41,7 @@ def test_interactive_setup_accepts_environment_defaults(
     assert configuration.generation_config == GenerationConfig()
     assert configuration.response_format is None
     assert configuration.enable_tools is False
+    assert configuration.workspace_root is None
 
 
 def test_interactive_setup_reprompts_for_invalid_provider(
