@@ -4,9 +4,12 @@ from pathlib import Path
 
 from agent_workbench.context import ContextDocument
 from agent_workbench.generation import GenerationConfig
-from agent_workbench.messages import ChatRequest
+from agent_workbench.messages import ChatRequest, ChatResponse
 from agent_workbench.structured_outputs import JSONResponseFormat
-from agent_workbench.tools import ToolDefinition
+from agent_workbench.tools import (
+    ToolDefinition,
+    ToolInvocation,
+)
 
 
 def test_chat_request_has_no_context_documents_by_default() -> None:
@@ -170,4 +173,51 @@ def test_chat_request_preserves_tool_order() -> None:
     assert request.tools == (
         calculator,
         project_information,
+    )
+
+
+def test_chat_response_has_no_tool_invocations_by_default() -> None:
+    """Create a text response without tool invocations."""
+
+    response = ChatResponse(text="Provider response.")
+
+    assert response.text == "Provider response."
+    assert response.tool_invocations == ()
+
+
+def test_chat_response_preserves_text_exactly() -> None:
+    """Preserve provider text without normalizing its whitespace."""
+
+    response = ChatResponse(text="  Provider response.  ")
+
+    assert response.text == "  Provider response.  "
+
+
+def test_chat_response_preserves_tool_invocation_order() -> None:
+    """Preserve tool invocations in provider response order."""
+
+    first_invocation = ToolInvocation(
+        id="call-1",
+        tool_name="calculator",
+        arguments={
+            "expression": "2 + 2",
+        },
+    )
+    second_invocation = ToolInvocation(
+        id="call-2",
+        tool_name="project_information",
+        arguments={},
+    )
+
+    response = ChatResponse(
+        tool_invocations=(
+            first_invocation,
+            second_invocation,
+        ),
+    )
+
+    assert response.text == ""
+    assert response.tool_invocations == (
+        first_invocation,
+        second_invocation,
     )
