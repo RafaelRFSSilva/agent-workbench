@@ -9,6 +9,7 @@ from agent_workbench.context import build_system_instructions
 from agent_workbench.errors import CompletionError
 from agent_workbench.messages import ChatRequest, ChatResponse
 from agent_workbench.structured_outputs import JSONSchema
+from agent_workbench.tools import ToolInvocation
 
 
 class OllamaMessage(TypedDict):
@@ -16,6 +17,21 @@ class OllamaMessage(TypedDict):
 
     role: Literal["system", "user", "assistant"]
     content: str
+
+
+class OllamaFunctionDefinition(TypedDict):
+    """Represent a function supplied to Ollama."""
+
+    name: str
+    description: str
+    parameters: JSONSchema
+
+
+class OllamaToolDefinition(TypedDict):
+    """Represent a tool supplied to Ollama."""
+
+    type: Literal["function"]
+    function: OllamaFunctionDefinition
 
 
 class OllamaChatArguments(TypedDict):
@@ -26,6 +42,7 @@ class OllamaChatArguments(TypedDict):
     stream: bool
     options: NotRequired[dict[str, float | int]]
     format: NotRequired[JSONSchema]
+    tools: NotRequired[list[OllamaToolDefinition]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +108,19 @@ class OllamaProvider:
         if request.response_format is not None:
             chat_arguments["format"] = request.response_format.schema
 
+        if request.tools:
+            chat_arguments["tools"] = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.input_schema,
+                    },
+                }
+                for tool in request.tools
+            ]
+
         try:
             response = chat(**chat_arguments)
         except ConnectionError as exc:
@@ -106,6 +136,18 @@ class OllamaProvider:
 
             raise CompletionError(f"Ollama request failed: {exc.error}") from exc
 
+        tool_calls = getattr(response.message, "tool_calls", None) or ()
+
+        tool_invocations = tuple(
+            ToolInvocation(
+                id=f"ollama-tool-call-{index}",
+                tool_name=tool_call.function.name,
+                arguments=dict(tool_call.function.arguments),
+            )
+            for index, tool_call in enumerate(tool_calls, start=1)
+        )
+
         return ChatResponse(
             text=response.message.content or "",
+            tool_invocations=tool_invocations,
         )
