@@ -14,7 +14,7 @@ from agent_workbench.context import (
 )
 from agent_workbench.errors import CompletionError
 from agent_workbench.generation import GenerationConfig
-from agent_workbench.messages import ChatRequest, Message
+from agent_workbench.messages import ChatRequest, ChatResponse, Message
 from agent_workbench.providers.openai import OpenAIProvider
 from agent_workbench.structured_outputs import JSONResponseFormat
 
@@ -84,7 +84,9 @@ def test_provider_returns_response_text() -> None:
     result = provider.complete(request)
 
     assert provider.name == "OpenAI"
-    assert result == "OpenAI provider working"
+    assert result == ChatResponse(
+        text="OpenAI provider working",
+    )
     create_mock.assert_called_once_with(
         model="test-model",
         input=messages,
@@ -200,7 +202,9 @@ def test_context_documents_are_added_to_instructions() -> None:
 
     result = provider.complete(request)
 
-    assert result == "OpenAI context received"
+    assert result == ChatResponse(
+        text="OpenAI context received",
+    )
     create_mock.assert_called_once_with(
         model="test-model",
         input=messages,
@@ -239,7 +243,9 @@ def test_generation_config_is_translated_to_openai_arguments() -> None:
 
     result = provider.complete(request)
 
-    assert result == "Configured OpenAI response"
+    assert result == ChatResponse(
+        text="Configured OpenAI response",
+    )
     create_mock.assert_called_once_with(
         model="test-model",
         input=messages,
@@ -296,7 +302,9 @@ def test_response_format_is_translated_to_openai_text_config() -> None:
 
     result = provider.complete(request)
 
-    assert result == structured_response
+    assert result == ChatResponse(
+        text=structured_response,
+    )
     create_mock.assert_called_once_with(
         model="test-model",
         input=messages,

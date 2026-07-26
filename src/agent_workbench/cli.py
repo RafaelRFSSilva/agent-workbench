@@ -69,7 +69,7 @@ def run_cli(
         request_messages = [*messages, user_message]
 
         try:
-            assistant_reply = provider.complete(
+            assistant_response = provider.complete(
                 ChatRequest(
                     messages=request_messages,
                     system_prompt=system_prompt,
@@ -84,11 +84,11 @@ def run_cli(
 
         assistant_message: Message = {
             "role": "assistant",
-            "content": assistant_reply,
+            "content": assistant_response.text,
         }
         messages = [*request_messages, assistant_message]
 
-        print(f"Assistant: {assistant_reply}\n")
+        print(f"Assistant: {assistant_response.text}\n")
 
 
 def main(

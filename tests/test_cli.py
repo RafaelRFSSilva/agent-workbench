@@ -7,7 +7,7 @@ from agent_workbench.cli import main, run_cli
 from agent_workbench.arguments import RuntimeConfiguration
 from agent_workbench.context import ContextDocument
 from agent_workbench.errors import CompletionError
-from agent_workbench.messages import ChatRequest, Message
+from agent_workbench.messages import ChatRequest, ChatResponse, Message
 from agent_workbench.agents import get_agent_profile
 from agent_workbench.generation import GenerationConfig
 from agent_workbench.structured_outputs import JSONResponseFormat
@@ -44,7 +44,7 @@ class FakeProvider:
         if isinstance(outcome, CompletionError):
             raise outcome
 
-        return outcome
+        return ChatResponse(text=outcome)
 
 
 def test_exit_command_does_not_call_provider(monkeypatch, capsys) -> None:

@@ -13,7 +13,7 @@ from anthropic import (
 
 from agent_workbench.context import build_system_instructions
 from agent_workbench.errors import CompletionError
-from agent_workbench.messages import ChatRequest, Message
+from agent_workbench.messages import ChatRequest, ChatResponse, Message
 from agent_workbench.structured_outputs import JSONSchema
 
 
@@ -87,7 +87,7 @@ class AnthropicProvider:
 
         return "Anthropic"
 
-    def complete(self, request: ChatRequest) -> str:
+    def complete(self, request: ChatRequest) -> ChatResponse:
         """Return an assistant reply for the supplied chat request."""
 
         request_messages: list[Message] = [
@@ -157,4 +157,8 @@ class AnthropicProvider:
                 f"Anthropic API request failed with status {exc.status_code}."
             ) from exc
 
-        return "".join(block.text for block in response.content if block.type == "text")
+        return ChatResponse(
+            text="".join(
+                block.text for block in response.content if block.type == "text"
+            ),
+        )

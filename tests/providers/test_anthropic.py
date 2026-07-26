@@ -19,7 +19,7 @@ from agent_workbench.context import (
 )
 from agent_workbench.errors import CompletionError
 from agent_workbench.generation import GenerationConfig
-from agent_workbench.messages import ChatRequest
+from agent_workbench.messages import ChatRequest, ChatResponse
 from agent_workbench.providers.anthropic import AnthropicProvider
 from agent_workbench.structured_outputs import JSONResponseFormat
 
@@ -57,7 +57,9 @@ def test_complete_returns_concatenated_text_blocks() -> None:
     )
     result = provider.complete(request)
 
-    assert result == "Hello world"
+    assert result == ChatResponse(
+        text="Hello world",
+    )
     create.assert_called_once_with(
         model="claude-test",
         max_tokens=256,
@@ -218,7 +220,9 @@ def test_context_documents_are_added_to_system_instructions() -> None:
 
     result = provider.complete(request)
 
-    assert result == "Anthropic context received"
+    assert result == ChatResponse(
+        text="Anthropic context received",
+    )
     create.assert_called_once_with(
         model="claude-test",
         max_tokens=256,
@@ -270,7 +274,9 @@ def test_generation_config_is_translated_to_anthropic_arguments() -> None:
 
     result = provider.complete(request)
 
-    assert result == "Configured Anthropic response"
+    assert result == ChatResponse(
+        text="Configured Anthropic response",
+    )
     create.assert_called_once_with(
         model="claude-test",
         max_tokens=256,
@@ -340,7 +346,10 @@ def test_response_format_is_translated_to_anthropic_output_config() -> None:
 
     result = provider.complete(request)
 
-    assert result == structured_response
+    assert result == ChatResponse(
+        text=structured_response,
+    )
+
     create.assert_called_once_with(
         model="claude-test",
         max_tokens=256,

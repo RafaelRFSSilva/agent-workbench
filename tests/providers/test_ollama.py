@@ -11,7 +11,7 @@ from agent_workbench.context import (
     ContextDocument,
 )
 from agent_workbench.errors import CompletionError
-from agent_workbench.messages import ChatRequest
+from agent_workbench.messages import ChatRequest, ChatResponse
 from agent_workbench.providers.ollama import OllamaProvider
 from agent_workbench.generation import GenerationConfig
 from agent_workbench.structured_outputs import JSONResponseFormat
@@ -47,7 +47,9 @@ def test_provider_returns_model_response(monkeypatch) -> None:
         ],
     )
 
-    assert provider.complete(request) == "provider working"
+    assert provider.complete(request) == ChatResponse(
+        text="provider working",
+    )
     assert captured_arguments == {
         "model": "test-model",
         "messages": [
@@ -135,7 +137,9 @@ def test_context_documents_are_added_as_system_instructions(
         ),
     )
 
-    assert provider.complete(request) == "context received"
+    assert provider.complete(request) == ChatResponse(
+        text="context received",
+    )
     assert captured_arguments == {
         "model": "test-model",
         "messages": [
@@ -193,7 +197,9 @@ def test_generation_config_is_translated_to_ollama_options(
         ),
     )
 
-    assert provider.complete(request) == "configured response"
+    assert provider.complete(request) == ChatResponse(
+        text="configured response",
+    )
     assert captured_arguments == {
         "model": "test-model",
         "messages": [
@@ -268,8 +274,8 @@ def test_response_format_is_translated_to_ollama_schema(
         ),
     )
 
-    assert provider.complete(request) == (
-        '{"summary":"No critical issues.","risk_level":"low"}'
+    assert provider.complete(request) == ChatResponse(
+        text='{"summary":"No critical issues.","risk_level":"low"}',
     )
     assert captured_arguments == {
         "model": "test-model",

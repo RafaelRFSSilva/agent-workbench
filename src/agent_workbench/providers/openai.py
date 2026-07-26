@@ -6,7 +6,7 @@ from openai import APIConnectionError, APIStatusError
 
 from agent_workbench.context import build_system_instructions
 from agent_workbench.errors import CompletionError
-from agent_workbench.messages import ChatRequest, Message
+from agent_workbench.messages import ChatRequest, ChatResponse, Message
 from agent_workbench.structured_outputs import JSONSchema
 
 
@@ -74,7 +74,7 @@ class OpenAIProvider:
 
         return "OpenAI"
 
-    def complete(self, request: ChatRequest) -> str:
+    def complete(self, request: ChatRequest) -> ChatResponse:
         """Generate a response using the configured OpenAI model."""
 
         input_messages: list[Message] = [
@@ -148,4 +148,6 @@ class OpenAIProvider:
                 f"OpenAI request failed with status code {exc.status_code}."
             ) from exc
 
-        return response.output_text or ""
+        return ChatResponse(
+            text=response.output_text or "",
+        )

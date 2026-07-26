@@ -7,7 +7,7 @@ from ollama import ResponseError, chat
 
 from agent_workbench.context import build_system_instructions
 from agent_workbench.errors import CompletionError
-from agent_workbench.messages import ChatRequest
+from agent_workbench.messages import ChatRequest, ChatResponse
 from agent_workbench.structured_outputs import JSONSchema
 
 
@@ -40,7 +40,7 @@ class OllamaProvider:
 
         return "Ollama"
 
-    def complete(self, request: ChatRequest) -> str:
+    def complete(self, request: ChatRequest) -> ChatResponse:
         """Generate a response using the configured Ollama model."""
 
         request_messages: list[OllamaMessage] = []
@@ -106,4 +106,6 @@ class OllamaProvider:
 
             raise CompletionError(f"Ollama request failed: {exc.error}") from exc
 
-        return response.message.content or ""
+        return ChatResponse(
+            text=response.message.content or "",
+        )
