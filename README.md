@@ -461,8 +461,9 @@ access the network, or use MCP.
 ### Controlled Workspace Actions
 
 Controlled actions are disabled by default. `--enable-actions` requires an
-explicit `--workspace PATH` and adds `apply_file_patch`, `run_ruff_format`,
-`run_ruff_check`, and `run_pytest` after the read-only tools:
+explicit `--workspace PATH` and adds `apply_file_patch`,
+`apply_workspace_changes`, `run_ruff_format`, `run_ruff_check`, and
+`run_pytest` after the read-only tools:
 
 ```bash
 uv run agent-workbench \
@@ -484,11 +485,47 @@ arbitrary shell or caller-controlled command flag.
 It compares the complete expected content, shows the complete unified diff,
 and revalidates after approval. Existing files are replaced atomically while
 preserving portable permission bits; new files use exclusive creation in an
-existing directory. Writes reject absolute paths, traversal, every symlink
-component, `.git`, binaries, stale content, missing parents, content over
-100 KiB, more than 500 changed lines, and complete diff previews over 64 KiB.
-Deletion, rename, directory creation, mode changes, and multi-file
-transactions are unsupported.
+existing directory.
+
+`apply_workspace_changes` applies one approved transaction using this exact
+closed shape:
+
+```json
+{
+  "changes": [
+    {
+      "path": "relative/path.py",
+      "expected_content": "complete expected content",
+      "replacement_content": "complete replacement content",
+      "create_if_missing": false
+    }
+  ]
+}
+```
+
+The transaction validates every target and complete diff before approval,
+sorts the plan by canonical relative path, rejects duplicate canonical
+targets, and shows one complete combined preview. Execution prepares all
+replacement and rollback material, revalidates the complete plan after
+approval, then commits changes in sorted order. A handled in-process failure
+rolls back already applied changes in reverse order. Successful rollback
+restores updates and removes transaction-created files; an incomplete rollback
+reports only the relative paths requiring manual inspection.
+
+Per file, existing, expected, and replacement content is limited to 100 KiB
+and a change to 500 added and removed lines. One transaction is limited to
+16 files, 512 KiB of combined expected content, 512 KiB of combined
+replacement content, 2,000 changed lines, and a complete 256 KiB combined
+preview. Single-file previews retain their 64 KiB limit. Writes reject
+absolute paths, traversal, every symlink component, `.git`, binaries, stale
+content, missing parents, deletion, rename, directory creation, and mode
+changes.
+
+The rollback guarantee covers handled failures in the current process only
+when rollback itself succeeds. It is not global filesystem atomicity and does
+not cover power loss, `SIGKILL`, abrupt process or operating-system
+termination, filesystem or disk failure, or rollback failure. Preserve and
+inspect the reported paths manually after an incomplete rollback.
 
 Validation uses only fixed non-shell commands against a canonical
 workspace-relative target: Ruff format and check have 30-second timeouts,
@@ -501,19 +538,19 @@ approval.
 
 With `--workspace` and `--enable-actions`, tool order is `list_files`,
 `read_file`, `search_text`, `search_symbols`, `inspect_git_status`,
-`inspect_git_diff`, `apply_file_patch`, `run_ruff_format`, `run_ruff_check`,
-then `run_pytest`. With `--enable-tools`, the order is `calculator`,
-`list_files`, `read_file`, `search_text`, `search_symbols`,
-`inspect_git_status`, `inspect_git_diff`, `apply_file_patch`,
-`run_ruff_format`, `run_ruff_check`, then `run_pytest`.
+`inspect_git_diff`, `apply_file_patch`, `apply_workspace_changes`,
+`run_ruff_format`, `run_ruff_check`, then `run_pytest`. With
+`--enable-tools`, `calculator` comes first and the remaining order is
+unchanged.
 
 Example request:
 
 ```text
-Inspect the relevant files, propose one small change, request approval before
-every write or validation action, apply the approved patch, run Ruff and
-pytest, inspect the final Git diff, and summarize the result. Do not commit or
-push.
+Inspect the relevant files. For changes that must succeed together, request
+one apply_workspace_changes transaction with complete expected and replacement
+content for every file. Request approval before every write or validation
+action, run Ruff and pytest, inspect the final Git status and diff, and
+summarize the result. Do not commit or push.
 ```
 
 See [Architecture](docs/architecture.md) for the shared tool models and
@@ -603,7 +640,8 @@ work.
 Agent Workbench does not yet provide:
 
 - Arbitrary shell or network tools.
-- File deletion, rename, or multi-file write transactions.
+- File deletion, rename, or directory creation.
+- Crash-safe or globally atomic multi-file writes.
 - Caller-controlled commands or command flags.
 - User-defined tools.
 - Asynchronous tool execution.

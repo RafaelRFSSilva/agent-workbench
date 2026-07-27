@@ -602,12 +602,13 @@ uv run agent-workbench \
 six read-only workspace tools:
 
 1. `apply_file_patch`
-2. `run_ruff_format`
-3. `run_ruff_check`
-4. `run_pytest`
+2. `apply_workspace_changes`
+3. `run_ruff_format`
+4. `run_ruff_check`
+5. `run_pytest`
 
 When the calculator is also enabled it remains first, followed by the six
-read-only tools and these four actions.
+read-only tools and these five actions.
 
 Every action displays an informed preview and asks:
 
@@ -630,8 +631,44 @@ symlinks and never target `.git`.
 
 Patch content and existing files are limited to 100 KiB, one patch may change
 at most 500 removed/added lines, and the complete preview must fit within
-64 KiB without truncation. File deletion, rename, directory creation, binary
-files, mode changes, and multi-file transactions are unsupported.
+64 KiB without truncation.
+
+Use `apply_workspace_changes` when several creations or updates must succeed
+together. Its exact closed input shape is:
+
+```json
+{
+  "changes": [
+    {
+      "path": "relative/path.py",
+      "expected_content": "complete expected content",
+      "replacement_content": "complete replacement content",
+      "create_if_missing": false
+    }
+  ]
+}
+```
+
+Every element requires `path`, `expected_content`, and `replacement_content`;
+`create_if_missing` is optional and defaults to false. Planning validates all
+targets, rejects duplicate canonical paths, sorts changes by canonical
+relative path, and presents every complete diff in one approval preview. The
+transaction is limited to 16 files, 512 KiB each of combined expected and
+replacement content, 2,000 changed lines, and a complete combined preview of
+256 KiB. The 100 KiB existing/expected/replacement and 500-changed-line limits
+still apply to each file.
+
+After approval, execution prepares replacement and rollback material for every
+change, revalidates the complete plan, then commits in deterministic order.
+Handled in-process commit failures roll back applied changes in reverse order:
+updates are restored and created files removed. This guarantee applies only
+when rollback succeeds. It is not global filesystem atomicity and does not
+cover power loss, `SIGKILL`, abrupt process or operating-system termination,
+filesystem or disk failure, or rollback failure. If rollback is incomplete,
+Agent Workbench reports the relative paths that require manual inspection.
+
+File deletion, rename, directory creation, binary files, and mode changes are
+unsupported.
 
 The validation tools run fixed commands without a shell or caller flags,
 against a canonical workspace-relative target. Ruff commands time out after
@@ -645,10 +682,11 @@ preview carefully.
 Suggested request:
 
 ```text
-Inspect the relevant files, propose one small change, request approval before
-every write or validation action, apply the approved patch, run Ruff and
-pytest, inspect the final Git diff, and summarize the result. Do not commit or
-push.
+Inspect the relevant files. For changes that must succeed together, request
+one apply_workspace_changes transaction with complete expected and replacement
+content for every file. Request approval before every write or validation
+action, run Ruff and pytest, inspect the final Git status and diff, and
+summarize the result. Do not commit or push.
 ```
 
 ## Configuration Precedence

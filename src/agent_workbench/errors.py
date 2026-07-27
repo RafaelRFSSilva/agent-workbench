@@ -15,3 +15,7 @@ class SessionStateError(RuntimeError):
 
 class WorkspacePathError(RuntimeError):
     """Represent an unsafe or invalid requested workspace path."""
+
+
+class WorkspaceTransactionError(CompletionError):
+    """Represent a safe transactional workspace application failure."""

@@ -148,6 +148,42 @@ def _prompt_for_tool_approval(
         print("  Complete diff:")
         diff = preview.get("diff")
         print(diff if isinstance(diff, str) else "[unavailable]")
+    elif tool_name == "apply_workspace_changes" and isinstance(preview, dict):
+        print("  Transactional workspace change")
+        print(f"  Files: {preview.get('operation_count', '[unavailable]')}")
+        print(f"  Created: {preview.get('created_count', '[unavailable]')}")
+        print(f"  Updated: {preview.get('updated_count', '[unavailable]')}")
+        print(
+            "  Total changed lines: "
+            f"{preview.get('total_changed_lines', '[unavailable]')}"
+        )
+        print("  One approval covers the exact listed transaction only.")
+        changes = preview.get("changes")
+        if isinstance(changes, list):
+            for change in changes:
+                if not isinstance(change, dict):
+                    print("  Change: [unavailable]")
+                    continue
+                print(f"  Path: {change.get('path', '[unavailable]')}")
+                print(f"    Operation: {change.get('operation', '[unavailable]')}")
+                print(
+                    "    Bytes: "
+                    f"{change.get('old_size_bytes', '[unavailable]')} → "
+                    f"{change.get('new_size_bytes', '[unavailable]')}"
+                )
+                print(
+                    f"    Changed lines: {change.get('changed_lines', '[unavailable]')}"
+                )
+                print("    Complete diff:")
+                diff = change.get("diff")
+                print(diff if isinstance(diff, str) else "[unavailable]")
+        else:
+            print("  Changes: [unavailable]")
+        print("  Rollback covers handled in-process failures when rollback succeeds.")
+        print(
+            "  It does not cover power loss, abrupt process termination, "
+            "filesystem failure, or rollback failure."
+        )
     elif tool_name in {
         "run_ruff_format",
         "run_ruff_check",
@@ -213,6 +249,34 @@ def _trace_arguments(invocation) -> object:
     """Return safe trace arguments with patch contents replaced by byte counts."""
 
     arguments = invocation.arguments
+    if invocation.tool_name == "apply_workspace_changes":
+        changes = arguments.get("changes")
+        safe_changes = []
+        if isinstance(changes, list):
+            for change in changes:
+                if not isinstance(change, dict):
+                    continue
+                expected_content = change.get("expected_content")
+                replacement_content = change.get("replacement_content")
+                safe_changes.append(
+                    {
+                        "path": change.get("path"),
+                        "create_if_missing": change.get(
+                            "create_if_missing",
+                            False,
+                        ),
+                        "expected_content_bytes": _utf8_byte_count(
+                            expected_content,
+                        ),
+                        "replacement_content_bytes": _utf8_byte_count(
+                            replacement_content,
+                        ),
+                    }
+                )
+        return {
+            "operation_count": len(safe_changes),
+            "changes": safe_changes,
+        }
     if invocation.tool_name != "apply_file_patch":
         return arguments
 
@@ -221,17 +285,20 @@ def _trace_arguments(invocation) -> object:
     return {
         "path": arguments.get("path"),
         "create_if_missing": arguments.get("create_if_missing", False),
-        "expected_content_bytes": (
-            len(expected_content.encode("utf-8"))
-            if isinstance(expected_content, str)
-            else None
-        ),
-        "replacement_content_bytes": (
-            len(replacement_content.encode("utf-8"))
-            if isinstance(replacement_content, str)
-            else None
-        ),
+        "expected_content_bytes": _utf8_byte_count(expected_content),
+        "replacement_content_bytes": _utf8_byte_count(replacement_content),
     }
+
+
+def _utf8_byte_count(value: object) -> int | None:
+    """Return a safe UTF-8 byte count for valid text."""
+
+    if not isinstance(value, str):
+        return None
+    try:
+        return len(value.encode("utf-8"))
+    except UnicodeEncodeError:
+        return None
 
 
 def _serialize_trace_data(value: object) -> str:
@@ -250,7 +317,10 @@ def _redact_trace_data(value: object, *, key: str | None = None) -> object:
 
     if key is not None and key.lower() in {
         "content",
+        "diff",
+        "expected_content",
         "password",
+        "replacement_content",
         "secret",
         "token",
         "api_key",

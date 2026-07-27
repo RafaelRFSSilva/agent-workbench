@@ -3,7 +3,7 @@
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from agent_workbench.errors import ConfigurationError
+from agent_workbench.errors import CompletionError, ConfigurationError
 from agent_workbench.tools import (
     JSONValue,
     JSONObject,
@@ -25,6 +25,7 @@ class _ToolRegistration:
     handler: ToolHandler = field(repr=False)
     requires_approval: bool
     approval_preview: ToolApprovalPreview | None = field(repr=False)
+    propagates_completion_errors: bool
 
 
 @dataclass(slots=True)
@@ -50,6 +51,7 @@ class ToolRegistry:
         *,
         requires_approval: bool = False,
         approval_preview: ToolApprovalPreview | None = None,
+        propagates_completion_errors: bool = False,
     ) -> None:
         """Register a synchronous handler for a tool definition."""
 
@@ -61,6 +63,7 @@ class ToolRegistry:
             handler=handler,
             requires_approval=requires_approval,
             approval_preview=approval_preview,
+            propagates_completion_errors=propagates_completion_errors,
         )
 
     def requires_approval(self, invocation: ToolInvocation) -> bool:
@@ -109,6 +112,14 @@ class ToolRegistry:
                 invocation_id=invocation.id,
                 status="success",
                 output=output,
+            )
+        except CompletionError:
+            if registration.propagates_completion_errors:
+                raise
+            return ToolResult(
+                invocation_id=invocation.id,
+                status="error",
+                error="Tool execution failed.",
             )
         except Exception:
             return ToolResult(

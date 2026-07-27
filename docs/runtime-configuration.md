@@ -737,11 +737,12 @@ asynchronous definitions through `is_async` while accepting only `any`,
 `class`, `function`, or `method` as its `kind`.
 
 `--enable-actions` is a separate default-false authorization and requires the
-workspace root. It appends `apply_file_patch`, `run_ruff_format`,
-`run_ruff_check`, and `run_pytest` in that order. It does not store approval
-callbacks or terminal functions in `RuntimeConfiguration`; the CLI owns the
-default-deny, one-use approval prompt. Interactive setup keeps actions false
-without asking another question.
+workspace root. It appends `apply_file_patch`, `apply_workspace_changes`,
+`run_ruff_format`, `run_ruff_check`, and `run_pytest` in that order. It does
+not store approval callbacks or terminal functions in
+`RuntimeConfiguration`; the CLI owns the default-deny, one-use approval
+prompt. Interactive setup keeps actions false without asking another
+question.
 
 Workspace action authorization does not grant deletion, rename, arbitrary
 commands or flags, network, Git mutation, or MCP access.
