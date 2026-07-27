@@ -28,6 +28,14 @@ class IsolatedCommitRecoveryPhase(StrEnum):
     COMMIT_VERIFICATION = "commit_verification"
 
 
+class WorktreeRecoveryPhase(StrEnum):
+    """Identify the worktree lifecycle phase requiring manual inspection."""
+
+    CREATION = "creation"
+    REMOVAL = "removal"
+    REMOVAL_VERIFICATION = "removal_verification"
+
+
 @dataclass(frozen=True, slots=True, init=False)
 class IsolatedCommitRecoveryEvidence:
     """Store bounded safe evidence after an isolated-commit failure."""
@@ -121,6 +129,143 @@ class IsolatedCommitRecoveryEvidence:
         if self.observed_head is None:
             return RecoveryStatus.UNKNOWN
         if self.observed_head == self.expected_head:
+            return RecoveryStatus.NO
+        return RecoveryStatus.YES
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class WorktreeRecoveryEvidence:
+    """Store safe evidence after a worktree lifecycle failure."""
+
+    phase: WorktreeRecoveryPhase
+    target_display: str
+    expected_branch: str
+    expected_source_head: str
+    observed_source_head: str | None
+    expected_worktree_head: str
+    observed_worktree_head: str | None
+    observed_branch: str | None
+    branch_present: RecoveryStatus
+    target_present: RecoveryStatus
+    registered: RecoveryStatus
+
+    def __init__(
+        self,
+        *,
+        phase: WorktreeRecoveryPhase,
+        target_display: str,
+        expected_branch: str,
+        expected_source_head: str,
+        observed_source_head: str | None,
+        expected_worktree_head: str,
+        observed_worktree_head: str | None,
+        observed_branch: str | None,
+        branch_present: RecoveryStatus,
+        target_present: RecoveryStatus,
+        registered: RecoveryStatus,
+    ) -> None:
+        """Validate and snapshot one operator-safe lifecycle observation."""
+
+        if not isinstance(phase, WorktreeRecoveryPhase):
+            raise ConfigurationError(
+                "worktree recovery phase must be a WorktreeRecoveryPhase."
+            )
+        if not isinstance(branch_present, RecoveryStatus):
+            raise ConfigurationError(
+                "worktree recovery branch state must be a RecoveryStatus."
+            )
+        if not isinstance(target_present, RecoveryStatus):
+            raise ConfigurationError(
+                "worktree recovery target state must be a RecoveryStatus."
+            )
+        if not isinstance(registered, RecoveryStatus):
+            raise ConfigurationError(
+                "worktree recovery registration state must be a RecoveryStatus."
+            )
+
+        safe_target = _validate_target_display(target_display)
+        safe_expected_branch = _validate_branch(
+            expected_branch,
+            field_name="expected branch",
+        )
+        safe_observed_branch = (
+            None
+            if observed_branch is None
+            else _validate_branch(
+                observed_branch,
+                field_name="observed branch",
+            )
+        )
+        safe_expected_source_head = _validate_head(
+            expected_source_head,
+            field_name="expected source HEAD",
+        )
+        safe_observed_source_head = (
+            None
+            if observed_source_head is None
+            else _validate_head(
+                observed_source_head,
+                field_name="observed source HEAD",
+            )
+        )
+        safe_expected_worktree_head = _validate_head(
+            expected_worktree_head,
+            field_name="expected worktree HEAD",
+        )
+        safe_observed_worktree_head = (
+            None
+            if observed_worktree_head is None
+            else _validate_head(
+                observed_worktree_head,
+                field_name="observed worktree HEAD",
+            )
+        )
+
+        object.__setattr__(self, "phase", phase)
+        object.__setattr__(self, "target_display", safe_target)
+        object.__setattr__(self, "expected_branch", safe_expected_branch)
+        object.__setattr__(
+            self,
+            "expected_source_head",
+            safe_expected_source_head,
+        )
+        object.__setattr__(
+            self,
+            "observed_source_head",
+            safe_observed_source_head,
+        )
+        object.__setattr__(
+            self,
+            "expected_worktree_head",
+            safe_expected_worktree_head,
+        )
+        object.__setattr__(
+            self,
+            "observed_worktree_head",
+            safe_observed_worktree_head,
+        )
+        object.__setattr__(self, "observed_branch", safe_observed_branch)
+        object.__setattr__(self, "branch_present", branch_present)
+        object.__setattr__(self, "target_present", target_present)
+        object.__setattr__(self, "registered", registered)
+
+    @property
+    def source_head_changed(self) -> RecoveryStatus:
+        """Derive whether the source HEAD differs from its expected identity."""
+
+        if self.observed_source_head is None:
+            return RecoveryStatus.UNKNOWN
+        if self.observed_source_head == self.expected_source_head:
+            return RecoveryStatus.NO
+        return RecoveryStatus.YES
+
+    @property
+    def worktree_head_changed(self) -> RecoveryStatus:
+        """Derive whether the worktree HEAD differs from its expected identity."""
+
+        if self.observed_worktree_head is None:
+            return RecoveryStatus.UNKNOWN
+        if self.observed_worktree_head == self.expected_worktree_head:
             return RecoveryStatus.NO
         return RecoveryStatus.YES
 

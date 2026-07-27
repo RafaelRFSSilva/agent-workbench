@@ -10,10 +10,16 @@ from agent_workbench.recovery import (
     IsolatedCommitRecoveryEvidence,
     IsolatedCommitRecoveryPhase,
     RecoveryStatus,
+    WorktreeRecoveryEvidence,
+    WorktreeRecoveryPhase,
 )
 
 EXPECTED_HEAD = "a" * 40
 CHANGED_HEAD = "b" * 40
+SOURCE_HEAD = "c" * 40
+WORKTREE_HEAD = "d" * 40
+CHANGED_SOURCE_HEAD = "e" * 40
+CHANGED_WORKTREE_HEAD = "f" * 40
 
 
 def recovery_evidence(
@@ -34,6 +40,28 @@ def recovery_evidence(
     }
     values.update(overrides)
     return IsolatedCommitRecoveryEvidence(**values)  # type: ignore[arg-type]
+
+
+def worktree_recovery_evidence(
+    **overrides: object,
+) -> WorktreeRecoveryEvidence:
+    """Create one valid worktree lifecycle recovery evidence object."""
+
+    values: dict[str, object] = {
+        "phase": WorktreeRecoveryPhase.CREATION,
+        "target_display": "../isolated",
+        "expected_branch": "agent/task",
+        "expected_source_head": SOURCE_HEAD,
+        "observed_source_head": SOURCE_HEAD,
+        "expected_worktree_head": WORKTREE_HEAD,
+        "observed_worktree_head": WORKTREE_HEAD,
+        "observed_branch": "agent/task",
+        "branch_present": RecoveryStatus.YES,
+        "target_present": RecoveryStatus.YES,
+        "registered": RecoveryStatus.YES,
+    }
+    values.update(overrides)
+    return WorktreeRecoveryEvidence(**values)  # type: ignore[arg-type]
 
 
 def test_preserves_valid_recovery_evidence() -> None:
@@ -251,3 +279,164 @@ def test_rejects_inconsistent_index_and_path_evidence(
             index_dirty=index_dirty,
             staged_paths=staged_paths,
         )
+
+
+def test_preserves_valid_worktree_recovery_evidence() -> None:
+    """Preserve exact safe lifecycle identities and observations."""
+
+    evidence = worktree_recovery_evidence()
+
+    assert evidence.phase is WorktreeRecoveryPhase.CREATION
+    assert evidence.target_display == "../isolated"
+    assert evidence.expected_branch == "agent/task"
+    assert evidence.expected_source_head == SOURCE_HEAD
+    assert evidence.observed_source_head == SOURCE_HEAD
+    assert evidence.expected_worktree_head == WORKTREE_HEAD
+    assert evidence.observed_worktree_head == WORKTREE_HEAD
+    assert evidence.observed_branch == "agent/task"
+    assert evidence.branch_present is RecoveryStatus.YES
+    assert evidence.target_present is RecoveryStatus.YES
+    assert evidence.registered is RecoveryStatus.YES
+    assert evidence.source_head_changed is RecoveryStatus.NO
+    assert evidence.worktree_head_changed is RecoveryStatus.NO
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [
+        WorktreeRecoveryPhase.CREATION,
+        WorktreeRecoveryPhase.REMOVAL,
+        WorktreeRecoveryPhase.REMOVAL_VERIFICATION,
+    ],
+)
+def test_accepts_every_worktree_recovery_phase(
+    phase: WorktreeRecoveryPhase,
+) -> None:
+    """Represent each current mutating worktree lifecycle boundary."""
+
+    evidence = worktree_recovery_evidence(phase=phase)
+
+    assert evidence.phase is phase
+
+
+def test_derives_changed_worktree_recovery_heads() -> None:
+    """Derive changed source and worktree identities from observations."""
+
+    evidence = worktree_recovery_evidence(
+        observed_source_head=CHANGED_SOURCE_HEAD,
+        observed_worktree_head=CHANGED_WORKTREE_HEAD,
+    )
+
+    assert evidence.source_head_changed is RecoveryStatus.YES
+    assert evidence.worktree_head_changed is RecoveryStatus.YES
+
+
+def test_derives_unknown_worktree_recovery_heads() -> None:
+    """Represent unavailable identities without inventing Git state."""
+
+    evidence = worktree_recovery_evidence(
+        observed_source_head=None,
+        observed_worktree_head=None,
+        observed_branch=None,
+        branch_present=RecoveryStatus.UNKNOWN,
+        target_present=RecoveryStatus.UNKNOWN,
+        registered=RecoveryStatus.UNKNOWN,
+    )
+
+    assert evidence.observed_source_head is None
+    assert evidence.observed_worktree_head is None
+    assert evidence.observed_branch is None
+    assert evidence.source_head_changed is RecoveryStatus.UNKNOWN
+    assert evidence.worktree_head_changed is RecoveryStatus.UNKNOWN
+
+
+def test_worktree_recovery_evidence_is_frozen_slotted_and_hashable() -> None:
+    """Provide immutable value semantics without exposing instance storage."""
+
+    first = worktree_recovery_evidence()
+    second = worktree_recovery_evidence()
+
+    assert first == second
+    assert hash(first) == hash(second)
+    assert len({first, second}) == 1
+    assert not hasattr(first, "__dict__")
+
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        first.target_display = "../changed"  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("phase", "creation"),
+        ("branch_present", "yes"),
+        ("target_present", "no"),
+        ("registered", "unknown"),
+    ],
+)
+def test_rejects_non_enum_worktree_recovery_values(
+    field: str,
+    value: object,
+) -> None:
+    """Require closed enum values for lifecycle phase and observations."""
+
+    with pytest.raises(ConfigurationError):
+        worktree_recovery_evidence(**{field: value})
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("expected_source_head", ""),
+        ("expected_source_head", "a" * 39),
+        ("expected_worktree_head", "z" * 40),
+        ("observed_source_head", "b" * 41),
+        ("observed_worktree_head", "not-an-object-id"),
+    ],
+)
+def test_rejects_invalid_worktree_recovery_heads(
+    field: str,
+    value: str,
+) -> None:
+    """Require complete SHA-1 or SHA-256 lifecycle identities."""
+
+    with pytest.raises(ConfigurationError, match="HEAD"):
+        worktree_recovery_evidence(**{field: value})
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("target_display", "/tmp/isolated"),
+        ("target_display", "C:\\isolated"),
+        ("target_display", "target\nother"),
+        ("expected_branch", ""),
+        ("expected_branch", "agent/task\nother"),
+        ("observed_branch", "agent/task\0other"),
+    ],
+)
+def test_rejects_unsafe_worktree_recovery_identity(
+    field: str,
+    value: str,
+) -> None:
+    """Reject unsafe target or branch identity evidence."""
+
+    with pytest.raises(ConfigurationError):
+        worktree_recovery_evidence(**{field: value})
+
+
+def test_accepts_sha256_worktree_recovery_heads() -> None:
+    """Support repositories using complete SHA-256 object identifiers."""
+
+    source_head = "1" * 64
+    worktree_head = "2" * 64
+
+    evidence = worktree_recovery_evidence(
+        expected_source_head=source_head,
+        observed_source_head=source_head,
+        expected_worktree_head=worktree_head,
+        observed_worktree_head=worktree_head,
+    )
+
+    assert evidence.source_head_changed is RecoveryStatus.NO
+    assert evidence.worktree_head_changed is RecoveryStatus.NO
