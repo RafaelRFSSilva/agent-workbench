@@ -13,6 +13,11 @@ import threading
 from typing import cast
 
 from agent_workbench.errors import CompletionError, ConfigurationError
+from agent_workbench.recovery import (
+    RecoveryStatus,
+    WorktreeRecoveryEvidence,
+    WorktreeRecoveryPhase,
+)
 from agent_workbench.tools import (
     JSONObject,
     JSONValue,
@@ -365,14 +370,35 @@ def create_git_worktree(
             ),
         )
     except ConfigurationError:
-        raise CompletionError(_creation_failure_message(plan)) from None
+        raise CompletionError(
+            _worktree_failure_message(
+                plan,
+                "Git worktree creation failed; partial state was preserved "
+                "for manual recovery",
+                WorktreeRecoveryPhase.CREATION,
+            )
+        ) from None
     if outcome.returncode != 0:
-        raise CompletionError(_creation_failure_message(plan))
+        raise CompletionError(
+            _worktree_failure_message(
+                plan,
+                "Git worktree creation failed; partial state was preserved "
+                "for manual recovery",
+                WorktreeRecoveryPhase.CREATION,
+            )
+        ) from None
 
     try:
         _verify_created_worktree(plan)
     except (CompletionError, ConfigurationError):
-        raise CompletionError(_creation_failure_message(plan)) from None
+        raise CompletionError(
+            _worktree_failure_message(
+                plan,
+                "Git worktree creation failed; partial state was preserved "
+                "for manual recovery",
+                WorktreeRecoveryPhase.CREATION,
+            )
+        ) from None
 
     return WorktreeHandle._validated(
         source_repository=plan.source_repository,
@@ -447,21 +473,33 @@ def remove_git_worktree(
         )
     except ConfigurationError:
         raise CompletionError(
-            "Clean worktree removal failed; remaining state was preserved "
-            "for manual recovery."
+            _worktree_failure_message(
+                plan,
+                "Clean worktree removal failed; remaining state was preserved "
+                "for manual recovery",
+                WorktreeRecoveryPhase.REMOVAL,
+            )
         ) from None
     if outcome.returncode != 0:
         raise CompletionError(
-            "Clean worktree removal failed; remaining state was preserved "
-            "for manual recovery."
+            _worktree_failure_message(
+                plan,
+                "Clean worktree removal failed; remaining state was preserved "
+                "for manual recovery",
+                WorktreeRecoveryPhase.REMOVAL,
+            )
         )
 
     try:
         _verify_removed_worktree(plan)
     except (CompletionError, ConfigurationError):
         raise CompletionError(
-            "Worktree removal verification was ambiguous; remaining state "
-            "was preserved for manual recovery."
+            _worktree_failure_message(
+                plan,
+                "Worktree removal verification was ambiguous; remaining state "
+                "was preserved for manual recovery",
+                WorktreeRecoveryPhase.REMOVAL_VERIFICATION,
+            )
         ) from None
 
 
@@ -674,48 +712,157 @@ def _find_worktree_record(
     return matches[0] if matches else None
 
 
-def _creation_failure_message(plan: WorktreePlan) -> str:
-    """Describe safe partial creation state without destructive cleanup."""
+def _collect_worktree_recovery_evidence(
+    plan: WorktreePlan | WorktreeRemovalPlan,
+    phase: WorktreeRecoveryPhase,
+) -> WorktreeRecoveryEvidence:
+    """Collect conservative read-only evidence after a lifecycle failure."""
 
-    branch_state = "unknown"
-    target_state = "unknown"
-    registered_state = "unknown"
+    if isinstance(plan, WorktreePlan):
+        target_path = plan.target_path
+        expected_worktree_head = plan.source_head
+    elif isinstance(plan, WorktreeRemovalPlan):
+        target_path = plan.worktree_path
+        expected_worktree_head = plan.worktree_head
+    else:
+        raise ConfigurationError(
+            "worktree recovery evidence requires a worktree lifecycle plan."
+        )
+
+    observed_source_head: str | None = None
+    observed_worktree_head: str | None = None
+    observed_branch: str | None = None
+
+    branch_present = RecoveryStatus.UNKNOWN
+    target_present = RecoveryStatus.UNKNOWN
+    registered = RecoveryStatus.UNKNOWN
+
     try:
-        branch_state = (
-            "present"
-            if _branch_exists(plan.source_repository, plan.branch_name)
-            else "absent"
+        source_output = _run_git(
+            plan.source_repository,
+            ("rev-parse", "--verify", "HEAD^{commit}"),
+        )
+        source_head = source_output.stdout.strip()
+        if source_output.returncode == 0 and _is_full_object_id(source_head):
+            observed_source_head = source_head
+    except (CompletionError, ConfigurationError):
+        pass
+
+    try:
+        branch_present = (
+            RecoveryStatus.YES
+            if _branch_exists(
+                plan.source_repository,
+                plan.branch_name,
+            )
+            else RecoveryStatus.NO
         )
     except (CompletionError, ConfigurationError):
         pass
+
     try:
-        os.lstat(plan.target_path)
+        os.lstat(target_path)
     except FileNotFoundError:
-        target_state = "absent"
+        target_present = RecoveryStatus.NO
     except OSError:
         pass
     else:
-        target_state = "present"
+        target_present = RecoveryStatus.YES
+
+    record: _WorktreeRecord | None = None
+
     try:
-        output = _run_git(
+        worktree_output = _run_git(
             plan.source_repository,
             ("worktree", "list", "--porcelain", "-z"),
         )
-        if output.returncode == 0:
-            records = _parse_worktree_records(output.stdout)
-            registered_state = (
-                "present"
-                if _find_worktree_record(records, plan.target_path) is not None
-                else "absent"
-            )
+        if worktree_output.returncode == 0:
+            records = _parse_worktree_records(worktree_output.stdout)
+            record = _find_worktree_record(records, target_path)
+            registered = RecoveryStatus.YES if record is not None else RecoveryStatus.NO
     except (CompletionError, ConfigurationError):
         pass
 
+    if record is not None:
+        if record.head is not None and _is_full_object_id(record.head):
+            observed_worktree_head = record.head
+
+        branch_prefix = "refs/heads/"
+        if (
+            record.branch is not None
+            and record.branch.startswith(branch_prefix)
+            and record.branch != branch_prefix
+        ):
+            observed_branch = record.branch.removeprefix(branch_prefix)
+
+    if target_present is RecoveryStatus.YES:
+        try:
+            observed_worktree_head = _worktree_head(target_path)
+        except (CompletionError, ConfigurationError):
+            pass
+
+        try:
+            observed_branch = _worktree_branch(target_path)
+        except (CompletionError, ConfigurationError):
+            pass
+
+    try:
+        return WorktreeRecoveryEvidence(
+            phase=phase,
+            target_display=plan.target_display,
+            expected_branch=plan.branch_name,
+            expected_source_head=plan.source_head,
+            observed_source_head=observed_source_head,
+            expected_worktree_head=expected_worktree_head,
+            observed_worktree_head=observed_worktree_head,
+            observed_branch=observed_branch,
+            branch_present=branch_present,
+            target_present=target_present,
+            registered=registered,
+        )
+    except ConfigurationError:
+        return WorktreeRecoveryEvidence(
+            phase=phase,
+            target_display=plan.target_display,
+            expected_branch=plan.branch_name,
+            expected_source_head=plan.source_head,
+            observed_source_head=None,
+            expected_worktree_head=expected_worktree_head,
+            observed_worktree_head=None,
+            observed_branch=None,
+            branch_present=RecoveryStatus.UNKNOWN,
+            target_present=RecoveryStatus.UNKNOWN,
+            registered=RecoveryStatus.UNKNOWN,
+        )
+
+
+def _worktree_failure_message(
+    plan: WorktreePlan | WorktreeRemovalPlan,
+    reason: str,
+    phase: WorktreeRecoveryPhase,
+) -> str:
+    """Format safe lifecycle recovery evidence without performing cleanup."""
+
+    evidence = _collect_worktree_recovery_evidence(
+        plan,
+        phase,
+    )
+
+    presence_labels = {
+        RecoveryStatus.UNKNOWN: "unknown",
+        RecoveryStatus.NO: "absent",
+        RecoveryStatus.YES: "present",
+    }
+
     return (
-        "Git worktree creation failed; partial state was preserved for manual "
-        f"recovery (branch {plan.branch_name}: {branch_state}; target "
-        f"{plan.target_display}: {target_state}; registered: "
-        f"{registered_state})."
+        f"{reason} "
+        f"(branch {evidence.expected_branch}: "
+        f"{presence_labels[evidence.branch_present]}; "
+        f"target {evidence.target_display}: "
+        f"{presence_labels[evidence.target_present]}; "
+        f"registered: {presence_labels[evidence.registered]}; "
+        f"source HEAD changed: {evidence.source_head_changed.value}; "
+        f"worktree HEAD changed: {evidence.worktree_head_changed.value})."
     )
 
 

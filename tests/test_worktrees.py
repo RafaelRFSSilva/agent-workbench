@@ -8,7 +8,8 @@ import subprocess
 
 import pytest
 
-from agent_workbench.errors import ConfigurationError
+from agent_workbench.errors import CompletionError, ConfigurationError
+from agent_workbench.recovery import RecoveryStatus, WorktreeRecoveryPhase
 from agent_workbench.tools import ToolApprovalDecision
 from agent_workbench.worktrees import (
     WorktreeAction,
@@ -61,6 +62,20 @@ def assert_plan_error(
 
     assert str(source.resolve(strict=False)) not in str(raised.value)
     assert str(target.resolve(strict=False)) not in str(raised.value)
+
+
+def capture_worktree_recovery_phases(monkeypatch, module):
+    """Record the lifecycle recovery phase supplied by one failure."""
+
+    phases: list[WorktreeRecoveryPhase] = []
+    original = module._worktree_failure_message
+
+    def capture(plan, reason, phase):
+        phases.append(phase)
+        return original(plan, reason, phase)
+
+    monkeypatch.setattr(module, "_worktree_failure_message", capture)
+    return phases
 
 
 def test_plan_is_immutable_slotted_safe_and_deterministic(tmp_path: Path) -> None:
@@ -745,6 +760,7 @@ def test_creation_failure_reports_partial_state_without_cleanup(
     plan = plan_git_worktree(source, "agent/partial", target)
     from agent_workbench import worktrees
 
+    phases = capture_worktree_recovery_phases(monkeypatch, worktrees)
     original = worktrees._run_git
 
     def fail_creation(repository, arguments):
@@ -788,6 +804,7 @@ def test_creation_failure_reports_partial_state_without_cleanup(
         "refs/heads/agent/partial",
         check=False,
     ).returncode == (1 if partial == "target" else 0)
+    assert phases == [WorktreeRecoveryPhase.CREATION]
 
 
 def test_inspection_reports_clean_and_all_dirty_entry_classes(
@@ -1027,6 +1044,8 @@ def test_removal_command_failure_preserves_worktree_without_force(
     removal = plan_git_worktree_removal(handle)
     from agent_workbench import worktrees
 
+    phases = capture_worktree_recovery_phases(monkeypatch, worktrees)
+
     original = worktrees._run_git
     mutation_arguments = []
 
@@ -1047,3 +1066,148 @@ def test_removal_command_failure_preserves_worktree_without_force(
     ]
     assert "--force" not in mutation_arguments[0]
     assert "agent/task" in run_git(source, "branch", "--list", "agent/task").stdout
+    assert phases == [WorktreeRecoveryPhase.REMOVAL]
+
+
+def test_removal_verification_failure_reports_observed_absent_state(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Report the state left after removal succeeds but verification fails."""
+
+    source, _, handle = create_approved_worktree(tmp_path)
+    removal = plan_git_worktree_removal(handle)
+    from agent_workbench import worktrees
+
+    phases = capture_worktree_recovery_phases(monkeypatch, worktrees)
+
+    def fail_verification(_plan):
+        raise CompletionError("injected removal verification failure")
+
+    monkeypatch.setattr(
+        worktrees,
+        "_verify_removed_worktree",
+        fail_verification,
+    )
+
+    with pytest.raises(CompletionError, match="manual recovery") as raised:
+        remove_git_worktree(removal, approve_worktree)
+
+    message = str(raised.value)
+    assert "branch agent/task: present" in message
+    assert "target ../isolated: absent" in message
+    assert "registered: absent" in message
+    assert "source HEAD changed: no" in message
+    assert "worktree HEAD changed: unknown" in message
+    assert not handle.worktree_path.exists()
+    assert (
+        "agent/task"
+        in run_git(
+            source,
+            "branch",
+            "--list",
+            "agent/task",
+        ).stdout
+    )
+    assert phases == [WorktreeRecoveryPhase.REMOVAL_VERIFICATION]
+
+
+def test_collects_real_worktree_lifecycle_recovery_evidence(
+    tmp_path: Path,
+) -> None:
+    """Capture structured evidence from one real registered worktree."""
+
+    source, _, handle = create_approved_worktree(tmp_path)
+    removal = plan_git_worktree_removal(handle)
+    from agent_workbench import worktrees
+
+    evidence = worktrees._collect_worktree_recovery_evidence(
+        removal,
+        WorktreeRecoveryPhase.REMOVAL,
+    )
+
+    assert evidence.phase is WorktreeRecoveryPhase.REMOVAL
+    assert evidence.target_display == handle.target_display
+    assert evidence.expected_branch == handle.branch_name
+    assert evidence.expected_source_head == removal.source_head
+    assert evidence.observed_source_head == removal.source_head
+    assert evidence.expected_worktree_head == removal.worktree_head
+    assert evidence.observed_worktree_head == removal.worktree_head
+    assert evidence.observed_branch == handle.branch_name
+    assert evidence.branch_present is RecoveryStatus.YES
+    assert evidence.target_present is RecoveryStatus.YES
+    assert evidence.registered is RecoveryStatus.YES
+    assert evidence.source_head_changed is RecoveryStatus.NO
+    assert evidence.worktree_head_changed is RecoveryStatus.NO
+    assert str(source.resolve()) not in repr(evidence)
+    assert str(handle.worktree_path) not in repr(evidence)
+
+
+def test_collects_post_removal_worktree_recovery_evidence(
+    tmp_path: Path,
+) -> None:
+    """Capture branch preservation and absent removed worktree state."""
+
+    source, _, handle = create_approved_worktree(tmp_path)
+    removal = plan_git_worktree_removal(handle)
+    run_git(
+        source,
+        "worktree",
+        "remove",
+        str(handle.worktree_path),
+    )
+    from agent_workbench import worktrees
+
+    evidence = worktrees._collect_worktree_recovery_evidence(
+        removal,
+        WorktreeRecoveryPhase.REMOVAL_VERIFICATION,
+    )
+
+    assert evidence.observed_source_head == removal.source_head
+    assert evidence.observed_worktree_head is None
+    assert evidence.observed_branch is None
+    assert evidence.branch_present is RecoveryStatus.YES
+    assert evidence.target_present is RecoveryStatus.NO
+    assert evidence.registered is RecoveryStatus.NO
+    assert evidence.source_head_changed is RecoveryStatus.NO
+    assert evidence.worktree_head_changed is RecoveryStatus.UNKNOWN
+
+
+def test_collects_unknown_worktree_recovery_state_when_inspection_fails(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Represent unavailable lifecycle facts without inventing state."""
+
+    _, _, handle = create_approved_worktree(tmp_path)
+    removal = plan_git_worktree_removal(handle)
+    from agent_workbench import worktrees
+
+    monkeypatch.setattr(
+        worktrees,
+        "_run_git",
+        lambda *_args, **_kwargs: worktrees._GitOutput(
+            2,
+            "",
+            "injected inspection failure",
+        ),
+    )
+
+    def fail_lstat(_path):
+        raise OSError("injected target inspection failure")
+
+    monkeypatch.setattr(worktrees.os, "lstat", fail_lstat)
+
+    evidence = worktrees._collect_worktree_recovery_evidence(
+        removal,
+        WorktreeRecoveryPhase.REMOVAL,
+    )
+
+    assert evidence.observed_source_head is None
+    assert evidence.observed_worktree_head is None
+    assert evidence.observed_branch is None
+    assert evidence.branch_present is RecoveryStatus.UNKNOWN
+    assert evidence.target_present is RecoveryStatus.UNKNOWN
+    assert evidence.registered is RecoveryStatus.UNKNOWN
+    assert evidence.source_head_changed is RecoveryStatus.UNKNOWN
+    assert evidence.worktree_head_changed is RecoveryStatus.UNKNOWN
