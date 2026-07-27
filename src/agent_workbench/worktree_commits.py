@@ -1,0 +1,1211 @@
+"""Validated planning for approved commits inside isolated Git worktrees."""
+
+from collections.abc import Sequence
+from dataclasses import dataclass, field
+import difflib
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import signal
+import stat
+import subprocess
+import threading
+from typing import cast
+
+from agent_workbench.errors import CompletionError, ConfigurationError
+from agent_workbench.tools import JSONObject
+from agent_workbench.worktrees import WorktreeHandle, inspect_git_worktree
+
+MAX_COMMIT_FILE_BYTES = 100 * 1024
+"""Maximum old or current bytes accepted for one committed file."""
+
+MAX_COMMIT_FILE_CHANGED_LINES = 500
+"""Maximum removed and added lines accepted for one committed file."""
+
+MAX_COMMIT_FILES = 32
+"""Maximum number of paths accepted by one isolated commit."""
+
+MAX_COMMIT_OLD_BYTES = 1024 * 1024
+"""Maximum combined old tracked bytes accepted by one isolated commit."""
+
+MAX_COMMIT_CURRENT_BYTES = 1024 * 1024
+"""Maximum combined current bytes accepted by one isolated commit."""
+
+MAX_COMMIT_CHANGED_LINES = 4_000
+"""Maximum combined removed and added lines accepted by one commit."""
+
+MAX_COMMIT_PREVIEW_BYTES = 512 * 1024
+"""Maximum encoded complete approval preview size."""
+
+MAX_COMMIT_MESSAGE_BYTES = 4 * 1024
+"""Maximum exact UTF-8 commit-message size."""
+
+GIT_COMMIT_TIMEOUT_SECONDS = 5
+"""Maximum duration for one fixed planning Git command."""
+
+MAX_COMMIT_GIT_OUTPUT_BYTES = 2 * 1024 * 1024
+"""Maximum retained bytes for each Git output stream."""
+
+_SAFE_GIT_CONFIG = (
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "core.fsmonitor=false",
+)
+_IN_PROGRESS_GIT_PATHS = (
+    "MERGE_HEAD",
+    "CHERRY_PICK_HEAD",
+    "REVERT_HEAD",
+    "BISECT_LOG",
+    "rebase-merge",
+    "rebase-apply",
+    "sequencer",
+    "index.lock",
+)
+_ZERO_OBJECT_IDS = {"0" * 40, "0" * 64}
+
+
+@dataclass(frozen=True, slots=True)
+class _CommitChange:
+    """Store one immutable exact changed-file snapshot."""
+
+    path: str
+    operation: str
+    old_content: bytes = field(repr=False)
+    current_content: bytes = field(repr=False)
+    old_mode: int | None
+    current_mode: int
+    changed_lines: int
+    diff: str = field(repr=False)
+
+    @property
+    def old_size_bytes(self) -> int:
+        """Return the exact old byte count."""
+
+        return len(self.old_content)
+
+    @property
+    def new_size_bytes(self) -> int:
+        """Return the exact current byte count."""
+
+        return len(self.current_content)
+
+    def preview(self) -> JSONObject:
+        """Return deterministic safe complete change metadata."""
+
+        return {
+            "path": self.path,
+            "operation": self.operation,
+            "old_size_bytes": self.old_size_bytes,
+            "new_size_bytes": self.new_size_bytes,
+            "changed_lines": self.changed_lines,
+            "diff": self.diff,
+        }
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class IsolatedCommitPlan:
+    """Pin one completely validated isolated local commit request."""
+
+    worktree: WorktreeHandle = field(repr=False)
+    old_head: str
+    source_head: str
+    source_branch: str
+    branch_name: str
+    commit_message: str = field(repr=False)
+    paths: tuple[str, ...]
+    operation_count: int
+    added_count: int
+    modified_count: int
+    total_old_size_bytes: int
+    total_new_size_bytes: int
+    total_changed_lines: int
+    diff_fingerprint: str
+    _author_name: str = field(repr=False)
+    _author_email: str = field(repr=False)
+    _changes: tuple[_CommitChange, ...] = field(repr=False)
+    _preview_json: str = field(repr=False)
+
+    def __init__(self) -> None:
+        """Prevent callers from constructing an unvalidated plan."""
+
+        raise ConfigurationError(
+            "isolated commit plans must be created by plan_isolated_commit."
+        )
+
+    @classmethod
+    def _validated(
+        cls,
+        *,
+        worktree: WorktreeHandle,
+        old_head: str,
+        source_head: str,
+        source_branch: str,
+        branch_name: str,
+        commit_message: str,
+        author_name: str,
+        author_email: str,
+        changes: tuple[_CommitChange, ...],
+        diff_fingerprint: str,
+        preview_json: str,
+    ) -> "IsolatedCommitPlan":
+        """Construct one plan from values fully validated in this module."""
+
+        plan = object.__new__(cls)
+        added_count = sum(change.operation == "add" for change in changes)
+        modified_count = sum(change.operation == "modify" for change in changes)
+        values = {
+            "worktree": worktree,
+            "old_head": old_head,
+            "source_head": source_head,
+            "source_branch": source_branch,
+            "branch_name": branch_name,
+            "commit_message": commit_message,
+            "paths": tuple(change.path for change in changes),
+            "operation_count": len(changes),
+            "added_count": added_count,
+            "modified_count": modified_count,
+            "total_old_size_bytes": sum(change.old_size_bytes for change in changes),
+            "total_new_size_bytes": sum(change.new_size_bytes for change in changes),
+            "total_changed_lines": sum(change.changed_lines for change in changes),
+            "diff_fingerprint": diff_fingerprint,
+            "_author_name": author_name,
+            "_author_email": author_email,
+            "_changes": changes,
+            "_preview_json": preview_json,
+        }
+        for name, value in values.items():
+            object.__setattr__(plan, name, value)
+        return plan
+
+    @property
+    def preview(self) -> JSONObject:
+        """Return an independent copy of the complete safe approval preview."""
+
+        return cast(JSONObject, json.loads(self._preview_json))
+
+
+@dataclass(frozen=True, slots=True)
+class _GitOutput:
+    """Store bounded exact output from one fixed Git command."""
+
+    returncode: int
+    stdout: bytes
+    stderr: bytes
+
+
+@dataclass(slots=True)
+class _BoundedCapture:
+    """Drain one process stream while retaining a bounded byte prefix."""
+
+    content: bytearray = field(default_factory=bytearray)
+    truncated: bool = False
+    failure: Exception | None = None
+
+    def read(self, stream) -> None:
+        """Drain one stream without retaining bytes beyond the safe limit."""
+
+        try:
+            while chunk := stream.read(8192):
+                remaining = MAX_COMMIT_GIT_OUTPUT_BYTES - len(self.content)
+                if remaining > 0:
+                    self.content.extend(chunk[:remaining])
+                if len(chunk) > remaining:
+                    self.truncated = True
+        except Exception as error:
+            self.failure = error
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+
+def plan_isolated_commit(
+    worktree: WorktreeHandle,
+    commit_message: str,
+) -> IsolatedCommitPlan:
+    """Validate and snapshot every eligible change in one isolated worktree."""
+
+    if not isinstance(worktree, WorktreeHandle):
+        raise ConfigurationError(
+            "isolated commit planning requires a verified WorktreeHandle."
+        )
+    if worktree.worktree_path == worktree.source_repository:
+        raise ConfigurationError(
+            "isolated commit planning cannot use the primary working tree."
+        )
+
+    message = _validate_commit_message(commit_message)
+    state = _inspect_commit_worktree(worktree)
+    author_name = _read_local_identity(worktree.worktree_path, "user.name")
+    author_email = _read_local_identity(worktree.worktree_path, "user.email")
+    _reject_in_progress_operation(worktree.worktree_path)
+    _require_clean_index(worktree.worktree_path)
+    changes = _collect_changes(worktree.worktree_path, state.head)
+    _validate_complete_limits(changes)
+
+    fingerprint = _fingerprint(
+        worktree=worktree,
+        old_head=state.head,
+        source_branch=state.source_branch,
+        commit_message=message,
+        author_name=author_name,
+        author_email=author_email,
+        changes=changes,
+    )
+    preview = _build_preview(
+        branch_name=worktree.branch_name,
+        old_head=state.head,
+        commit_message=message,
+        changes=changes,
+        fingerprint=fingerprint,
+    )
+    preview_json = _serialize_preview(preview)
+
+    return IsolatedCommitPlan._validated(
+        worktree=worktree,
+        old_head=state.head,
+        source_head=worktree.source_head,
+        source_branch=state.source_branch,
+        branch_name=worktree.branch_name,
+        commit_message=message,
+        author_name=author_name,
+        author_email=author_email,
+        changes=changes,
+        diff_fingerprint=fingerprint,
+        preview_json=preview_json,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _CommitWorktreeState:
+    """Store verified identities required for immutable planning."""
+
+    head: str
+    source_branch: str
+
+
+def _inspect_commit_worktree(worktree: WorktreeHandle) -> _CommitWorktreeState:
+    """Revalidate linked-worktree identity and capture primary branch state."""
+
+    try:
+        state = inspect_git_worktree(worktree)
+    except ConfigurationError:
+        raise ConfigurationError(
+            "isolated commit source repository or handle is invalid."
+        ) from None
+    except CompletionError:
+        raise ConfigurationError(
+            "isolated commit worktree identity or branch is invalid."
+        ) from None
+    if (
+        not state.registered
+        or state.branch_name != worktree.branch_name
+        or worktree.worktree_path == worktree.source_repository
+    ):
+        raise ConfigurationError(
+            "isolated commit worktree registration or branch is invalid."
+        )
+
+    top_level = _run_git(
+        worktree.worktree_path,
+        ("rev-parse", "--show-toplevel"),
+    )
+    if top_level.returncode != 0:
+        raise ConfigurationError("isolated commit worktree is unavailable.")
+    try:
+        reported = Path(_decode_line(top_level.stdout, "worktree top-level")).resolve(
+            strict=True
+        )
+    except (FileNotFoundError, OSError, RuntimeError):
+        raise ConfigurationError("isolated commit worktree is unavailable.") from None
+    if reported != worktree.worktree_path:
+        raise ConfigurationError("isolated commit worktree identity is invalid.")
+
+    branch = _read_symbolic_branch(worktree.worktree_path)
+    if branch != worktree.branch_name:
+        raise ConfigurationError("isolated commit worktree branch is invalid.")
+    head = _read_head(worktree.worktree_path)
+    if head != state.head:
+        raise ConfigurationError("isolated commit worktree HEAD is ambiguous.")
+
+    source_branch = _read_symbolic_branch(worktree.source_repository)
+    source_head = _read_head(worktree.source_repository)
+    if source_head != worktree.source_head:
+        raise ConfigurationError("isolated commit source HEAD has changed.")
+    _reject_in_progress_operation(worktree.source_repository)
+    _require_no_upstream(worktree.worktree_path)
+    return _CommitWorktreeState(head=head, source_branch=source_branch)
+
+
+def _validate_commit_message(message: object) -> str:
+    """Validate an exact bounded message without rewriting it."""
+
+    if not isinstance(message, str):
+        raise ConfigurationError("commit message must be a string.")
+    if not message.strip():
+        raise ConfigurationError("commit message must not be blank.")
+    if message.startswith("-"):
+        raise ConfigurationError("commit message must not begin with '-'.")
+    if "\0" in message:
+        raise ConfigurationError("commit message must not contain NUL.")
+    try:
+        encoded = message.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ConfigurationError("commit message must be valid UTF-8.") from None
+    if len(encoded) > MAX_COMMIT_MESSAGE_BYTES:
+        raise ConfigurationError(
+            f"commit message exceeds the {MAX_COMMIT_MESSAGE_BYTES}-byte limit."
+        )
+    return message
+
+
+def _read_local_identity(repository: Path, key: str) -> str:
+    """Return one safe exact repository-local identity value."""
+
+    output = _run_git(repository, ("config", "--local", "--get", key))
+    if output.returncode != 0:
+        raise ConfigurationError(
+            "isolated commit requires repository-local author identity."
+        )
+    value = _decode_line(output.stdout, "repository-local identity")
+    if not value or any(
+        ord(character) < 32 or ord(character) == 127 for character in value
+    ):
+        raise ConfigurationError(
+            "repository-local author identity is missing or invalid."
+        )
+    return value
+
+
+def _read_symbolic_branch(repository: Path) -> str:
+    """Return one attached local branch or reject detached state."""
+
+    output = _run_git(
+        repository,
+        ("symbolic-ref", "--quiet", "--short", "HEAD"),
+    )
+    if output.returncode != 0:
+        raise ConfigurationError(
+            "isolated commit requires the expected attached local branch."
+        )
+    branch = _decode_line(output.stdout, "Git branch")
+    if not branch:
+        raise ConfigurationError(
+            "isolated commit requires the expected attached local branch."
+        )
+    return branch
+
+
+def _read_head(repository: Path) -> str:
+    """Return one complete verified commit identifier."""
+
+    output = _run_git(
+        repository,
+        ("rev-parse", "--verify", "HEAD^{commit}"),
+    )
+    head = _decode_line(output.stdout, "Git HEAD") if output.returncode == 0 else ""
+    if not _is_full_object_id(head):
+        raise ConfigurationError("isolated commit requires a valid HEAD.")
+    return head
+
+
+def _require_no_upstream(worktree: Path) -> None:
+    """Require the isolated branch to remain local-only."""
+
+    output = _run_git(
+        worktree,
+        (
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{upstream}",
+        ),
+    )
+    if output.returncode == 0:
+        raise ConfigurationError("isolated commit branch must not have an upstream.")
+    if output.returncode not in (1, 128):
+        raise ConfigurationError("unable to inspect isolated commit upstream.")
+
+
+def _reject_in_progress_operation(repository: Path) -> None:
+    """Reject known in-progress Git operation state without reading it."""
+
+    for name in _IN_PROGRESS_GIT_PATHS:
+        output = _run_git(repository, ("rev-parse", "--git-path", name))
+        if output.returncode != 0:
+            raise ConfigurationError("unable to inspect Git operation state.")
+        try:
+            git_path = Path(_decode_line(output.stdout, "Git operation path"))
+            if not git_path.is_absolute():
+                git_path = repository / git_path
+            if os.path.lexists(git_path):
+                raise ConfigurationError(
+                    "isolated commit cannot run during a Git operation."
+                )
+        except OSError:
+            raise ConfigurationError("unable to inspect Git operation state.") from None
+
+
+def _require_clean_index(worktree: Path) -> None:
+    """Reject every pre-existing staged, intent-to-add, or unmerged entry."""
+
+    staged = _run_git(
+        worktree,
+        ("diff", "--cached", "--quiet", "--no-ext-diff", "--"),
+    )
+    if staged.returncode == 1:
+        raise ConfigurationError(
+            "isolated commit requires a completely clean real index."
+        )
+    if staged.returncode != 0:
+        raise ConfigurationError("unable to inspect the isolated commit index.")
+
+    entries = _run_git(worktree, ("ls-files", "--stage", "-z"))
+    if entries.returncode != 0:
+        raise ConfigurationError("unable to inspect the isolated commit index.")
+    for entry in entries.stdout.split(b"\0"):
+        if not entry:
+            continue
+        metadata, separator, _path = entry.partition(b"\t")
+        parts = metadata.split()
+        if not separator or len(parts) != 3:
+            raise ConfigurationError("isolated commit index state is invalid.")
+        try:
+            object_id = parts[1].decode("ascii")
+            stage = int(parts[2])
+        except (UnicodeDecodeError, ValueError):
+            raise ConfigurationError(
+                "isolated commit index state is invalid."
+            ) from None
+        if object_id in _ZERO_OBJECT_IDS or stage != 0:
+            raise ConfigurationError(
+                "isolated commit requires a completely clean real index."
+            )
+
+
+def _collect_changes(
+    worktree: Path,
+    old_head: str,
+) -> tuple[_CommitChange, ...]:
+    """Collect every eligible working-tree change in deterministic order."""
+
+    ignored = _run_git(
+        worktree,
+        ("ls-files", "--others", "--ignored", "--exclude-standard", "-z"),
+    )
+    if ignored.returncode != 0:
+        raise ConfigurationError("unable to inspect ignored worktree paths.")
+    if ignored.stdout:
+        raise ConfigurationError(
+            "isolated commit planning rejects ignored worktree files."
+        )
+
+    status_output = _run_git(
+        worktree,
+        ("status", "--porcelain=v1", "-z", "--untracked-files=all"),
+    )
+    if status_output.returncode != 0:
+        raise ConfigurationError("unable to inspect isolated commit changes.")
+    status_entries = _parse_status(status_output.stdout)
+    _reject_unreported_unsafe_entries(
+        worktree,
+        tuple(raw_path for _status, raw_path in status_entries),
+    )
+    if not status_entries:
+        raise ConfigurationError(
+            "isolated commit requires at least one eligible change."
+        )
+
+    changes = []
+    canonical_paths: set[Path] = set()
+    for status_code, raw_path in status_entries:
+        relative_path, target = _resolve_changed_path(worktree, raw_path)
+        canonical = target.resolve(strict=True)
+        if canonical in canonical_paths:
+            raise ConfigurationError("isolated commit paths are ambiguous.")
+        canonical_paths.add(canonical)
+        if status_code == "??":
+            change = _prepare_added_change(relative_path, target)
+        elif status_code == " M":
+            change = _prepare_modified_change(
+                worktree,
+                old_head,
+                relative_path,
+                target,
+            )
+        else:
+            raise ConfigurationError(
+                "isolated commit contains an unsupported change type."
+            )
+        changes.append(change)
+    return tuple(sorted(changes, key=lambda change: change.path))
+
+
+def _reject_unreported_unsafe_entries(
+    worktree: Path,
+    reported_paths: tuple[bytes, ...],
+) -> None:
+    """Cross-check Git status so special or ambiguous paths are never omitted."""
+
+    tracked_output = _run_git(worktree, ("ls-files", "-z"))
+    if tracked_output.returncode != 0:
+        raise ConfigurationError("unable to enumerate tracked worktree paths.")
+    try:
+        tracked = {
+            path.decode("utf-8") for path in tracked_output.stdout.split(b"\0") if path
+        }
+        reported = {path.decode("utf-8") for path in reported_paths}
+    except UnicodeDecodeError:
+        raise ConfigurationError("isolated commit paths must be valid UTF-8.") from None
+
+    try:
+        for directory, directory_names, file_names in os.walk(
+            worktree,
+            followlinks=False,
+        ):
+            parent = Path(directory)
+            if parent == worktree and ".git" in directory_names:
+                directory_names.remove(".git")
+            for name in tuple(directory_names):
+                candidate = parent / name
+                relative = candidate.relative_to(worktree).as_posix()
+                if candidate.is_symlink():
+                    directory_names.remove(name)
+                    if relative not in tracked:
+                        raise ConfigurationError(
+                            "isolated commit contains an unreported unsafe path."
+                        )
+            for name in file_names:
+                candidate = parent / name
+                relative = candidate.relative_to(worktree).as_posix()
+                if relative == ".git" or relative in tracked or relative in reported:
+                    continue
+                candidate_status = os.lstat(candidate)
+                if not stat.S_ISREG(candidate_status.st_mode):
+                    raise ConfigurationError(
+                        "isolated commit supports regular files only."
+                    )
+                raise ConfigurationError(
+                    "isolated commit contains an unreported changed path."
+                )
+    except ConfigurationError:
+        raise
+    except (OSError, UnicodeError, ValueError):
+        raise ConfigurationError(
+            "unable to enumerate isolated commit paths safely."
+        ) from None
+
+
+def _parse_status(output: bytes) -> tuple[tuple[str, bytes], ...]:
+    """Parse exact NUL-delimited porcelain entries and reject ambiguity."""
+
+    entries = output.split(b"\0")
+    parsed = []
+    index = 0
+    while index < len(entries):
+        entry = entries[index]
+        index += 1
+        if not entry:
+            continue
+        if len(entry) < 4 or entry[2:3] != b" ":
+            raise ConfigurationError("isolated commit Git status is invalid.")
+        try:
+            status_code = entry[:2].decode("ascii")
+        except UnicodeDecodeError:
+            raise ConfigurationError("isolated commit Git status is invalid.") from None
+        path = entry[3:]
+        if status_code[0] not in (" ", "?"):
+            raise ConfigurationError(
+                "isolated commit requires a completely clean real index."
+            )
+        if status_code == " A":
+            raise ConfigurationError(
+                "isolated commit requires a completely clean real index."
+            )
+        if status_code not in (" M", "??"):
+            if "U" in status_code:
+                raise ConfigurationError(
+                    "isolated commit rejects conflicted or unmerged paths."
+                )
+            raise ConfigurationError(
+                "isolated commit contains an unsupported change type."
+            )
+        parsed.append((status_code, path))
+    return tuple(parsed)
+
+
+def _resolve_changed_path(worktree: Path, raw_path: bytes) -> tuple[str, Path]:
+    """Return one safe canonical workspace-relative path and target."""
+
+    try:
+        decoded = raw_path.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ConfigurationError("isolated commit paths must be valid UTF-8.") from None
+    if not decoded or any(
+        ord(character) < 32 or ord(character) == 127 for character in decoded
+    ):
+        raise ConfigurationError("isolated commit path is unsafe.")
+    pure = PurePosixPath(decoded)
+    if (
+        pure.is_absolute()
+        or not pure.parts
+        or any(part in ("", ".", "..") for part in pure.parts)
+        or ".git" in pure.parts
+        or pure.parts[0].startswith(("-", ":"))
+    ):
+        raise ConfigurationError("isolated commit path is unsafe.")
+
+    target = worktree.joinpath(*pure.parts)
+    current = worktree
+    for part in pure.parts[:-1]:
+        current /= part
+        try:
+            current_status = os.lstat(current)
+        except OSError:
+            raise ConfigurationError("isolated commit path is unavailable.") from None
+        if not stat.S_ISDIR(current_status.st_mode) or stat.S_ISLNK(
+            current_status.st_mode
+        ):
+            raise ConfigurationError("isolated commit path has an unsafe parent.")
+    try:
+        target_status = os.lstat(target)
+        if stat.S_ISLNK(target_status.st_mode):
+            raise ConfigurationError("isolated commit symlinks are unsupported.")
+        canonical = target.resolve(strict=True)
+        canonical.relative_to(worktree)
+    except ConfigurationError:
+        raise
+    except (FileNotFoundError, OSError, RuntimeError, ValueError):
+        raise ConfigurationError(
+            "isolated commit path is unavailable or external."
+        ) from None
+    if canonical != target:
+        raise ConfigurationError("isolated commit symlinks are unsupported.")
+    return pure.as_posix(), target
+
+
+def _prepare_added_change(relative_path: str, target: Path) -> _CommitChange:
+    """Snapshot one new untracked regular UTF-8 file."""
+
+    current_content, current_mode = _read_regular_file(target)
+    current_text = _decode_file_content(current_content)
+    changed_lines = _count_changed_lines("", current_text)
+    _validate_file_limits(
+        old_content=b"",
+        current_content=current_content,
+        changed_lines=changed_lines,
+    )
+    return _CommitChange(
+        path=relative_path,
+        operation="add",
+        old_content=b"",
+        current_content=current_content,
+        old_mode=None,
+        current_mode=current_mode,
+        changed_lines=changed_lines,
+        diff=_create_unified_diff(
+            relative_path,
+            "",
+            current_text,
+            operation="add",
+        ),
+    )
+
+
+def _prepare_modified_change(
+    worktree: Path,
+    old_head: str,
+    relative_path: str,
+    target: Path,
+) -> _CommitChange:
+    """Snapshot one modified tracked regular UTF-8 file."""
+
+    old_mode, object_id = _read_index_entry(worktree, relative_path)
+    if old_mode not in (0o100644, 0o100755):
+        raise ConfigurationError(
+            "isolated commit contains an unsupported tracked file type."
+        )
+    old_output = _run_git(worktree, ("cat-file", "blob", object_id))
+    if old_output.returncode != 0:
+        raise ConfigurationError("unable to read tracked commit content.")
+    old_content = old_output.stdout
+    current_content, current_mode = _read_regular_file(target)
+    if current_mode != old_mode:
+        raise ConfigurationError(
+            "isolated commit contains an unsupported mode or executable-bit change."
+        )
+    old_text = _decode_file_content(old_content)
+    current_text = _decode_file_content(current_content)
+    if old_content == current_content:
+        raise ConfigurationError(
+            "isolated commit contains an unsupported mode-only change."
+        )
+    head_output = _run_git(
+        worktree,
+        ("rev-parse", "--verify", f"{old_head}:{relative_path}"),
+    )
+    if (
+        head_output.returncode != 0
+        or _decode_line(head_output.stdout, "tracked object") != object_id
+    ):
+        raise ConfigurationError("tracked commit content is ambiguous.")
+    changed_lines = _count_changed_lines(old_text, current_text)
+    _validate_file_limits(
+        old_content=old_content,
+        current_content=current_content,
+        changed_lines=changed_lines,
+    )
+    return _CommitChange(
+        path=relative_path,
+        operation="modify",
+        old_content=old_content,
+        current_content=current_content,
+        old_mode=old_mode,
+        current_mode=current_mode,
+        changed_lines=changed_lines,
+        diff=_create_unified_diff(
+            relative_path,
+            old_text,
+            current_text,
+            operation="modify",
+        ),
+    )
+
+
+def _read_index_entry(worktree: Path, relative_path: str) -> tuple[int, str]:
+    """Return one exact stage-zero tracked index entry."""
+
+    output = _run_git(
+        worktree,
+        ("ls-files", "--stage", "-z", "--", relative_path),
+    )
+    entries = [entry for entry in output.stdout.split(b"\0") if entry]
+    if output.returncode != 0 or len(entries) != 1:
+        raise ConfigurationError("tracked commit index entry is invalid.")
+    metadata, separator, path = entries[0].partition(b"\t")
+    parts = metadata.split()
+    if not separator or path != relative_path.encode() or len(parts) != 3:
+        raise ConfigurationError("tracked commit index entry is invalid.")
+    try:
+        mode = int(parts[0], 8)
+        object_id = parts[1].decode("ascii")
+        stage = int(parts[2])
+    except (UnicodeDecodeError, ValueError):
+        raise ConfigurationError("tracked commit index entry is invalid.") from None
+    if stage != 0 or not _is_full_object_id(object_id):
+        raise ConfigurationError("tracked commit index entry is invalid.")
+    return mode, object_id
+
+
+def _read_regular_file(target: Path) -> tuple[bytes, int]:
+    """Read one bounded regular file without following it or racing identity."""
+
+    try:
+        target_status = os.lstat(target)
+    except OSError:
+        raise ConfigurationError("isolated commit file is unavailable.") from None
+    if not stat.S_ISREG(target_status.st_mode) or stat.S_ISLNK(target_status.st_mode):
+        raise ConfigurationError("isolated commit supports regular files only.")
+    if target_status.st_size > MAX_COMMIT_FILE_BYTES:
+        raise ConfigurationError(
+            f"isolated commit file exceeds the {MAX_COMMIT_FILE_BYTES}-byte limit."
+        )
+
+    descriptor: int | None = None
+    try:
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(target, flags)
+        opened_status = os.fstat(descriptor)
+        if (
+            opened_status.st_dev,
+            opened_status.st_ino,
+        ) != (
+            target_status.st_dev,
+            target_status.st_ino,
+        ):
+            raise ConfigurationError("isolated commit file changed while reading.")
+        with os.fdopen(descriptor, "rb") as source:
+            descriptor = None
+            content = source.read(MAX_COMMIT_FILE_BYTES + 1)
+    except ConfigurationError:
+        raise
+    except OSError:
+        raise ConfigurationError("unable to read isolated commit file.") from None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    if len(content) > MAX_COMMIT_FILE_BYTES:
+        raise ConfigurationError(
+            f"isolated commit file exceeds the {MAX_COMMIT_FILE_BYTES}-byte limit."
+        )
+    file_mode = stat.S_IMODE(target_status.st_mode)
+    git_mode = 0o100755 if file_mode & 0o111 else 0o100644
+    return content, git_mode
+
+
+def _decode_file_content(content: bytes) -> str:
+    """Decode strict UTF-8 text and reject NUL bytes."""
+
+    if b"\0" in content:
+        raise ConfigurationError("isolated commit files must not contain NUL.")
+    try:
+        return content.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ConfigurationError(
+            "isolated commit files must contain valid UTF-8."
+        ) from None
+
+
+def _validate_file_limits(
+    *,
+    old_content: bytes,
+    current_content: bytes,
+    changed_lines: int,
+) -> None:
+    """Apply exact per-file content and change limits."""
+
+    if (
+        len(old_content) > MAX_COMMIT_FILE_BYTES
+        or len(current_content) > MAX_COMMIT_FILE_BYTES
+    ):
+        raise ConfigurationError(
+            f"isolated commit file exceeds the {MAX_COMMIT_FILE_BYTES}-byte limit."
+        )
+    if changed_lines > MAX_COMMIT_FILE_CHANGED_LINES:
+        raise ConfigurationError(
+            "isolated commit file exceeds the "
+            f"{MAX_COMMIT_FILE_CHANGED_LINES}-changed-line limit."
+        )
+
+
+def _validate_complete_limits(changes: tuple[_CommitChange, ...]) -> None:
+    """Apply complete-plan path, byte, and line limits."""
+
+    if not changes:
+        raise ConfigurationError(
+            "isolated commit requires at least one eligible change."
+        )
+    if len(changes) > MAX_COMMIT_FILES:
+        raise ConfigurationError(
+            f"isolated commit exceeds the {MAX_COMMIT_FILES}-file limit."
+        )
+    old_bytes = sum(change.old_size_bytes for change in changes)
+    if old_bytes > MAX_COMMIT_OLD_BYTES:
+        raise ConfigurationError(
+            f"isolated commit exceeds the {MAX_COMMIT_OLD_BYTES}-old-byte limit."
+        )
+    current_bytes = sum(change.new_size_bytes for change in changes)
+    if current_bytes > MAX_COMMIT_CURRENT_BYTES:
+        raise ConfigurationError(
+            "isolated commit exceeds the "
+            f"{MAX_COMMIT_CURRENT_BYTES}-current-byte limit."
+        )
+    changed_lines = sum(change.changed_lines for change in changes)
+    if changed_lines > MAX_COMMIT_CHANGED_LINES:
+        raise ConfigurationError(
+            "isolated commit exceeds the "
+            f"{MAX_COMMIT_CHANGED_LINES}-changed-line limit."
+        )
+
+
+def _count_changed_lines(old_content: str, new_content: str) -> int:
+    """Count removed and added lines deterministically."""
+
+    old_lines = old_content.splitlines()
+    new_lines = new_content.splitlines()
+    changed_lines = 0
+    for tag, old_start, old_end, new_start, new_end in difflib.SequenceMatcher(
+        None,
+        old_lines,
+        new_lines,
+        autojunk=False,
+    ).get_opcodes():
+        if tag != "equal":
+            changed_lines += old_end - old_start
+            changed_lines += new_end - new_start
+    return changed_lines
+
+
+def _create_unified_diff(
+    relative_path: str,
+    old_content: str,
+    new_content: str,
+    *,
+    operation: str,
+) -> str:
+    """Return one complete deterministic unified diff."""
+
+    from_file = "/dev/null" if operation == "add" else f"a/{relative_path}"
+    lines = difflib.unified_diff(
+        old_content.splitlines(keepends=True),
+        new_content.splitlines(keepends=True),
+        fromfile=from_file,
+        tofile=f"b/{relative_path}",
+        lineterm="\n",
+    )
+    complete_lines: list[str] = []
+    for line in lines:
+        complete_lines.append(line)
+        if not line.endswith("\n"):
+            complete_lines.append("\n\\ No newline at end of file\n")
+    return "".join(complete_lines)
+
+
+def _fingerprint(
+    *,
+    worktree: WorktreeHandle,
+    old_head: str,
+    source_branch: str,
+    commit_message: str,
+    author_name: str,
+    author_email: str,
+    changes: tuple[_CommitChange, ...],
+) -> str:
+    """Hash every approved identity, message, mode, byte, and diff snapshot."""
+
+    fingerprint_data = {
+        "source_head": worktree.source_head,
+        "source_branch": source_branch,
+        "old_head": old_head,
+        "branch": worktree.branch_name,
+        "commit_message": commit_message,
+        "author_name": author_name,
+        "author_email": author_email,
+        "changes": [
+            {
+                "path": change.path,
+                "operation": change.operation,
+                "old_sha256": hashlib.sha256(change.old_content).hexdigest(),
+                "current_sha256": hashlib.sha256(change.current_content).hexdigest(),
+                "old_mode": change.old_mode,
+                "current_mode": change.current_mode,
+                "changed_lines": change.changed_lines,
+                "diff": change.diff,
+            }
+            for change in changes
+        ],
+    }
+    encoded = json.dumps(
+        fingerprint_data,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _build_preview(
+    *,
+    branch_name: str,
+    old_head: str,
+    commit_message: str,
+    changes: tuple[_CommitChange, ...],
+    fingerprint: str,
+) -> JSONObject:
+    """Build one complete deterministic operator-safe preview."""
+
+    added_count = sum(change.operation == "add" for change in changes)
+    modified_count = sum(change.operation == "modify" for change in changes)
+    return {
+        "action": "create_isolated_commit",
+        "branch": branch_name,
+        "old_head": old_head,
+        "commit_message": commit_message,
+        "operation_count": len(changes),
+        "added_count": added_count,
+        "modified_count": modified_count,
+        "total_old_size_bytes": sum(change.old_size_bytes for change in changes),
+        "total_new_size_bytes": sum(change.new_size_bytes for change in changes),
+        "total_changed_lines": sum(change.changed_lines for change in changes),
+        "paths": [change.path for change in changes],
+        "changes": [change.preview() for change in changes],
+        "diff_fingerprint": fingerprint,
+        "command": (
+            "git add -- <approved paths> && "
+            "git commit --no-verify --no-gpg-sign --file=-"
+        ),
+        "guarantees": [
+            "local isolated branch only",
+            "no amend",
+            "no merge",
+            "no push",
+            "no branch deletion",
+        ],
+    }
+
+
+def _serialize_preview(preview: JSONObject) -> str:
+    """Serialize and bound one complete untruncated preview."""
+
+    preview_json = json.dumps(
+        preview,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    if len(preview_json.encode("utf-8")) > MAX_COMMIT_PREVIEW_BYTES:
+        raise ConfigurationError(
+            "isolated commit complete preview exceeds the "
+            f"{MAX_COMMIT_PREVIEW_BYTES}-byte limit."
+        )
+    return preview_json
+
+
+def _decode_line(content: bytes, context: str) -> str:
+    """Decode one deterministic UTF-8 line without normalizing its value."""
+
+    try:
+        decoded = content.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ConfigurationError(f"{context} is not valid UTF-8.") from None
+    if decoded.endswith("\n"):
+        decoded = decoded[:-1]
+    if "\n" in decoded or "\r" in decoded or "\0" in decoded:
+        raise ConfigurationError(f"{context} is invalid.")
+    return decoded
+
+
+def _is_full_object_id(value: str) -> bool:
+    """Return whether a value is a complete SHA-1 or SHA-256 object id."""
+
+    return len(value) in (40, 64) and all(
+        character in "0123456789abcdef" for character in value
+    )
+
+
+def _git_environment() -> dict[str, str]:
+    """Return a fixed local-only Git environment without parent secrets."""
+
+    return {
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_EXTERNAL_DIFF": "",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_TERMINAL_PROMPT": "0",
+        "HOME": "/nonexistent",
+        "LC_ALL": "C",
+        "PATH": "/usr/bin:/bin",
+        "XDG_CONFIG_HOME": "/nonexistent",
+    }
+
+
+def _run_git(
+    repository: Path,
+    arguments: Sequence[str],
+    *,
+    input_bytes: bytes | None = None,
+) -> _GitOutput:
+    """Run one fixed non-shell Git command with bounded exact output."""
+
+    command = [
+        "git",
+        "-C",
+        str(repository),
+        *_SAFE_GIT_CONFIG,
+        *arguments,
+    ]
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=repository,
+            env=_git_environment(),
+            shell=False,
+            stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+    except FileNotFoundError:
+        raise ConfigurationError("Git executable is unavailable.") from None
+    except OSError:
+        raise ConfigurationError("unable to start Git command.") from None
+
+    if process.stdout is None or process.stderr is None:
+        _terminate_process_group(process)
+        raise ConfigurationError("unable to capture Git command output.")
+
+    stdout_capture = _BoundedCapture()
+    stderr_capture = _BoundedCapture()
+    stdout_thread = threading.Thread(
+        target=stdout_capture.read,
+        args=(process.stdout,),
+        daemon=True,
+    )
+    stderr_thread = threading.Thread(
+        target=stderr_capture.read,
+        args=(process.stderr,),
+        daemon=True,
+    )
+    stdout_thread.start()
+    stderr_thread.start()
+
+    if input_bytes is not None:
+        if process.stdin is None:
+            _terminate_process_group(process)
+            raise ConfigurationError("unable to supply Git command input.")
+        try:
+            process.stdin.write(input_bytes)
+            process.stdin.close()
+        except OSError:
+            _terminate_process_group(process)
+            raise ConfigurationError("unable to supply Git command input.") from None
+
+    timed_out = False
+    try:
+        process.wait(timeout=GIT_COMMIT_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        _terminate_process_group(process)
+
+    stdout_thread.join(timeout=1)
+    stderr_thread.join(timeout=1)
+    if stdout_thread.is_alive() or stderr_thread.is_alive():
+        _terminate_process_group(process)
+        process.stdout.close()
+        process.stderr.close()
+        stdout_thread.join(timeout=1)
+        stderr_thread.join(timeout=1)
+
+    if timed_out:
+        raise ConfigurationError("Git command timed out.")
+    if stdout_capture.failure is not None or stderr_capture.failure is not None:
+        raise ConfigurationError("unable to capture Git command output.")
+    if stdout_thread.is_alive() or stderr_thread.is_alive():
+        raise ConfigurationError("unable to capture Git command output.")
+    if stdout_capture.truncated or stderr_capture.truncated:
+        raise ConfigurationError("Git command output exceeds the safe limit.")
+
+    return _GitOutput(
+        returncode=process.returncode,
+        stdout=bytes(stdout_capture.content),
+        stderr=bytes(stderr_capture.content),
+    )
+
+
+def _terminate_process_group(process) -> None:
+    """Terminate and reap one isolated Git process group."""
+
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        pass
+    try:
+        process.wait(timeout=1)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        raise ConfigurationError("unable to terminate Git command.") from None
