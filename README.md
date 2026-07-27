@@ -31,6 +31,8 @@ Implemented capabilities:
   workspace inspection, and explicitly approved controlled workspace actions.
 - Provider-independent `AgentSession` identity, lifecycle, transactional
   conversation ownership, and synchronous direct or tool-enabled sends.
+- Immutable provider-independent `TaskSpec` metadata with ordered acceptance
+  criteria and optional read-only attachment to an `AgentSession`.
 - Reusable `AgentSession` construction from resolved runtime configuration,
   including providers and deterministic optional tool registries.
 - Supervised local Git worktree isolation with separately approved creation,
@@ -622,6 +624,7 @@ Existing environment variables are not overwritten by `.env`.
 | [Agent Profiles](docs/agent-profiles.md) | Built-in and custom roles |
 | [Context Files](docs/context-files.md) | Attachments and future workspace context |
 | [Structured Outputs](docs/structured-outputs.md) | JSON Schema response configuration |
+| [Task Specifications](docs/task-specifications.md) | Immutable objectives, acceptance criteria, and session task metadata |
 | [Product Vision](docs/product-vision.md) | Multi-agent VS Code workspace and voice input |
 | [Project Configuration](docs/project-configuration.md) | `.agent-workbench/`, skills, commands, and MCP |
 | [Roadmap](docs/roadmap.md) | Completed and planned milestones |
@@ -641,16 +644,18 @@ Completed foundations:
 - [x] Provider-independent tool calling, calculator, safe workspace
   inspection, and controlled approved coding actions.
 - [x] Provider-independent AgentSession and reusable runtime factory.
+- [x] Provider-independent immutable task specifications and optional
+  `AgentSession` task metadata.
 - [x] Supervised worktree isolation and approved exact local commits.
 
 Next milestones:
 
-- [ ] Local project retrieval and RAG.
-- [ ] Multi-agent orchestration.
-- [ ] Project configuration and MCP.
+- [ ] Crash-safe transaction and worktree lifecycle recovery.
+- [ ] Deletion and rename transactions with explicit conflict handling.
+- [ ] Local project retrieval and project configuration.
+- [ ] Task lifecycle, assignment, dependencies, and multi-agent orchestration.
 - [ ] Terminal and VS Code interfaces.
-- [ ] Voice prompt input.
-- [ ] Evaluation, persistence, and AWS deployment.
+- [ ] Voice input, evaluation, persistence, MCP, and AWS deployment.
 
 See the complete [Roadmap](docs/roadmap.md).
 

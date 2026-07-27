@@ -1219,6 +1219,7 @@ AgentSession
 ├── ContextDocument tuple
 ├── GenerationConfig
 ├── optional JSONResponseFormat
+├── optional TaskSpec metadata
 ├── optional ToolRegistry
 ├── maximum tool rounds
 ├── owned successful Message history
@@ -1233,6 +1234,15 @@ configured provider rather than duplicated. Context, generation, response
 format, and ordered tool definitions are forwarded through the existing
 `ChatRequest` contract on every turn.
 
+`TaskSpec` provides optional immutable session metadata containing one exact
+objective and an ordered tuple of acceptance criteria. The public
+`AgentSession.task_spec` property is read-only and defaults to `None`.
+
+The task specification is not currently forwarded through `ChatRequest`,
+inserted into prompts, translated by provider adapters, evaluated by the tool
+loop, or used to control session lifecycle. Those behaviors belong to future
+task orchestration rather than the base session boundary.
+
 The synchronous `send()` operation rejects blank content and re-entrant sends,
 sets the status to `completing`, and selects direct provider completion or the
 existing `run_tool_calling_loop()`. It forwards the maximum-round limit and an
@@ -1245,11 +1255,12 @@ tool-loop, maximum-round, or observer exceptions leave prior history unchanged,
 set `failed`, and propagate unchanged. A later successful send is allowed and
 returns the session to `ready`.
 
-The base session boundary does not add task models, task assignment, multiple
-simultaneous sessions, orchestration, persistence, serialization, concurrency,
-cancellation, asynchronous APIs, RAG, MCP, VS Code, or voice input. The
-additive isolated-session factory binds one such session to one validated
-worktree without changing `AgentSession` itself.
+The base session boundary now supports optional immutable `TaskSpec` metadata,
+but it does not implement task assignment, task lifecycle, dependencies,
+acceptance evaluation, multiple simultaneous sessions, orchestration,
+persistence, serialization, concurrency, cancellation, asynchronous APIs, RAG,
+MCP, VS Code, or voice input. The additive isolated-session factory binds one
+such session to one validated worktree without changing those boundaries.
 
 ## Orchestration Boundary
 
