@@ -368,8 +368,9 @@ rounds are not persisted across separate user turns.
 
 ### Read-Only Workspace Tools
 
-Authorize one workspace explicitly with `--workspace` to expose `list_files`
-and `read_file`; no workspace tools are available without it:
+Authorize one workspace explicitly with `--workspace` to expose `list_files`,
+`read_file`, `search_text`, `inspect_git_status`, and `inspect_git_diff`; no
+workspace tools are available without it:
 
 ```bash
 uv run agent-workbench \
@@ -379,7 +380,8 @@ uv run agent-workbench \
 ```
 
 Combine it with `--enable-tools` to expose all tools in deterministic order:
-`calculator`, `list_files`, then `read_file`.
+`calculator`, `list_files`, `read_file`, `search_text`, `inspect_git_status`,
+then `inspect_git_diff`.
 
 ```bash
 uv run agent-workbench \
@@ -394,8 +396,28 @@ paths, traversal, prefix-confusion paths, and symlinks escaping the root are
 rejected; symlinks that resolve within the root remain available. `list_files`
 returns sorted direct children, including hidden entries, with a 128-entry
 limit. `read_file` returns UTF-8 files up to 100 KiB using canonical relative
-paths. These tools are read-only: they do not edit, delete, search recursively,
-glob, access the network, or use MCP.
+paths.
+
+`search_text` performs literal recursive search in deterministic
+workspace-relative order, including hidden entries but never following
+directory symlinks. It skips invalid UTF-8 safely and is bounded to a
+256-character query, 512 files, 100 KiB per file, 256 matching lines, and
+1,000 returned characters per line; its `truncated` result indicates a limit.
+
+Git inspection uses only fixed non-shell commands: status is equivalent to
+`git status --short --branch`, while diff returns separate unstaged and staged
+fixed-command output. Commands have a three-second timeout, disable external
+diff helpers, and limit combined returned diff output to 100 KiB.
+
+Use `--show-tool-traces` with active tools to display compact deterministic
+JSON invocation and result records before the final response. Traces are
+opt-in, redact read content and absolute paths, and are not placed in
+conversation history.
+
+These tools are read-only: they do not edit, delete, glob, access the network,
+or use MCP. `search_symbols`, writes, arbitrary command execution, and
+filesystem race protection between resolution and later access remain future
+work.
 
 See [Architecture](docs/architecture.md) for the shared tool models and
 provider translations.

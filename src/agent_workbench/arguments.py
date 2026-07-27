@@ -46,6 +46,7 @@ class CLIArguments:
     response_format_file: Path | None = None
     enable_tools: bool = False
     workspace_root: Path | None = None
+    show_tool_traces: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +62,7 @@ class RuntimeConfiguration:
     response_format: JSONResponseFormat | None = None
     enable_tools: bool = False
     workspace_root: Path | None = None
+    show_tool_traces: bool = False
 
 
 def _non_empty_model_name(value: str) -> str:
@@ -272,6 +274,12 @@ def parse_cli_arguments(
         help="Authorized workspace root for read-only tools.",
     )
 
+    parser.add_argument(
+        "--show-tool-traces",
+        action="store_true",
+        help="Display completed tool calls and results during the session.",
+    )
+
     parsed_arguments = parser.parse_args(argv)
 
     setup_conflicts = (
@@ -287,6 +295,7 @@ def parse_cli_arguments(
         or parsed_arguments.response_format_file is not None
         or parsed_arguments.enable_tools
         or parsed_arguments.workspace is not None
+        or parsed_arguments.show_tool_traces
     )
 
     if parsed_arguments.setup and setup_conflicts:
@@ -312,6 +321,7 @@ def parse_cli_arguments(
         response_format_file=parsed_arguments.response_format_file,
         enable_tools=parsed_arguments.enable_tools,
         workspace_root=parsed_arguments.workspace,
+        show_tool_traces=parsed_arguments.show_tool_traces,
     )
 
 
@@ -376,4 +386,5 @@ def resolve_runtime_configuration(
         response_format=response_format,
         enable_tools=arguments.enable_tools,
         workspace_root=arguments.workspace_root,
+        show_tool_traces=arguments.show_tool_traces,
     )

@@ -525,6 +525,7 @@ def test_tools_are_disabled_by_default() -> None:
 
     assert arguments.enable_tools is False
     assert arguments.workspace_root is None
+    assert arguments.show_tool_traces is False
 
 
 def test_parse_cli_arguments_accepts_workspace_paths() -> None:
@@ -545,6 +546,14 @@ def test_parse_cli_arguments_enables_built_in_tools() -> None:
     assert arguments.enable_tools is True
 
 
+def test_parse_cli_arguments_enables_tool_traces() -> None:
+    """Enable visible tool traces only through the explicit CLI flag."""
+
+    arguments = parse_cli_arguments(["--show-tool-traces"])
+
+    assert arguments.show_tool_traces is True
+
+
 def test_runtime_configuration_preserves_tool_enablement() -> None:
     """Carry the explicit tool setting into runtime configuration."""
 
@@ -557,6 +566,20 @@ def test_runtime_configuration_preserves_tool_enablement() -> None:
     )
 
     assert configuration.enable_tools is True
+
+
+def test_runtime_configuration_preserves_tool_trace_enablement() -> None:
+    """Carry the explicit trace setting into runtime configuration."""
+
+    configuration = resolve_runtime_configuration(
+        CLIArguments(
+            provider_name="ollama",
+            model_name="gpt-oss:20b",
+            show_tool_traces=True,
+        )
+    )
+
+    assert configuration.show_tool_traces is True
 
 
 def test_runtime_configuration_preserves_workspace_root() -> None:
@@ -618,6 +641,9 @@ def test_runtime_configuration_disables_tools_by_default() -> None:
         [
             "--workspace",
             "project",
+        ],
+        [
+            "--show-tool-traces",
         ],
     ],
 )
