@@ -7,7 +7,7 @@ from agent_workbench.errors import ConfigurationError
 from agent_workbench.messages import ToolInteractionRound
 from agent_workbench.session import AgentSession
 from agent_workbench.tasks import TaskSpec
-from agent_workbench.tools import ToolApprovalHandler
+from agent_workbench.tools import ToolApprovalHandler, ToolApprovalDecision
 from agent_workbench.tool_calling import ToolRoundObserver
 
 
@@ -101,6 +101,10 @@ def run_autonomous_coding_task(
         raise ConfigurationError("autonomous coding prompt must be a non-blank string.")
     if not callable(tool_approval_handler):
         raise ConfigurationError("autonomous coding requires a tool approval handler.")
+    if tool_round_observer is not None and not callable(tool_round_observer):
+        raise ConfigurationError(
+            "autonomous coding tool round observer must be callable."
+        )
 
     registry = session.tool_registry
     if registry is None:
@@ -122,25 +126,29 @@ def run_autonomous_coding_task(
         acceptance_criteria=acceptance_criteria,
     )
     observed_rounds: list[ToolInteractionRound] = []
+    approved_action_names: list[str] = []
 
     def observe_tool_round(round_: ToolInteractionRound) -> None:
         observed_rounds.append(round_)
         if tool_round_observer is not None:
             tool_round_observer(round_)
 
+    def handle_tool_approval(request):
+        decision = tool_approval_handler(request)
+
+        if decision is ToolApprovalDecision.APPROVE:
+            approved_action_names.append(request.invocation.tool_name)
+
+        return decision
+
     response = session.send(
         _build_coding_prompt(task_spec),
         tool_round_observer=observe_tool_round,
-        tool_approval_handler=tool_approval_handler,
+        tool_approval_handler=handle_tool_approval,
+        recover_approval_preview_errors=True,
     )
 
-    if tool_round_observer is not None and not callable(tool_round_observer):
-        raise ConfigurationError(
-            "autonomous coding tool round observer must be callable."
-        )
-
     executed_tool_names: list[str] = []
-    approved_action_names: list[str] = []
     validation_runs: list[ValidationRun] = []
 
     for round_ in observed_rounds:
@@ -150,9 +158,6 @@ def run_autonomous_coding_task(
             strict=True,
         ):
             executed_tool_names.append(invocation.tool_name)
-
-            if registry.requires_approval(invocation):
-                approved_action_names.append(invocation.tool_name)
 
             if invocation.tool_name in _VALIDATION_TOOL_NAMES:
                 validation_runs.append(
