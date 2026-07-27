@@ -33,6 +33,9 @@ Implemented capabilities:
   conversation ownership, and synchronous direct or tool-enabled sends.
 - Immutable provider-independent `TaskSpec` metadata with ordered acceptance
   criteria and optional read-only attachment to an `AgentSession`.
+- One-shot supervised autonomous coding tasks through `--task`, with bounded
+  tool rounds, explicit action approvals, validation evidence, final Git
+  inspection, and an optional completed-tool trace.
 - Reusable `AgentSession` construction from resolved runtime configuration,
   including providers and deterministic optional tool registries.
 - Supervised local Git worktree isolation with separately approved creation,
@@ -560,6 +563,41 @@ summarize the result. Do not commit or push.
 See [Architecture](docs/architecture.md) for the shared tool models and
 provider translations.
 
+## Run One Autonomous Coding Task
+
+Use `--task` to give the configured agent one development objective, allow it
+to inspect the authorized workspace, request approved changes, run validation,
+inspect the final Git state, report the result, and then exit:
+
+```bash
+uv run agent-workbench \
+  --provider ollama \
+  --model gpt-oss:20b \
+  --agent developer \
+  --workspace /path/to/project \
+  --enable-actions \
+  --show-tool-traces \
+  --task "Inspect the project, fix the defect with the smallest necessary change, run Ruff and pytest, inspect the final Git status and diff, and report the result."
+```
+
+`--task` requires both `--workspace` and `--enable-actions`. It cannot be
+combined with `--setup`.
+
+The coding loop is bounded by a fixed maximum number of tool rounds. The model
+may use the available read-only workspace tools, request structured file
+changes, run the fixed Ruff and pytest commands, and inspect Git status and
+diff. Every file change and validation command remains default-deny and
+requires approval for that exact invocation.
+
+`--show-tool-traces` displays each completed tool invocation and its redacted
+result while the task is running. Read file contents and absolute workspace
+paths are not displayed in traces.
+
+The task mode does not automatically commit, merge, push, delete files, rename
+files, install dependencies, run arbitrary shell commands, or access the public
+network. Model quality and adherence to instructions depend on the selected
+provider and model.
+
 ## Run in an Isolated Git Worktree
 
 Keep a clean primary repository untouched while the agent works on a new local
@@ -649,12 +687,13 @@ Completed foundations:
 - [x] Supervised worktree isolation and approved exact local commits.
 - [x] Provider-independent structured recovery evidence for isolated commit and
   worktree lifecycle failures, using conservative read-only Git inspection.
+- [x] Supervised autonomous coding loop: receive one development prompt,
+  inspect the workspace, perform approved bounded changes, run Ruff and pytest,
+  inspect the final Git status and diff, report structured validation evidence,
+  and exit.
 
 Next milestones:
 
-- [ ] Autonomous coding loop: receive one development prompt, inspect the
-  workspace, plan bounded changes, edit files, run validation, iterate after
-  failures, present the final diff, and create a commit after approval.
 - [ ] Persistent lifecycle records and crash-safe restart recovery.
 - [ ] Deletion and rename transactions with explicit conflict handling.
 - [ ] Local project retrieval and project configuration.
