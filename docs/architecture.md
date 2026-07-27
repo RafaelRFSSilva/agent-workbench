@@ -806,10 +806,11 @@ Provider adapters retain native protocol details:
 
 The CLI keeps tools opt-in. `--enable-tools` registers the safe synchronous
 calculator, while `--workspace PATH` authorizes the read-only `list_files` and
-`read_file`, `search_text`, `inspect_git_status`, and `inspect_git_diff` tools
-for one root. With both options, one registry is built in this order:
-`calculator`, `list_files`, `read_file`, `search_text`, `inspect_git_status`,
-`inspect_git_diff`. Without either option, no tool registry is created.
+`read_file`, `search_text`, `search_symbols`, `inspect_git_status`, and
+`inspect_git_diff` tools for one root. With both options, one registry is built
+in this order: `calculator`, `list_files`, `read_file`, `search_text`,
+`search_symbols`, `inspect_git_status`, `inspect_git_diff`. Without either
+option, no tool registry is created.
 `--show-tool-traces` adds an optional callback for completed provider-independent
 rounds; traces are compact JSON, redacted, and excluded from normal CLI history.
 Internal tool rounds remain inside a single loop and are not persisted in normal
@@ -841,18 +842,36 @@ only and caps content at 100 KiB. Both report canonical relative paths. They
 are read-only. `search_text` provides bounded literal recursive search of
 regular UTF-8 files in deterministic relative order, skips invalid UTF-8 and
 directory symlinks, and reports truncation at its query, file, byte, match, and
-line limits. Git inspection runs only fixed non-shell status and diff commands
-with external helpers disabled, a three-second timeout, and 100 KiB output
-limits; it separates unstaged and staged diff results. These tools do not
-provide globbing, network, MCP, write, deletion, or arbitrary execution
-capabilities.
+line limits.
+
+`search_symbols` parses Python with `ast.parse()` and never imports or executes
+inspected code. Lexical AST scope identifies classes, top-level and nested
+functions, asynchronous functions, methods, and nested classes. The portable
+kinds are `class`, `function`, and `method`; `any` is the unfiltered input
+value, and `is_async` independently identifies asynchronous functions and
+methods. Literal name and qualified-name matching is case-insensitive by
+default. Results are ordered by canonical relative path, line, and qualified
+name.
+
+Recursive symbol search includes hidden paths, skips directory symlinks, and
+deduplicates canonical files. Explicit internal file symlinks resolve to their
+canonical targets. Invalid UTF-8, `SyntaxError`, and oversized files are
+skipped with `files_skipped` during directory search and rejected safely when
+requested explicitly. Limits are 256 query characters, 512 Python files,
+100 KiB per file, 256 matches, and 512 qualified-name characters;
+`truncated` reports bounded file, match, or name handling.
+
+Git inspection runs only fixed non-shell status and diff commands with external
+helpers disabled, a three-second timeout, and 100 KiB output limits; it
+separates unstaged and staged diff results. These tools do not provide
+globbing, network, MCP, write, deletion, or arbitrary execution capabilities.
 
 Agents should not receive unrestricted access automatically. Filesystem race
 protection between resolution and later access is not yet guaranteed.
 
 Read access, write access, command execution, network access, and Git
-operations remain separate permissions. `search_symbols` and any mutable or
-arbitrary-command capability remain future work.
+operations remain separate permissions. Mutable or arbitrary-command
+capabilities remain future work.
 
 ## Agent Session Boundary
 
@@ -953,9 +972,10 @@ The current architecture does not yet provide:
 * Background execution.
 * Cloud deployment.
 
-The current tool implementation is synchronous and contains only the opt-in
-calculator. It does not include filesystem, network, MCP, asynchronous, or
-user-defined tools.
+The current tool implementation is synchronous and contains the opt-in
+calculator plus explicitly authorized read-only workspace inspection. It does
+not include writes, network, MCP, asynchronous execution, or user-defined
+tools.
 
 The presence of future-oriented abstractions in documentation does not imply
 that these capabilities are already implemented.

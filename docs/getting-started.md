@@ -513,11 +513,11 @@ uv run agent-workbench \
   --workspace .
 ```
 
-This exposes `list_files`, `read_file`, `search_text`, `inspect_git_status`,
-and `inspect_git_diff`. `list_files` returns sorted direct children only,
-including hidden entries, with file, directory, symlink, and other
-classifications; it refuses directories with more than 128 entries. `read_file`
-reads strict UTF-8 text up to 100 KiB and returns its canonical
+This exposes `list_files`, `read_file`, `search_text`, `search_symbols`,
+`inspect_git_status`, and `inspect_git_diff`. `list_files` returns sorted
+direct children only, including hidden entries, with file, directory, symlink,
+and other classifications; it refuses directories with more than 128 entries.
+`read_file` reads strict UTF-8 text up to 100 KiB and returns its canonical
 workspace-relative path.
 
 The workspace root and requested paths are resolved canonically. Absolute
@@ -528,6 +528,26 @@ files and directories, skips invalid UTF-8, and does not follow directory
 symlinks. It limits queries to 256 characters, inspects at most 512 files and
 100 KiB per file, returns at most 256 matching lines of 1,000 characters, and
 sets `truncated` when a limit applies.
+
+`search_symbols` is Python-only and parses source with the standard-library
+AST. It never imports or executes inspected modules. It finds classes,
+functions, asynchronous functions, methods, and nested definitions using a
+literal substring match against names and qualified names. Matching is
+case-insensitive by default. The valid `kind` filters are exactly `any`,
+`class`, `function`, and `method`; asynchronous functions and methods use
+`is_async=true` rather than a separate kind.
+
+Results use canonical workspace-relative paths and deterministic
+path/line/qualified-name ordering. Hidden Python files and directories are
+included, but recursive search does not follow directory symlinks. An
+explicitly requested internal Python file symlink resolves to its canonical
+target. Directory searches skip invalid UTF-8, invalid Python syntax, and
+oversized files; explicit file searches reject these conditions safely.
+
+Symbol queries are limited to 256 characters. One call inspects at most 512
+Python files of at most 100 KiB each, returns at most 256 matches, and returns
+qualified names up to 512 characters. `files_skipped` counts skipped files,
+while `truncated` reports file, match, or qualified-name limits.
 
 Git status and diff inspection use fixed non-shell commands only. Diff output
 separates unstaged from staged changes, disables external diff helpers, times
@@ -545,7 +565,8 @@ uv run agent-workbench \
 ```
 
 The combined registry is deterministic: `calculator`, `list_files`,
-`read_file`, `search_text`, `inspect_git_status`, then `inspect_git_diff`.
+`read_file`, `search_text`, `search_symbols`, `inspect_git_status`, then
+`inspect_git_diff`.
 
 Show completed calls and results without changing conversation history:
 
@@ -559,9 +580,9 @@ uv run agent-workbench \
 
 Traces are opt-in, compact deterministic JSON, and redact read content and
 absolute paths. Tool execution remains synchronous, and internal tool rounds
-are not persisted across separate CLI user turns. `search_symbols`, writes,
-arbitrary command execution, and filesystem race protection between path
-resolution and later access are not yet available.
+are not persisted across separate CLI user turns. Writes, arbitrary command
+execution, and filesystem race protection between path resolution and later
+access are not yet available.
 
 ## Configuration Precedence
 

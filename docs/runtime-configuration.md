@@ -724,9 +724,16 @@ Runtime configuration follows these security principles:
 - Automated tests use simulated provider clients.
 - Project files are not modified by runtime configuration.
 
-The `--workspace` option grants only the current read-only `list_files` and
-`read_file`, `search_text`, `inspect_git_status`, and `inspect_git_diff` tools.
-It does not grant write, delete, arbitrary command, network, or MCP access.
+The `--workspace` option grants only the current read-only `list_files`,
+`read_file`, `search_text`, `search_symbols`, `inspect_git_status`, and
+`inspect_git_diff` tools. They are registered in that order; when
+`--enable-tools` is also supplied, `calculator` comes first. `search_symbols`
+is Python-only, uses non-executing standard-library AST parsing, and reports
+asynchronous definitions through `is_async` while accepting only `any`,
+`class`, `function`, or `method` as its `kind`.
+
+Workspace authorization does not grant write, delete, arbitrary command,
+network, or MCP access.
 `--show-tool-traces` defaults to false and displays no output unless a tool
 registry is active. The prompt-based setup keeps its default workspace root of
 `None`; use direct CLI configuration to authorize a workspace.
