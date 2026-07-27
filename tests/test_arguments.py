@@ -524,6 +524,7 @@ def test_tools_are_disabled_by_default() -> None:
     arguments = parse_cli_arguments([])
 
     assert arguments.enable_tools is False
+    assert arguments.enable_actions is False
     assert arguments.workspace_root is None
     assert arguments.show_tool_traces is False
 
@@ -536,6 +537,47 @@ def test_parse_cli_arguments_accepts_workspace_paths() -> None:
 
     assert relative_arguments.workspace_root == Path("project")
     assert absolute_arguments.workspace_root == Path("/tmp/project")
+
+
+def test_parse_cli_arguments_enables_controlled_actions_with_workspace() -> None:
+    """Preserve explicit action authorization for relative and absolute roots."""
+
+    relative = parse_cli_arguments(["--workspace", "project", "--enable-actions"])
+    absolute = parse_cli_arguments(["--workspace", "/tmp/project", "--enable-actions"])
+
+    assert relative.enable_actions is True
+    assert relative.workspace_root == Path("project")
+    assert absolute.enable_actions is True
+    assert absolute.workspace_root == Path("/tmp/project")
+
+
+def test_runtime_configuration_requires_workspace_for_actions() -> None:
+    """Reject effectful tools without an explicit workspace boundary."""
+
+    with pytest.raises(ConfigurationError, match="requires --workspace"):
+        resolve_runtime_configuration(
+            CLIArguments(
+                provider_name="ollama",
+                model_name="gpt-oss:20b",
+                enable_actions=True,
+            )
+        )
+
+
+def test_runtime_configuration_preserves_action_enablement() -> None:
+    """Carry action authorization without callbacks or presentation state."""
+
+    configuration = resolve_runtime_configuration(
+        CLIArguments(
+            provider_name="ollama",
+            model_name="gpt-oss:20b",
+            workspace_root=Path("project"),
+            enable_actions=True,
+        )
+    )
+
+    assert configuration.enable_actions is True
+    assert configuration.workspace_root == Path("project")
 
 
 def test_parse_cli_arguments_enables_built_in_tools() -> None:
@@ -641,6 +683,9 @@ def test_runtime_configuration_disables_tools_by_default() -> None:
         [
             "--workspace",
             "project",
+        ],
+        [
+            "--enable-actions",
         ],
         [
             "--show-tool-traces",

@@ -225,6 +225,105 @@ def test_factory_builds_exact_deterministic_tool_registry(
         ] == expected_names
 
 
+@pytest.mark.parametrize(
+    ("enable_tools", "expected_names"),
+    [
+        (
+            False,
+            [
+                "list_files",
+                "read_file",
+                "search_text",
+                "search_symbols",
+                "inspect_git_status",
+                "inspect_git_diff",
+                "apply_file_patch",
+                "run_ruff_format",
+                "run_ruff_check",
+                "run_pytest",
+            ],
+        ),
+        (
+            True,
+            [
+                "calculator",
+                "list_files",
+                "read_file",
+                "search_text",
+                "search_symbols",
+                "inspect_git_status",
+                "inspect_git_diff",
+                "apply_file_patch",
+                "run_ruff_format",
+                "run_ruff_check",
+                "run_pytest",
+            ],
+        ),
+    ],
+)
+def test_factory_registers_actions_only_when_explicitly_authorized(
+    tmp_path,
+    enable_tools,
+    expected_names,
+) -> None:
+    """Append action tools in exact order after read-only workspace tools."""
+
+    session = create_agent_session(
+        SessionId("actions"),
+        configuration(
+            enable_tools=enable_tools,
+            enable_actions=True,
+            workspace_root=tmp_path,
+        ),
+    )
+
+    assert [item.name for item in session.tool_registry.definitions] == expected_names
+
+
+def test_factory_rejects_actions_without_workspace() -> None:
+    """Defend the reusable factory boundary from invalid direct configuration."""
+
+    with pytest.raises(ConfigurationError, match="require a workspace"):
+        create_agent_session(
+            SessionId("invalid-actions"),
+            configuration(enable_actions=True),
+        )
+
+
+def test_factory_uses_same_workspace_for_read_and_action_tools(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """Bind all workspace registrations to one canonical Workspace instance."""
+
+    from agent_workbench import session_factory
+
+    seen_workspaces = []
+    registrations = (
+        "register_workspace_tools",
+        "register_symbol_tools",
+        "register_git_tools",
+        "register_workspace_action_tools",
+        "register_validation_tools",
+    )
+    for name in registrations:
+        original = getattr(session_factory, name)
+
+        def record(registry, workspace, original=original):
+            seen_workspaces.append(workspace)
+            original(registry, workspace)
+
+        monkeypatch.setattr(session_factory, name, record)
+
+    create_agent_session(
+        SessionId("actions"),
+        configuration(enable_actions=True, workspace_root=tmp_path),
+    )
+
+    assert len(seen_workspaces) == 5
+    assert all(workspace is seen_workspaces[0] for workspace in seen_workspaces)
+
+
 def test_factory_uses_one_workspace_for_all_registration(
     monkeypatch,
     tmp_path,

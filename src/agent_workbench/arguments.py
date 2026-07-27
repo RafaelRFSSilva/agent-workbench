@@ -46,6 +46,7 @@ class CLIArguments:
     response_format_file: Path | None = None
     enable_tools: bool = False
     workspace_root: Path | None = None
+    enable_actions: bool = False
     show_tool_traces: bool = False
 
 
@@ -62,6 +63,7 @@ class RuntimeConfiguration:
     response_format: JSONResponseFormat | None = None
     enable_tools: bool = False
     workspace_root: Path | None = None
+    enable_actions: bool = False
     show_tool_traces: bool = False
 
 
@@ -271,7 +273,16 @@ def parse_cli_arguments(
     parser.add_argument(
         "--workspace",
         type=_workspace_path,
-        help="Authorized workspace root for read-only tools.",
+        help="Authorized workspace root for controlled workspace tools.",
+    )
+
+    parser.add_argument(
+        "--enable-actions",
+        action="store_true",
+        help=(
+            "Enable approved file changes and fixed validation commands; "
+            "requires --workspace."
+        ),
     )
 
     parser.add_argument(
@@ -295,6 +306,7 @@ def parse_cli_arguments(
         or parsed_arguments.response_format_file is not None
         or parsed_arguments.enable_tools
         or parsed_arguments.workspace is not None
+        or parsed_arguments.enable_actions
         or parsed_arguments.show_tool_traces
     )
 
@@ -321,6 +333,7 @@ def parse_cli_arguments(
         response_format_file=parsed_arguments.response_format_file,
         enable_tools=parsed_arguments.enable_tools,
         workspace_root=parsed_arguments.workspace,
+        enable_actions=parsed_arguments.enable_actions,
         show_tool_traces=parsed_arguments.show_tool_traces,
     )
 
@@ -332,6 +345,9 @@ def resolve_runtime_configuration(
 
     if arguments.provider_name is not None and arguments.model_name is None:
         raise ConfigurationError("--model is required when --provider is specified.")
+
+    if arguments.enable_actions and arguments.workspace_root is None:
+        raise ConfigurationError("--enable-actions requires --workspace.")
 
     if arguments.agent_name is not None and arguments.agent_file is not None:
         raise ConfigurationError("--agent cannot be combined with --agent-file.")
@@ -386,5 +402,6 @@ def resolve_runtime_configuration(
         response_format=response_format,
         enable_tools=arguments.enable_tools,
         workspace_root=arguments.workspace_root,
+        enable_actions=arguments.enable_actions,
         show_tool_traces=arguments.show_tool_traces,
     )
