@@ -8,6 +8,10 @@ import subprocess
 import pytest
 
 from agent_workbench.errors import CompletionError, ConfigurationError
+from agent_workbench.recovery import (
+    IsolatedCommitRecoveryPhase,
+    RecoveryStatus,
+)
 from agent_workbench.tools import ToolApprovalDecision
 from agent_workbench.worktree_commits import (
     MAX_COMMIT_CHANGED_LINES,
@@ -98,6 +102,20 @@ def assert_plan_error(
     if isinstance(handle, WorktreeHandle):
         assert str(handle.source_repository) not in str(raised.value)
         assert str(handle.worktree_path) not in str(raised.value)
+
+
+def capture_recovery_phases(monkeypatch, module):
+    """Record the recovery phase supplied by one isolated-commit failure."""
+
+    phases: list[IsolatedCommitRecoveryPhase] = []
+    original = module._commit_failure_message
+
+    def capture(plan, reason, phase):
+        phases.append(phase)
+        return original(plan, reason, phase)
+
+    monkeypatch.setattr(module, "_commit_failure_message", capture)
+    return phases
 
 
 def test_plan_is_immutable_slotted_complete_safe_and_deterministic(
@@ -792,6 +810,7 @@ def test_staging_failure_preserves_partial_index_and_never_commits(
     plan = plan_isolated_commit(handle, "fix: stage failure")
     module = pytest.importorskip("agent_workbench.worktree_commits")
     original_run_git = module._run_git
+    phases = capture_recovery_phases(monkeypatch, module)
     commands = []
 
     def fail_stage(repository, arguments, *, input_bytes=None):
@@ -825,6 +844,7 @@ def test_staging_failure_preserves_partial_index_and_never_commits(
         for arguments in commands
         for operation in ("reset", "restore", "clean", "stash")
     )
+    assert phases == [IsolatedCommitRecoveryPhase.EXACT_STAGING]
 
 
 @pytest.mark.parametrize("mismatch_kind", ["unexpected_path", "content"])
@@ -842,6 +862,7 @@ def test_post_staging_mismatch_preserves_index_and_never_commits(
     plan = plan_isolated_commit(handle, "fix: staging mismatch")
     module = pytest.importorskip("agent_workbench.worktree_commits")
     original_run_git = module._run_git
+    phases = capture_recovery_phases(monkeypatch, module)
     commit_attempted = False
 
     def mismatch_after_stage(repository, arguments, *, input_bytes=None):
@@ -880,6 +901,9 @@ def test_post_staging_mismatch_preserves_index_and_never_commits(
     if mismatch_kind == "unexpected_path":
         assert "unexpected.txt" in staged
     assert run_git(worktree, "rev-parse", "HEAD").stdout.strip() == plan.old_head
+    assert phases == [
+        IsolatedCommitRecoveryPhase.STAGED_STATE_VERIFICATION,
+    ]
 
 
 def test_commit_failure_preserves_fully_staged_index_without_retry(
@@ -894,6 +918,7 @@ def test_commit_failure_preserves_fully_staged_index_without_retry(
     plan = plan_isolated_commit(handle, "fix: commit failure")
     module = pytest.importorskip("agent_workbench.worktree_commits")
     original_run_git = module._run_git
+    phases = capture_recovery_phases(monkeypatch, module)
     commit_calls = 0
 
     def fail_commit(repository, arguments, *, input_bytes=None):
@@ -921,6 +946,9 @@ def test_commit_failure_preserves_fully_staged_index_without_retry(
         run_git(worktree, "diff", "--cached", "--name-only").stdout.strip()
         == "tracked.txt"
     )
+    assert phases == [
+        IsolatedCommitRecoveryPhase.LOCAL_COMMIT_CREATION,
+    ]
 
 
 def test_ambiguous_post_commit_verification_preserves_new_head(
@@ -934,6 +962,7 @@ def test_ambiguous_post_commit_verification_preserves_new_head(
     (worktree / "tracked.txt").write_text("changed\n", encoding="utf-8")
     plan = plan_isolated_commit(handle, "fix: ambiguous")
     module = pytest.importorskip("agent_workbench.worktree_commits")
+    phases = capture_recovery_phases(monkeypatch, module)
     monkeypatch.setattr(
         module,
         "_verify_created_commit",
@@ -953,6 +982,82 @@ def test_ambiguous_post_commit_verification_preserves_new_head(
 
     assert run_git(worktree, "rev-parse", "HEAD").stdout.strip() != plan.old_head
     assert run_git(worktree, "branch", "--show-current").stdout.strip() == "agent/task"
+    assert phases == [
+        IsolatedCommitRecoveryPhase.COMMIT_VERIFICATION,
+    ]
+
+
+def test_collects_real_isolated_commit_recovery_evidence(
+    tmp_path: Path,
+) -> None:
+    """Capture bounded structured evidence from the real isolated worktree."""
+
+    _, handle = create_isolated_worktree(tmp_path)
+    worktree = handle.worktree_path
+    (worktree / "tracked.txt").write_text("changed\n", encoding="utf-8")
+    (worktree / "new.py").write_text("value = 1\n", encoding="utf-8")
+    plan = plan_isolated_commit(handle, "fix: recovery evidence")
+    run_git(worktree, "add", "--", "new.py")
+
+    module = pytest.importorskip("agent_workbench.worktree_commits")
+    evidence = module._collect_commit_recovery_evidence(
+        plan,
+        IsolatedCommitRecoveryPhase.LOCAL_COMMIT_CREATION,
+    )
+
+    assert evidence.phase is IsolatedCommitRecoveryPhase.LOCAL_COMMIT_CREATION
+    assert evidence.target_display == handle.target_display
+    assert evidence.expected_branch == plan.branch_name
+    assert evidence.observed_branch == plan.branch_name
+    assert evidence.expected_head == plan.old_head
+    assert evidence.observed_head == plan.old_head
+    assert evidence.head_changed is RecoveryStatus.NO
+    assert evidence.index_dirty is RecoveryStatus.YES
+    assert evidence.staged_paths == ("new.py",)
+    assert evidence.worktree_dirty is RecoveryStatus.YES
+    assert str(handle.source_repository) not in repr(evidence)
+    assert str(handle.worktree_path) not in repr(evidence)
+
+
+def test_collects_unknown_recovery_state_when_git_inspection_fails(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Represent unavailable observations without inventing Git state."""
+
+    _, handle = create_isolated_worktree(tmp_path)
+    worktree = handle.worktree_path
+    (worktree / "tracked.txt").write_text("changed\n", encoding="utf-8")
+    plan = plan_isolated_commit(handle, "fix: unavailable recovery evidence")
+    module = pytest.importorskip("agent_workbench.worktree_commits")
+
+    def fail_identity(*_args, **_kwargs):
+        raise ConfigurationError("injected identity inspection failure")
+
+    monkeypatch.setattr(module, "_read_head", fail_identity)
+    monkeypatch.setattr(module, "_read_symbolic_branch", fail_identity)
+    monkeypatch.setattr(
+        module,
+        "_run_git",
+        lambda *_args, **_kwargs: module._GitOutput(
+            1,
+            b"",
+            b"injected inspection failure",
+        ),
+    )
+
+    evidence = module._collect_commit_recovery_evidence(
+        plan,
+        IsolatedCommitRecoveryPhase.COMMIT_VERIFICATION,
+    )
+
+    assert evidence.phase is IsolatedCommitRecoveryPhase.COMMIT_VERIFICATION
+    assert evidence.observed_branch is None
+    assert evidence.observed_head is None
+    assert evidence.head_changed is RecoveryStatus.UNKNOWN
+    assert evidence.index_dirty is RecoveryStatus.UNKNOWN
+    assert evidence.staged_paths == ()
+    assert evidence.worktree_dirty is RecoveryStatus.UNKNOWN
 
 
 def test_second_commit_requires_a_fresh_plan_and_approval(tmp_path: Path) -> None:

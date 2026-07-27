@@ -647,10 +647,15 @@ Completed foundations:
 - [x] Provider-independent immutable task specifications and optional
   `AgentSession` task metadata.
 - [x] Supervised worktree isolation and approved exact local commits.
+- [x] Provider-independent structured recovery evidence for isolated commit and
+  worktree lifecycle failures, using conservative read-only Git inspection.
 
 Next milestones:
 
-- [ ] Crash-safe transaction and worktree lifecycle recovery.
+- [ ] Autonomous coding loop: receive one development prompt, inspect the
+  workspace, plan bounded changes, edit files, run validation, iterate after
+  failures, present the final diff, and create a commit after approval.
+- [ ] Persistent lifecycle records and crash-safe restart recovery.
 - [ ] Deletion and rename transactions with explicit conflict handling.
 - [ ] Local project retrieval and project configuration.
 - [ ] Task lifecycle, assignment, dependencies, and multi-agent orchestration.
