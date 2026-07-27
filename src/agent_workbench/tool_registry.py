@@ -3,7 +3,11 @@
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from agent_workbench.errors import CompletionError, ConfigurationError
+from agent_workbench.errors import (
+    CompletionError,
+    ConfigurationError,
+    WorkspacePathError,
+)
 from agent_workbench.tools import (
     JSONValue,
     JSONObject,
@@ -83,11 +87,21 @@ class ToolRegistry:
         if registration is None:
             raise ConfigurationError(f"Unknown tool '{invocation.tool_name}'.")
 
-        preview = (
-            registration.approval_preview(invocation.arguments)
-            if registration.approval_preview is not None
-            else None
-        )
+        try:
+            preview = (
+                registration.approval_preview(invocation.arguments)
+                if registration.approval_preview is not None
+                else None
+            )
+        except (
+            CompletionError,
+            ConfigurationError,
+            ValueError,
+            WorkspacePathError,
+        ) as exc:
+            raise CompletionError(
+                f"Approval preview failed for {invocation.tool_name}: {exc}"
+            ) from None
         return ToolApprovalRequest(
             invocation=invocation,
             preview=preview,

@@ -254,7 +254,10 @@ def test_cli_invalid_action_preview_is_safe_and_later_turn_succeeds(
     run_cli(session, enable_actions=True)
 
     output = capsys.readouterr().out
-    assert "Error: apply_file_patch path must not contain traversal." in output
+    assert (
+        "Error: Approval preview failed for apply_file_patch: "
+        "apply_file_patch path must not contain traversal."
+    ) in output
     assert "Traceback" not in output
     assert "Assistant: Recovered." in output
     assert provider.requests[1].messages == [{"role": "user", "content": "Continue."}]
@@ -373,6 +376,154 @@ def test_cli_requests_new_approval_for_a_second_action(
         "Approve action? [y/N]: ",
         "Approve action? [y/N]: ",
     ]
+
+
+def test_cli_displays_approved_action_completion_without_tool_traces(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    """Display a compact completion record for an approved action."""
+
+    executions = []
+
+    def fake_run_validation(_workspace, tool_name, _arguments):
+        executions.append(tool_name)
+        return {
+            "tool": tool_name,
+            "path": ".",
+            "exit_code": 0,
+        }
+
+    monkeypatch.setattr(
+        "agent_workbench.validation_tools.run_validation",
+        fake_run_validation,
+    )
+    provider = FakeProvider(
+        [
+            ChatResponse(
+                tool_invocations=(
+                    ToolInvocation(
+                        id="pytest",
+                        tool_name="run_pytest",
+                        arguments={"path": "."},
+                    ),
+                )
+            ),
+            ChatResponse(text="Validated."),
+        ]
+    )
+    session = AgentSession(
+        id=SessionId("action-completion"),
+        provider=provider,
+        tool_registry=action_registry(Workspace(tmp_path)),
+    )
+    inputs = iter(["Test.", "y", "/exit"])
+    monkeypatch.setattr("builtins.input", lambda _: next(inputs))
+
+    run_cli(
+        session,
+        enable_actions=True,
+        show_tool_traces=False,
+    )
+
+    output = capsys.readouterr().out
+    assert executions == ["run_pytest"]
+    assert "Action completed: run_pytest" in output
+    assert "  Status: success" in output
+    assert "Tool trace:" not in output
+    assert output.index("Action completed: run_pytest") < output.index(
+        "Assistant: Validated."
+    )
+
+
+def test_cli_attributes_followup_approval_preview_failure_to_tool(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    """Attribute a later preview failure to its own requested action."""
+
+    (tmp_path / "module.py").write_text("existing\n", encoding="utf-8")
+    executions = []
+
+    def fake_run_validation(_workspace, tool_name, _arguments):
+        executions.append(tool_name)
+        return {
+            "tool": tool_name,
+            "path": ".",
+            "exit_code": 0,
+        }
+
+    monkeypatch.setattr(
+        "agent_workbench.validation_tools.run_validation",
+        fake_run_validation,
+    )
+    provider = FakeProvider(
+        [
+            ChatResponse(
+                tool_invocations=(
+                    ToolInvocation(
+                        id="pytest",
+                        tool_name="run_pytest",
+                        arguments={"path": "."},
+                    ),
+                )
+            ),
+            ChatResponse(
+                tool_invocations=(
+                    ToolInvocation(
+                        id="stale-patch",
+                        tool_name="apply_file_patch",
+                        arguments={
+                            "path": "module.py",
+                            "expected_content": "",
+                            "replacement_content": "replacement\n",
+                            "create_if_missing": True,
+                        },
+                    ),
+                )
+            ),
+            ChatResponse(text="Recovered."),
+        ]
+    )
+    session = AgentSession(
+        id=SessionId("followup-preview-failure"),
+        provider=provider,
+        tool_registry=action_registry(Workspace(tmp_path)),
+    )
+    prompts = []
+    inputs = iter(["Test then patch.", "y", "Continue.", "/exit"])
+
+    def answer(prompt):
+        if prompt.startswith("Approve"):
+            prompts.append(prompt)
+        return next(inputs)
+
+    monkeypatch.setattr("builtins.input", answer)
+
+    run_cli(
+        session,
+        enable_actions=True,
+        show_tool_traces=False,
+    )
+
+    output = capsys.readouterr().out
+    assert executions == ["run_pytest"]
+    assert prompts == ["Approve action? [y/N]: "]
+    assert "Action completed: run_pytest" in output
+    assert "  Status: success" in output
+    assert (
+        "Error: Approval preview failed for apply_file_patch: "
+        "create_if_missing requires a missing target."
+    ) in output
+    assert "Traceback" not in output
+    assert "Assistant: Recovered." in output
+    assert provider.requests[2].messages == [{"role": "user", "content": "Continue."}]
+    assert session.messages == (
+        {"role": "user", "content": "Continue."},
+        {"role": "assistant", "content": "Recovered."},
+    )
 
 
 def test_cli_returns_failed_pytest_exit_to_model_as_normal_result(
