@@ -635,7 +635,9 @@ def test_transaction_registration_uses_exact_closed_nested_schema(
     assert APPLY_WORKSPACE_CHANGES_DEFINITION.name == "apply_workspace_changes"
     assert APPLY_WORKSPACE_CHANGES_DEFINITION.description == (
         "Apply one approved transactional set of UTF-8 file creations and "
-        "updates inside the authorized workspace."
+        "updates inside the authorized workspace. Each changes array element "
+        "must contain path, expected_content, replacement_content, and optional "
+        "create_if_missing."
     )
     assert APPLY_WORKSPACE_CHANGES_DEFINITION.input_schema == {
         "type": "object",
@@ -681,6 +683,77 @@ def test_transaction_registration_uses_exact_closed_nested_schema(
             ),
         )
     )
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        (
+            {
+                "path": "module.py",
+                "replacement_content": "new\n",
+            },
+            (
+                "apply_workspace_changes change is missing required fields: "
+                "expected_content"
+            ),
+        ),
+        (
+            {
+                "patch": {
+                    "path": "module.py",
+                    "expected_content": "old\n",
+                    "replacement_content": "new\n",
+                }
+            },
+            (
+                "apply_workspace_changes change is missing required fields: "
+                "expected_content, path, replacement_content"
+            ),
+        ),
+        (
+            {
+                **patch_arguments(),
+                "operation": "update",
+            },
+            "apply_workspace_changes change has unsupported fields: operation",
+        ),
+        (
+            patch_arguments(path=1),  # type: ignore[arg-type]
+            "apply_workspace_changes change path must be a string",
+        ),
+        (
+            patch_arguments(create="false"),  # type: ignore[arg-type]
+            "apply_workspace_changes change create_if_missing must be a boolean",
+        ),
+    ],
+)
+def test_transaction_nested_validation_errors_name_exact_invalid_fields(
+    tmp_path: Path,
+    change: dict[str, object],
+    message: str,
+) -> None:
+    """Describe malformed nested objects without accepting or repairing them."""
+
+    _, workspace = create_workspace(tmp_path)
+
+    with pytest.raises(ValueError, match=message):
+        preview_workspace_changes(
+            workspace,
+            transaction_arguments(change),
+        )
+
+
+def test_single_file_validation_error_remains_compatible(tmp_path: Path) -> None:
+    """Keep the existing single-file action name in its malformed-input error."""
+
+    _, workspace = create_workspace(tmp_path)
+
+    with pytest.raises(
+        ValueError,
+        match="apply_file_patch requires structured patch arguments",
+    ):
+        preview_file_patch(workspace, {"path": "module.py"})
 
 
 def test_transaction_preview_is_complete_sorted_and_non_mutating(

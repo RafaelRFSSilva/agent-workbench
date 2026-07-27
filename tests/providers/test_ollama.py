@@ -20,6 +20,7 @@ from agent_workbench.providers.ollama import OllamaProvider
 from agent_workbench.generation import GenerationConfig
 from agent_workbench.structured_outputs import JSONResponseFormat
 from agent_workbench.tools import ToolDefinition, ToolInvocation, ToolResult
+from agent_workbench.workspace_actions import APPLY_WORKSPACE_CHANGES_DEFINITION
 
 
 def test_provider_returns_model_response(monkeypatch) -> None:
@@ -377,6 +378,58 @@ def test_tools_are_translated_to_ollama_functions(
             }
         ],
     }
+
+
+def test_atomic_workspace_schema_is_delivered_to_ollama_unchanged(
+    monkeypatch,
+) -> None:
+    """Preserve the exact closed nested transaction schema and guidance."""
+
+    captured_arguments = {}
+
+    def fake_chat(**kwargs):
+        captured_arguments.update(kwargs)
+        return SimpleNamespace(
+            message=SimpleNamespace(
+                content="",
+                tool_calls=None,
+            )
+        )
+
+    monkeypatch.setattr(
+        "agent_workbench.providers.ollama.chat",
+        fake_chat,
+    )
+    provider = OllamaProvider(model_name="test-model")
+
+    assert (
+        provider.complete(
+            ChatRequest(
+                messages=[{"role": "user", "content": "Change both files."}],
+                tools=(APPLY_WORKSPACE_CHANGES_DEFINITION,),
+            )
+        )
+        == ChatResponse()
+    )
+
+    function = captured_arguments["tools"][0]["function"]
+    assert function["name"] == "apply_workspace_changes"
+    assert function["description"] == (
+        "Apply one approved transactional set of UTF-8 file creations and "
+        "updates inside the authorized workspace. Each changes array element "
+        "must contain path, expected_content, replacement_content, and optional "
+        "create_if_missing."
+    )
+    assert function["parameters"] == APPLY_WORKSPACE_CHANGES_DEFINITION.input_schema
+    assert function["parameters"]["required"] == ["changes"]
+    changes = function["parameters"]["properties"]["changes"]
+    assert changes["type"] == "array"
+    assert changes["items"]["required"] == [
+        "path",
+        "expected_content",
+        "replacement_content",
+    ]
+    assert changes["items"]["additionalProperties"] is False
 
 
 def test_tool_calls_are_translated_to_tool_invocations(

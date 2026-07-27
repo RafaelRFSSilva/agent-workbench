@@ -74,7 +74,9 @@ APPLY_WORKSPACE_CHANGES_DEFINITION = ToolDefinition(
     name="apply_workspace_changes",
     description=(
         "Apply one approved transactional set of UTF-8 file creations and "
-        "updates inside the authorized workspace."
+        "updates inside the authorized workspace. Each changes array element "
+        "must contain path, expected_content, replacement_content, and optional "
+        "create_if_missing."
     ),
     input_schema={
         "type": "object",
@@ -193,6 +195,7 @@ def preview_file_patch(
         workspace,
         arguments,
         preview_limit_bytes=MAX_PATCH_PREVIEW_BYTES,
+        validation_name="apply_file_patch",
     )
     return {
         **patch.metadata(),
@@ -210,6 +213,7 @@ def apply_file_patch(
         workspace,
         arguments,
         preview_limit_bytes=MAX_PATCH_PREVIEW_BYTES,
+        validation_name="apply_file_patch",
     )
 
     if patch.operation == "create":
@@ -294,11 +298,15 @@ def _prepare_patch(
     arguments: object,
     *,
     preview_limit_bytes: int | None,
+    validation_name: str,
 ) -> _PreparedPatch:
     """Validate arguments, target state, limits, and the complete diff."""
 
     path, expected_content, replacement_content, create_if_missing = (
-        _get_patch_arguments(arguments)
+        _get_patch_arguments(
+            arguments,
+            validation_name=validation_name,
+        )
     )
     target, relative_path, target_status = _resolve_write_target(workspace, path)
     _encode_patch_content("expected_content", expected_content)
@@ -375,6 +383,7 @@ def _prepare_workspace_change_plan(
                     workspace,
                     change,
                     preview_limit_bytes=None,
+                    validation_name="apply_workspace_changes change",
                 )
                 for change in changes
             ),
@@ -447,6 +456,8 @@ def _get_workspace_change_arguments(
 
 def _get_patch_arguments(
     arguments: object,
+    *,
+    validation_name: str,
 ) -> tuple[str, str, str, bool]:
     """Validate the closed structured patch argument object."""
 
@@ -459,24 +470,45 @@ def _get_patch_arguments(
         *required,
         "create_if_missing",
     }
-    if (
+    if validation_name == "apply_file_patch" and (
         not isinstance(arguments, dict)
         or not required <= set(arguments)
         or set(arguments) - allowed
     ):
         raise ValueError("apply_file_patch requires structured patch arguments.")
+    if not isinstance(arguments, dict):
+        raise ValueError(f"{validation_name} must be an object.")
+
+    missing = sorted(required - set(arguments))
+    if missing:
+        raise ValueError(
+            f"{validation_name} is missing required fields: {', '.join(missing)}."
+        )
+    unsupported = sorted(set(arguments) - allowed)
+    if unsupported:
+        raise ValueError(
+            f"{validation_name} has unsupported fields: {', '.join(unsupported)}."
+        )
 
     path = arguments["path"]
     expected_content = arguments["expected_content"]
     replacement_content = arguments["replacement_content"]
     create_if_missing = arguments.get("create_if_missing", False)
-    if (
+    if validation_name == "apply_file_patch" and (
         not isinstance(path, str)
         or not isinstance(expected_content, str)
         or not isinstance(replacement_content, str)
         or not isinstance(create_if_missing, bool)
     ):
         raise ValueError("apply_file_patch requires structured patch arguments.")
+    if not isinstance(path, str):
+        raise ValueError(f"{validation_name} path must be a string.")
+    if not isinstance(expected_content, str):
+        raise ValueError(f"{validation_name} expected_content must be a string.")
+    if not isinstance(replacement_content, str):
+        raise ValueError(f"{validation_name} replacement_content must be a string.")
+    if not isinstance(create_if_missing, bool):
+        raise ValueError(f"{validation_name} create_if_missing must be a boolean.")
 
     return path, expected_content, replacement_content, create_if_missing
 
@@ -714,6 +746,7 @@ def _replace_file_atomically(
                 "create_if_missing": False,
             },
             preview_limit_bytes=MAX_PATCH_PREVIEW_BYTES,
+            validation_name="apply_file_patch",
         )
         if current.operation != "update":
             raise ValueError("apply_file_patch target changed before replacement.")
