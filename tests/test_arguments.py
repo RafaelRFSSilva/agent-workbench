@@ -875,3 +875,59 @@ def test_runtime_configuration_loads_response_format_file(
     assert configuration.response_format is not None
     assert configuration.response_format.name == "software_review"
     assert configuration.response_format.schema == schema
+
+
+def test_parse_cli_arguments_accepts_autonomous_task() -> None:
+    """Parse and normalize one autonomous coding task."""
+
+    arguments = parse_cli_arguments(
+        [
+            "--task",
+            "  Correct the failing implementation.  ",
+        ]
+    )
+
+    assert arguments.task_prompt == "Correct the failing implementation."
+
+
+def test_parse_cli_arguments_rejects_blank_autonomous_task() -> None:
+    """Reject autonomous task prompts containing only whitespace."""
+
+    with pytest.raises(SystemExit) as exc_info:
+        parse_cli_arguments(["--task", "   "])
+
+    assert exc_info.value.code == 2
+
+
+def test_autonomous_task_requires_actions() -> None:
+    """Require explicit action enablement for autonomous coding."""
+
+    with pytest.raises(
+        ConfigurationError,
+        match="--task requires --enable-actions",
+    ):
+        resolve_runtime_configuration(
+            CLIArguments(
+                provider_name="ollama",
+                model_name="gpt-oss:20b",
+                task_prompt="Correct the implementation.",
+                workspace_root=Path("."),
+            )
+        )
+
+
+def test_autonomous_task_actions_require_workspace() -> None:
+    """Require an authorized workspace for autonomous coding actions."""
+
+    with pytest.raises(
+        ConfigurationError,
+        match="--enable-actions requires --workspace",
+    ):
+        resolve_runtime_configuration(
+            CLIArguments(
+                provider_name="ollama",
+                model_name="gpt-oss:20b",
+                task_prompt="Correct the implementation.",
+                enable_actions=True,
+            )
+        )

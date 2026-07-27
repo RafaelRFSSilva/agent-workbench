@@ -36,6 +36,7 @@ class CLIArguments:
     provider_name: ProviderName | None
     model_name: str | None
     setup: bool = False
+    task_prompt: str | None = None
     system_prompt: str | None = None
     agent_name: str | None = None
     agent_file: Path | None = None
@@ -91,6 +92,17 @@ def _non_empty_system_prompt(value: str) -> str:
         raise ArgumentTypeError("system prompt must not be blank")
 
     return system_prompt
+
+
+def _non_empty_task_prompt(value: str) -> str:
+    """Return a normalized autonomous task prompt or reject a blank value."""
+
+    task_prompt = value.strip()
+
+    if not task_prompt:
+        raise ArgumentTypeError("task prompt must not be blank")
+
+    return task_prompt
 
 
 def _agent_profile_path(value: str) -> Path:
@@ -206,8 +218,8 @@ def parse_cli_arguments(
     parser = ArgumentParser(
         prog="agent-workbench",
         description=(
-            "Start an interactive conversation using a configured "
-            "language model provider."
+            "Start an interactive conversation or run one supervised "
+            "autonomous coding task."
         ),
     )
 
@@ -215,6 +227,11 @@ def parse_cli_arguments(
         "--setup",
         action="store_true",
         help="Configure the session through an interactive setup flow.",
+    )
+    parser.add_argument(
+        "--task",
+        type=_non_empty_task_prompt,
+        help="Run one supervised autonomous coding task and exit.",
     )
     parser.add_argument(
         "--provider",
@@ -335,6 +352,7 @@ def parse_cli_arguments(
         or parsed_arguments.show_tool_traces
         or parsed_arguments.worktree_path is not None
         or parsed_arguments.worktree_branch is not None
+        or parsed_arguments.task is not None
     )
 
     if parsed_arguments.setup and setup_conflicts:
@@ -364,6 +382,7 @@ def parse_cli_arguments(
         show_tool_traces=parsed_arguments.show_tool_traces,
         worktree_path=parsed_arguments.worktree_path,
         worktree_branch=parsed_arguments.worktree_branch,
+        task_prompt=parsed_arguments.task,
     )
 
 
@@ -374,6 +393,9 @@ def resolve_runtime_configuration(
 
     if arguments.provider_name is not None and arguments.model_name is None:
         raise ConfigurationError("--model is required when --provider is specified.")
+
+    if arguments.task_prompt is not None and not arguments.enable_actions:
+        raise ConfigurationError("--task requires --enable-actions.")
 
     if arguments.enable_actions and arguments.workspace_root is None:
         raise ConfigurationError("--enable-actions requires --workspace.")

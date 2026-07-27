@@ -1,26 +1,26 @@
 """Interactive command-line interface for Agent Workbench."""
 
-from collections.abc import Sequence
 import json
+from collections.abc import Sequence
+
+from agent_workbench.agents import AgentProfile
 from agent_workbench.arguments import (
     parse_cli_arguments,
     resolve_runtime_configuration,
 )
-from agent_workbench.config import (
-    load_environment,
-)
-from agent_workbench.interactive_setup import run_interactive_setup
-from agent_workbench.isolated_sessions import create_isolated_agent_session
+from agent_workbench.coding_loop import run_autonomous_coding_task
+from agent_workbench.config import load_environment
 from agent_workbench.errors import (
     CompletionError,
     ConfigurationError,
     WorkspacePathError,
 )
+from agent_workbench.interactive_setup import run_interactive_setup
+from agent_workbench.isolated_sessions import create_isolated_agent_session
 from agent_workbench.messages import ToolInteractionRound
-from agent_workbench.tool_registry import ToolRegistry
-from agent_workbench.agents import AgentProfile
 from agent_workbench.session import AgentSession, SessionId
 from agent_workbench.session_factory import create_agent_session
+from agent_workbench.tool_registry import ToolRegistry
 from agent_workbench.tools import (
     ToolApprovalDecision,
     ToolApprovalRequest,
@@ -36,6 +36,7 @@ from agent_workbench.worktrees import (
 )
 
 EXIT_COMMANDS = {"/exit", "/quit"}
+AUTONOMOUS_MAX_TOOL_ROUNDS = 16
 
 
 def run_cli(
@@ -115,38 +116,61 @@ def main(
 
     load_environment()
     arguments = parse_cli_arguments(argv)
+    task_prompt = getattr(arguments, "task_prompt", None)
 
     try:
         if arguments.setup:
             runtime_configuration = run_interactive_setup()
         else:
             runtime_configuration = resolve_runtime_configuration(arguments)
-
     except ConfigurationError as exc:
         print(f"Configuration error: {exc}")
         return
 
     if runtime_configuration.worktree_path is not None:
-        _run_isolated_cli(runtime_configuration)
+        _run_isolated_cli(
+            runtime_configuration,
+            task_prompt=task_prompt,
+        )
         return
 
     try:
-        session = create_agent_session(
-            SessionId("cli-session"),
-            runtime_configuration,
-        )
+        if task_prompt is None:
+            session = create_agent_session(
+                SessionId("cli-session"),
+                runtime_configuration,
+            )
+        else:
+            session = create_agent_session(
+                SessionId("cli-session"),
+                runtime_configuration,
+                max_tool_rounds=AUTONOMOUS_MAX_TOOL_ROUNDS,
+            )
     except ConfigurationError as exc:
         print(f"Configuration error: {exc}")
         return
 
-    _run_configured_cli(session, runtime_configuration)
+    _run_configured_cli(
+        session,
+        runtime_configuration,
+        task_prompt=task_prompt,
+    )
 
 
 def _run_configured_cli(
     session: AgentSession,
     runtime_configuration,
+    *,
+    task_prompt: str | None = None,
 ) -> None:
-    """Run the existing CLI presentation with resolved optional callbacks."""
+    """Run the configured interactive CLI or one autonomous task."""
+
+    if task_prompt is not None:
+        _run_autonomous_task(
+            session,
+            task_prompt,
+        )
+        return
 
     run_arguments = {
         "agent_profile": runtime_configuration.agent_profile,
@@ -158,7 +182,53 @@ def _run_configured_cli(
     run_cli(session, **run_arguments)
 
 
-def _run_isolated_cli(runtime_configuration) -> None:
+def _run_autonomous_task(
+    session: AgentSession,
+    task_prompt: str,
+) -> None:
+    """Run one supervised autonomous task and display its final result."""
+
+    try:
+        result = run_autonomous_coding_task(
+            session,
+            task_prompt,
+            tool_approval_handler=_prompt_for_tool_approval,
+        )
+    except (
+        CompletionError,
+        ConfigurationError,
+        ValueError,
+        WorkspacePathError,
+    ) as exc:
+        print(f"Autonomous task error: {exc}")
+        return
+
+    print(f"\nAssistant: {result.assistant_summary}\n")
+    print("Autonomous task result:")
+    print(f"  Tool rounds: {result.tool_round_count}")
+    print(f"  Validation succeeded: {'yes' if result.validation_succeeded else 'no'}")
+    print(f"  Git status inspected: {'yes' if result.inspected_git_status else 'no'}")
+    print(f"  Git diff inspected: {'yes' if result.inspected_git_diff else 'no'}")
+
+    if result.validation_runs:
+        print("  Validation runs:")
+        for validation in result.validation_runs:
+            exit_code = (
+                str(validation.exit_code)
+                if validation.exit_code is not None
+                else "[unavailable]"
+            )
+            print(
+                f"    - {validation.tool_name}: "
+                f"{validation.result_status}, exit code {exit_code}"
+            )
+
+
+def _run_isolated_cli(
+    runtime_configuration,
+    *,
+    task_prompt: str | None = None,
+) -> None:
     """Create, run, and conservatively finish one supervised worktree session."""
 
     source = runtime_configuration.workspace_root
@@ -176,16 +246,28 @@ def _run_isolated_cli(runtime_configuration) -> None:
         return
 
     try:
-        isolated = create_isolated_agent_session(
-            SessionId("cli-session"),
-            runtime_configuration,
-            handle,
-        )
+        if task_prompt is None:
+            isolated = create_isolated_agent_session(
+                SessionId("cli-session"),
+                runtime_configuration,
+                handle,
+            )
+        else:
+            isolated = create_isolated_agent_session(
+                SessionId("cli-session"),
+                runtime_configuration,
+                handle,
+                max_tool_rounds=AUTONOMOUS_MAX_TOOL_ROUNDS,
+            )
     except ConfigurationError as exc:
         print(f"Configuration error: {exc}")
         return
 
-    _run_configured_cli(isolated.session, runtime_configuration)
+    _run_configured_cli(
+        isolated.session,
+        runtime_configuration,
+        task_prompt=task_prompt,
+    )
 
     try:
         state = inspect_git_worktree(handle)

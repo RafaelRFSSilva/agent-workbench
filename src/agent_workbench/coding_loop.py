@@ -8,6 +8,7 @@ from agent_workbench.messages import ToolInteractionRound
 from agent_workbench.session import AgentSession
 from agent_workbench.tasks import TaskSpec
 from agent_workbench.tools import ToolApprovalHandler
+from agent_workbench.tool_calling import ToolRoundObserver
 
 
 DEFAULT_CODING_ACCEPTANCE_CRITERIA = (
@@ -16,6 +17,8 @@ DEFAULT_CODING_ACCEPTANCE_CRITERIA = (
     "Run pytest and resolve introduced regressions.",
     "Inspect the final Git status and diff before reporting completion.",
 )
+
+DEFAULT_AUTONOMOUS_MAX_TOOL_ROUNDS = 16
 
 _REQUIRED_CODING_TOOLS = frozenset(
     {
@@ -87,6 +90,7 @@ def run_autonomous_coding_task(
     prompt: str,
     *,
     tool_approval_handler: ToolApprovalHandler,
+    tool_round_observer: ToolRoundObserver | None = None,
     acceptance_criteria: Iterable[str] = DEFAULT_CODING_ACCEPTANCE_CRITERIA,
 ) -> AutonomousCodingResult:
     """Run one prompt through the complete bounded coding tool loop."""
@@ -119,11 +123,21 @@ def run_autonomous_coding_task(
     )
     observed_rounds: list[ToolInteractionRound] = []
 
+    def observe_tool_round(round_: ToolInteractionRound) -> None:
+        observed_rounds.append(round_)
+        if tool_round_observer is not None:
+            tool_round_observer(round_)
+
     response = session.send(
         _build_coding_prompt(task_spec),
-        tool_round_observer=observed_rounds.append,
+        tool_round_observer=observe_tool_round,
         tool_approval_handler=tool_approval_handler,
     )
+
+    if tool_round_observer is not None and not callable(tool_round_observer):
+        raise ConfigurationError(
+            "autonomous coding tool round observer must be callable."
+        )
 
     executed_tool_names: list[str] = []
     approved_action_names: list[str] = []
