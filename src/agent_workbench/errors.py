@@ -9,5 +9,9 @@ class ConfigurationError(RuntimeError):
     """Represent an invalid application configuration."""
 
 
+class SessionStateError(RuntimeError):
+    """Represent an invalid operation for the current session state."""
+
+
 class WorkspacePathError(RuntimeError):
     """Represent an unsafe or invalid requested workspace path."""
