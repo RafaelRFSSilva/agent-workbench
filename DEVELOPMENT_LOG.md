@@ -1,5 +1,124 @@
 # Development Log
 
+## 2026-07-27 — Approved Isolated Git Commits
+
+### Implemented
+
+- Added immutable validated `IsolatedCommitPlan` snapshots and complete safe
+  commit previews in commit `7b77a2f`.
+- Added exact one-use approval, post-approval revalidation, exact-path staging,
+  staged-diff verification, fixed commit creation, result metadata, and
+  conservative partial-state reporting in commit `708ca82`.
+- Added the operator-side CLI message, complete preview, default-deny commit
+  approval, success reinspection, and separate clean-removal flow in commit
+  `51033ed`.
+- Added the practical self-hosting operator guide and updated the worktree,
+  runtime, architecture, and roadmap documentation in this milestone.
+
+### Commit Architecture
+
+- `IsolatedCommitPlan` is frozen, slotted, and validated-only. It pins the
+  verified `WorktreeHandle`, source and isolated identities, exact branch and
+  old HEAD, repository-local author identity, unchanged message, deterministic
+  complete path set, add/modify operations, old/current bytes, complete unified
+  diffs, aggregate counts, and a SHA-256 fingerprint.
+- Planning requires a clean real index and includes every eligible change.
+  Supported entries are modified tracked and new untracked UTF-8 regular files.
+  Deletions, renames, copies, mode changes, symlinks, submodules, binaries,
+  conflicts, pre-staged content, ignored/unsafe paths, and partial selection
+  are rejected.
+- Approval is operator-side, exact, one-use, and never exposed as a model tool.
+  The complete plan is regenerated after approval and before staging.
+- Staging is limited to exact approved paths. Actual index blobs, modes, path
+  set, operations, diffs, identities, and fingerprint must match the plan.
+- Commit verification requires one new commit with the exact old HEAD parent,
+  message, path set, tree content, modes, and diffs; a clean isolated index and
+  worktree; the same branch without upstream; and unchanged primary identity.
+- Clean worktree removal retains its independent approval and preserves the
+  local branch and commit.
+
+### Fixed Git Mutation Boundary
+
+The approved paths are staged only through the equivalent of:
+
+```text
+git -C WORKTREE add -- APPROVED_PATHS...
+```
+
+The commit is created only through the equivalent of:
+
+```text
+git -C WORKTREE \
+  -c core.hooksPath=/dev/null \
+  -c commit.gpgSign=false \
+  -c tag.gpgSign=false \
+  -c core.editor=false \
+  commit \
+  --no-verify \
+  --no-gpg-sign \
+  --file=-
+```
+
+The exact message is supplied through standard input. Hooks, editor, and
+signing are disabled. Add-dot, add-all, commit-all, amend, merge, rebase, push,
+fetch, pull, reset, clean, stash, restore, checkout, switch, branch deletion,
+force removal, arbitrary Git, arbitrary shell, and caller-controlled
+environment are outside the boundary.
+
+### Recovery Policy
+
+- Stale or rejected state before staging causes no Git mutation.
+- After staging starts, failure may leave a partial or complete isolated index.
+  The error reports bounded relative staged paths and performs no reset,
+  restore, clean, stash, unstage, or retry.
+- After commit starts, an advanced or ambiguously verified HEAD remains
+  preserved. There is no amend, destructive cleanup, removal, or branch
+  deletion.
+- The operator must inspect the isolated branch, HEAD, index, and worktree
+  manually. This is handled-failure preservation, not transactionality across
+  Git staging/commit and not crash-safe recovery.
+
+### `COMMIT-842` Real Local Validation
+
+- A real local `gpt-oss:20b` session used only
+  `create_isolated_agent_session()` with a worktree pinned to a fresh clean
+  primary HEAD on `agent/commit-842`.
+- The model made the exact ordered calls: three reads, one approved
+  `apply_workspace_changes` transaction for `demo/labels.py` and
+  `demo/math_ops.py`, Ruff format, Ruff check, pytest, Git status, and Git diff.
+  It returned all required `COMMIT-842`, isolation, Ruff, pytest, and
+  ready-to-commit markers.
+- Ruff and pytest passed. Tests and project configuration were unchanged. The
+  isolated index remained clean before commit planning, exactly two worktree
+  entries were dirty, normal session history contained only the user and final
+  assistant messages, and the primary tracked bytes, status, branch, and HEAD
+  remained unchanged.
+- One complete immutable preview for `fix: correct demo behavior` was approved
+  separately. Exact paths were staged; the exact message was supplied through
+  standard input; one commit was created and its parent, message, path set,
+  diff, index, worktree, branch, and absent upstream were verified.
+- Clean removal was approved separately. The worktree and registration were
+  removed while the local branch and commit remained reachable.
+- Fresh-repository smokes passed for denied, missing, and malformed approval;
+  file/path/HEAD/branch/source/index staleness; partial staging; staged-diff
+  mismatch; fixed commit failure; ambiguous advanced HEAD; and unsupported
+  deletion, binary, symlink, staged-index, and missing-identity planning.
+- No merge, push, fetch, pull, amend, reset, restore, clean, stash, force
+  removal, or branch deletion occurred.
+
+### Validation and Self-Hosting Readiness
+
+- Stage 3 focused commit-lifecycle tests pass with 24 tests.
+- The complete automated suite passes with 804 tests before and after the
+  documentation-only stage.
+- Ruff formatting, Ruff linting, and `git diff --check` pass.
+- Agent Workbench is ready for small supervised local feature tasks using the
+  operator playbook in `docs/self-hosting.md`.
+- Execution remains synchronous. Only eligible UTF-8 add/modify commits are
+  supported. Push, Pull Request creation, merge, signing, deletion/rename,
+  conflict automation, branch deletion, concurrent sessions, orchestration,
+  persistence, and crash-safe recovery remain manual or future work.
+
 ## 2026-07-27 — Supervised Git Worktree Isolation
 
 ### Implemented

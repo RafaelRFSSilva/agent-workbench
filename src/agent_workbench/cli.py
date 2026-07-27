@@ -200,7 +200,28 @@ def _run_isolated_cli(runtime_configuration) -> None:
             f"Changed entries: {state.changed_entry_count}. "
             "Please inspect, commit, or clean it manually."
         )
-        return
+        if not _offer_isolated_commit(handle):
+            return
+        try:
+            state = inspect_git_worktree(handle)
+        except (ConfigurationError, CompletionError) as exc:
+            print(
+                "Worktree recovery required after isolated commit: "
+                f"{exc} The worktree was preserved for manual recovery."
+            )
+            return
+        if not state.clean:
+            print(
+                "Isolated commit recovery required: the worktree is not clean. "
+                "The worktree and local branch were preserved for manual recovery."
+            )
+            return
+
+    _offer_clean_worktree_removal(handle, state)
+
+
+def _offer_clean_worktree_removal(handle, state) -> None:
+    """Offer the existing separately approved clean-worktree removal."""
 
     try:
         removal_plan = plan_git_worktree_removal(handle)
@@ -216,6 +237,115 @@ def _run_isolated_cli(runtime_configuration) -> None:
         return
 
     print(f"Clean isolated worktree removed; local branch {state.branch_name} remains.")
+
+
+def _offer_isolated_commit(handle) -> bool:
+    """Offer one operator-approved local commit for an eligible dirty worktree."""
+
+    try:
+        commit_message = input("Commit message (blank to preserve worktree): ")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        _print_isolated_commit_preserved()
+        return False
+    if not commit_message:
+        _print_isolated_commit_preserved()
+        return False
+
+    from agent_workbench.worktree_commits import (
+        create_isolated_commit,
+        plan_isolated_commit,
+    )
+
+    try:
+        plan = plan_isolated_commit(handle, commit_message)
+    except (ConfigurationError, CompletionError) as exc:
+        print(f"Isolated commit planning: {exc}")
+        _print_isolated_commit_preserved()
+        return False
+
+    try:
+        result = create_isolated_commit(
+            plan,
+            _prompt_for_isolated_commit_approval,
+        )
+    except (ConfigurationError, CompletionError) as exc:
+        print(f"Isolated commit: {exc}")
+        _print_isolated_commit_preserved()
+        return False
+
+    print(
+        "Isolated commit created on local branch "
+        f"{result.branch_name}. Operations: {result.operation_count} "
+        f"(added: {result.added_count}, modified: {result.modified_count})."
+    )
+    print(f"New isolated HEAD: {result.new_head}")
+    print("Primary working tree unchanged.")
+    return True
+
+
+def _print_isolated_commit_preserved() -> None:
+    """Print bounded operator-side recovery guidance without cleanup."""
+
+    print(
+        "The isolated worktree and local branch were preserved for manual recovery. "
+        "Inspect the isolated index, HEAD, and working tree before continuing. "
+        "No destructive automatic cleanup was attempted."
+    )
+
+
+def _prompt_for_isolated_commit_approval(request) -> ToolApprovalDecision:
+    """Render one complete immutable commit preview and prompt exactly once."""
+
+    preview = request.preview
+    if not isinstance(preview, dict):
+        return ToolApprovalDecision.DENY
+
+    print("\nIsolated commit approval required")
+    print(f"  Branch: {preview.get('branch', '[unavailable]')}")
+    print(f"  Old HEAD: {preview.get('old_head', '[unavailable]')}")
+    print("  Commit message:")
+    print(str(preview.get("commit_message", "[unavailable]")))
+    print(f"  Operations: {preview.get('operation_count', '[unavailable]')}")
+    print(f"  Added: {preview.get('added_count', '[unavailable]')}")
+    print(f"  Modified: {preview.get('modified_count', '[unavailable]')}")
+    print(f"  Changed lines: {preview.get('total_changed_lines', '[unavailable]')}")
+    print("  Approved paths:")
+    paths = preview.get("paths")
+    if isinstance(paths, list) and all(isinstance(path, str) for path in paths):
+        for path in paths:
+            print(f"    - {path}")
+    else:
+        print("    [unavailable]")
+
+    print("  Complete diffs:")
+    changes = preview.get("changes")
+    if isinstance(changes, list):
+        for change in changes:
+            if not isinstance(change, dict):
+                continue
+            path = change.get("path")
+            diff = change.get("diff")
+            if isinstance(path, str) and isinstance(diff, str):
+                print(f"    {path}:")
+                print(diff, end="" if diff.endswith("\n") else "\n")
+
+    print("  Warning: only the isolated local branch is affected.")
+    print("  Staging is limited to the exact listed paths.")
+    print("  No amend, merge, push, or branch deletion occurs.")
+    print(
+        "  Failed staging or commit can require manual recovery of the "
+        "isolated index/worktree."
+    )
+    print("  No destructive automatic cleanup will occur.")
+    try:
+        answer = input("Approve isolated commit? [y/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return ToolApprovalDecision.DENY
+    if answer in {"y", "yes"}:
+        return ToolApprovalDecision.APPROVE
+    return ToolApprovalDecision.DENY
 
 
 def _prompt_for_worktree_approval(

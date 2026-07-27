@@ -780,10 +780,20 @@ Creation and clean removal use fixed non-shell local Git commands with hooks
 disabled, isolated system/global configuration, a minimal environment,
 post-approval revalidation, timeouts, and bounded output.
 
-Dirty worktrees are preserved without a removal prompt. Clean worktrees receive
-a second exact default-deny approval; approved removal leaves the local branch.
-There is no automatic commit, merge, push, branch deletion, reset, clean,
-stash, forced removal, or arbitrary Git command.
+Dirty worktrees first remain visible for manual review. A blank commit message
+preserves them. A non-blank message is passed unchanged to the isolated commit
+planner; eligible changes receive a complete diff preview and one exact
+default-deny commit approval. Verified success advances only the isolated local
+branch and displays its new HEAD. Clean worktrees then receive a distinct
+default-deny removal approval; approved removal leaves the local branch and
+commit.
+
+Commit planning requires a clean real index and supports only modified tracked
+or new untracked UTF-8 regular files. It rejects deletions, renames, copies,
+mode changes, symlinks, submodules, binaries, conflicts, and pre-staged
+content. There is no automatic approval, merge, push, branch deletion, reset,
+restore, clean, stash, forced removal, or arbitrary Git command. Failures after
+staging begins preserve partial state for deliberate manual recovery.
 
 ## Current Limitations
 
