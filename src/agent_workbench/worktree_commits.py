@@ -1,8 +1,9 @@
 """Validated planning for approved commits inside isolated Git worktrees."""
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 import difflib
+from enum import StrEnum
 import hashlib
 import json
 import os
@@ -14,7 +15,11 @@ import threading
 from typing import cast
 
 from agent_workbench.errors import CompletionError, ConfigurationError
-from agent_workbench.tools import JSONObject
+from agent_workbench.tools import (
+    JSONObject,
+    JSONValue,
+    ToolApprovalDecision,
+)
 from agent_workbench.worktrees import WorktreeHandle, inspect_git_worktree
 
 MAX_COMMIT_FILE_BYTES = 100 * 1024
@@ -186,6 +191,72 @@ class IsolatedCommitPlan:
         return cast(JSONObject, json.loads(self._preview_json))
 
 
+class IsolatedCommitAction(StrEnum):
+    """Identify one operator-side isolated commit action."""
+
+    CREATE = "create_isolated_commit"
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class IsolatedCommitApprovalRequest:
+    """Provide one immutable exact isolated-commit preview for approval."""
+
+    action: IsolatedCommitAction
+    _preview_json: str = field(repr=False)
+
+    def __init__(
+        self,
+        action: IsolatedCommitAction,
+        preview: JSONValue,
+    ) -> None:
+        """Validate and snapshot one strict-JSON approval preview."""
+
+        if not isinstance(action, IsolatedCommitAction):
+            raise ConfigurationError(
+                "isolated commit approval action must be an IsolatedCommitAction."
+            )
+        try:
+            preview_json = json.dumps(
+                preview,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        except (TypeError, ValueError):
+            raise ConfigurationError(
+                "isolated commit approval preview must be strict JSON."
+            ) from None
+        object.__setattr__(self, "action", action)
+        object.__setattr__(self, "_preview_json", preview_json)
+
+    @property
+    def preview(self) -> JSONObject:
+        """Return an independent copy of the exact approval preview."""
+
+        return cast(JSONObject, json.loads(self._preview_json))
+
+
+type IsolatedCommitApprovalHandler = Callable[
+    [IsolatedCommitApprovalRequest],
+    ToolApprovalDecision,
+]
+
+
+@dataclass(frozen=True, slots=True)
+class IsolatedCommitResult:
+    """Return safe verified metadata for one created local commit."""
+
+    branch_name: str
+    old_head: str
+    new_head: str
+    commit_message: str
+    paths: tuple[str, ...]
+    operation_count: int
+    added_count: int
+    modified_count: int
+
+
 @dataclass(frozen=True, slots=True)
 class _GitOutput:
     """Store bounded exact output from one fixed Git command."""
@@ -277,6 +348,123 @@ def plan_isolated_commit(
         diff_fingerprint=fingerprint,
         preview_json=preview_json,
     )
+
+
+def create_isolated_commit(
+    plan: IsolatedCommitPlan,
+    approval_handler: IsolatedCommitApprovalHandler | None,
+) -> IsolatedCommitResult:
+    """Stage, commit, and verify one exact approved isolated plan."""
+
+    if not isinstance(plan, IsolatedCommitPlan):
+        raise ConfigurationError(
+            "isolated commit creation requires an IsolatedCommitPlan."
+        )
+    _require_commit_approval(plan, approval_handler)
+
+    try:
+        current_plan = plan_isolated_commit(
+            plan.worktree,
+            plan.commit_message,
+        )
+    except ConfigurationError:
+        raise CompletionError(
+            "Isolated commit plan is stale; no paths were staged and no "
+            "commit was created."
+        ) from None
+    if current_plan != plan:
+        raise CompletionError(
+            "Isolated commit plan is stale; no paths were staged and no "
+            "commit was created."
+        )
+
+    try:
+        stage_outcome = _run_git(
+            plan.worktree.worktree_path,
+            ("add", "--", *plan.paths),
+        )
+    except ConfigurationError:
+        raise CompletionError(
+            _commit_failure_message(plan, "Exact staging failed")
+        ) from None
+    if stage_outcome.returncode != 0:
+        raise CompletionError(_commit_failure_message(plan, "Exact staging failed"))
+
+    try:
+        _verify_staged_plan(plan)
+    except (CompletionError, ConfigurationError):
+        raise CompletionError(
+            _commit_failure_message(plan, "Staged-state verification failed")
+        ) from None
+
+    commit_arguments = (
+        "-c",
+        "commit.gpgSign=false",
+        "-c",
+        "tag.gpgSign=false",
+        "-c",
+        "core.editor=false",
+        "commit",
+        "--no-verify",
+        "--no-gpg-sign",
+        "--cleanup=verbatim",
+        "--file=-",
+    )
+    try:
+        commit_outcome = _run_git(
+            plan.worktree.worktree_path,
+            commit_arguments,
+            input_bytes=plan.commit_message.encode("utf-8"),
+        )
+    except ConfigurationError:
+        raise CompletionError(
+            _commit_failure_message(plan, "Local commit creation failed")
+        ) from None
+    if commit_outcome.returncode != 0:
+        raise CompletionError(
+            _commit_failure_message(plan, "Local commit creation failed")
+        )
+
+    try:
+        new_head = _read_head(plan.worktree.worktree_path)
+        _verify_created_commit(plan, new_head)
+    except (CompletionError, ConfigurationError):
+        raise CompletionError(
+            _commit_failure_message(plan, "Commit verification failed")
+        ) from None
+
+    return IsolatedCommitResult(
+        branch_name=plan.branch_name,
+        old_head=plan.old_head,
+        new_head=new_head,
+        commit_message=plan.commit_message,
+        paths=plan.paths,
+        operation_count=plan.operation_count,
+        added_count=plan.added_count,
+        modified_count=plan.modified_count,
+    )
+
+
+def _require_commit_approval(
+    plan: IsolatedCommitPlan,
+    approval_handler: IsolatedCommitApprovalHandler | None,
+) -> None:
+    """Require one exact explicit decision before any index mutation."""
+
+    if approval_handler is None:
+        raise CompletionError("Isolated commit creation requires explicit approval.")
+    request = IsolatedCommitApprovalRequest(
+        IsolatedCommitAction.CREATE,
+        plan.preview,
+    )
+    try:
+        decision = approval_handler(request)
+    except Exception:
+        raise CompletionError("Unable to obtain isolated commit approval.") from None
+    if decision is ToolApprovalDecision.DENY:
+        raise CompletionError("Isolated commit approval was denied.")
+    if decision is not ToolApprovalDecision.APPROVE:
+        raise CompletionError("Isolated commit approval decision is invalid.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -542,6 +730,369 @@ def _collect_changes(
             )
         changes.append(change)
     return tuple(sorted(changes, key=lambda change: change.path))
+
+
+def _verify_staged_plan(plan: IsolatedCommitPlan) -> None:
+    """Require the real index and staged content to equal the approved plan."""
+
+    _verify_plan_identity(
+        plan,
+        expected_worktree_head=plan.old_head,
+    )
+    status_output = _run_git(
+        plan.worktree.worktree_path,
+        ("status", "--porcelain=v1", "-z", "--untracked-files=all"),
+    )
+    if status_output.returncode != 0:
+        raise CompletionError("Unable to inspect staged isolated commit state.")
+    staged_status = _parse_expected_staged_status(status_output.stdout)
+    if tuple(sorted(staged_status)) != plan.paths:
+        raise CompletionError("Staged path set differs from the approved plan.")
+
+    actual_changes = tuple(
+        _read_staged_change(
+            plan.worktree.worktree_path,
+            change,
+            staged_status[change.path],
+        )
+        for change in plan._changes
+    )
+    if actual_changes != plan._changes:
+        raise CompletionError("Staged content differs from the approved plan.")
+
+    author_name = _read_local_identity(
+        plan.worktree.worktree_path,
+        "user.name",
+    )
+    author_email = _read_local_identity(
+        plan.worktree.worktree_path,
+        "user.email",
+    )
+    fingerprint = _fingerprint(
+        worktree=plan.worktree,
+        old_head=plan.old_head,
+        source_branch=plan.source_branch,
+        commit_message=plan.commit_message,
+        author_name=author_name,
+        author_email=author_email,
+        changes=actual_changes,
+    )
+    if fingerprint != plan.diff_fingerprint:
+        raise CompletionError("Staged diff fingerprint differs from approval.")
+
+
+def _parse_expected_staged_status(output: bytes) -> dict[str, str]:
+    """Return exact staged paths while rejecting unstaged or unexpected state."""
+
+    staged: dict[str, str] = {}
+    for entry in output.split(b"\0"):
+        if not entry:
+            continue
+        if len(entry) < 4 or entry[2:3] != b" ":
+            raise CompletionError("Staged Git status is invalid.")
+        try:
+            status_code = entry[:2].decode("ascii")
+            path = entry[3:].decode("utf-8")
+        except UnicodeDecodeError:
+            raise CompletionError("Staged Git status is invalid.") from None
+        if status_code not in ("A ", "M "):
+            raise CompletionError(
+                "Staged state contains an unsupported or unstaged change."
+            )
+        if path in staged:
+            raise CompletionError("Staged path set is ambiguous.")
+        staged[path] = status_code[0]
+    return staged
+
+
+def _read_staged_change(
+    worktree: Path,
+    approved: _CommitChange,
+    staged_status: str,
+) -> _CommitChange:
+    """Reconstruct one exact staged change using real index objects."""
+
+    expected_status = "A" if approved.operation == "add" else "M"
+    if staged_status != expected_status:
+        raise CompletionError("Staged operation differs from the approved plan.")
+    mode, object_id = _read_index_entry(worktree, approved.path)
+    content_output = _run_git(worktree, ("cat-file", "blob", object_id))
+    if content_output.returncode != 0:
+        raise CompletionError("Unable to read staged commit content.")
+    current_content = content_output.stdout
+    current_text = _decode_file_content(current_content)
+    old_text = _decode_file_content(approved.old_content)
+    changed_lines = _count_changed_lines(old_text, current_text)
+    operation = approved.operation
+    return _CommitChange(
+        path=approved.path,
+        operation=operation,
+        old_content=approved.old_content,
+        current_content=current_content,
+        old_mode=approved.old_mode,
+        current_mode=mode,
+        changed_lines=changed_lines,
+        diff=_create_unified_diff(
+            approved.path,
+            old_text,
+            current_text,
+            operation=operation,
+        ),
+    )
+
+
+def _verify_plan_identity(
+    plan: IsolatedCommitPlan,
+    *,
+    expected_worktree_head: str,
+) -> None:
+    """Verify source, worktree, branch, operation, and upstream identities."""
+
+    try:
+        state = inspect_git_worktree(plan.worktree)
+    except (CompletionError, ConfigurationError):
+        raise CompletionError("Isolated commit worktree identity changed.") from None
+    if (
+        state.branch_name != plan.branch_name
+        or state.head != expected_worktree_head
+        or _read_symbolic_branch(plan.worktree.worktree_path) != plan.branch_name
+        or _read_head(plan.worktree.worktree_path) != expected_worktree_head
+    ):
+        raise CompletionError("Isolated commit worktree identity changed.")
+    if (
+        _read_symbolic_branch(plan.worktree.source_repository) != plan.source_branch
+        or _read_head(plan.worktree.source_repository) != plan.source_head
+    ):
+        raise CompletionError("Primary source identity changed.")
+    _reject_in_progress_operation(plan.worktree.source_repository)
+    _reject_in_progress_operation(plan.worktree.worktree_path)
+    _require_no_upstream(plan.worktree.worktree_path)
+
+
+def _verify_created_commit(
+    plan: IsolatedCommitPlan,
+    new_head: str,
+) -> None:
+    """Verify parent, message, paths, blobs, index, worktree, and source."""
+
+    if new_head == plan.old_head:
+        raise CompletionError("Isolated commit HEAD did not advance.")
+    _verify_plan_identity(
+        plan,
+        expected_worktree_head=new_head,
+    )
+
+    parents = _run_git(
+        plan.worktree.worktree_path,
+        ("rev-list", "--parents", "-n", "1", new_head),
+    )
+    try:
+        parent_fields = parents.stdout.decode("ascii").strip().split()
+    except UnicodeDecodeError:
+        raise CompletionError("Created commit parent state is invalid.") from None
+    if parents.returncode != 0 or parent_fields != [new_head, plan.old_head]:
+        raise CompletionError("Created commit must have exactly the old HEAD parent.")
+
+    commit_object = _run_git(
+        plan.worktree.worktree_path,
+        ("cat-file", "commit", new_head),
+    )
+    separator = commit_object.stdout.find(b"\n\n")
+    if commit_object.returncode != 0 or separator < 0:
+        raise CompletionError("Unable to inspect the created commit message.")
+    stored_message = commit_object.stdout[separator + 2 :]
+    approved_message = plan.commit_message.encode("utf-8")
+    if stored_message not in (approved_message, approved_message + b"\n"):
+        raise CompletionError("Created commit message differs from approval.")
+
+    committed_status = _read_committed_status(
+        plan.worktree.worktree_path,
+        new_head,
+    )
+    expected_status = {
+        change.path: ("A" if change.operation == "add" else "M")
+        for change in plan._changes
+    }
+    if committed_status != expected_status:
+        raise CompletionError("Created commit path set differs from approval.")
+
+    committed_changes = tuple(
+        _read_committed_change(
+            plan.worktree.worktree_path,
+            new_head,
+            change,
+        )
+        for change in plan._changes
+    )
+    if committed_changes != plan._changes:
+        raise CompletionError("Created commit diff differs from approval.")
+
+    _require_clean_index(plan.worktree.worktree_path)
+    status = _run_git(
+        plan.worktree.worktree_path,
+        ("status", "--porcelain=v1", "-z", "--untracked-files=all"),
+    )
+    if status.returncode != 0 or status.stdout:
+        raise CompletionError("Created commit did not leave a clean worktree.")
+
+
+def _read_committed_status(worktree: Path, commit: str) -> dict[str, str]:
+    """Return exact add/modify status for one created commit."""
+
+    output = _run_git(
+        worktree,
+        (
+            "diff-tree",
+            "--no-commit-id",
+            "--name-status",
+            "--no-renames",
+            "-r",
+            "-z",
+            commit,
+        ),
+    )
+    if output.returncode != 0:
+        raise CompletionError("Unable to inspect created commit paths.")
+    fields = [field for field in output.stdout.split(b"\0") if field]
+    committed: dict[str, str] = {}
+    index = 0
+    while index < len(fields):
+        field = fields[index]
+        index += 1
+        if b"\t" in field:
+            status_bytes, path_bytes = field.split(b"\t", 1)
+        else:
+            if index >= len(fields):
+                raise CompletionError("Created commit path status is invalid.")
+            status_bytes = field
+            path_bytes = fields[index]
+            index += 1
+        try:
+            status_code = status_bytes.decode("ascii")
+            path = path_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            raise CompletionError("Created commit path status is invalid.") from None
+        if status_code not in ("A", "M") or path in committed:
+            raise CompletionError("Created commit contains an unsupported path.")
+        committed[path] = status_code
+    return committed
+
+
+def _read_committed_change(
+    worktree: Path,
+    commit: str,
+    approved: _CommitChange,
+) -> _CommitChange:
+    """Reconstruct one committed tree entry and complete unified diff."""
+
+    mode, object_id = _read_tree_entry(worktree, commit, approved.path)
+    content_output = _run_git(worktree, ("cat-file", "blob", object_id))
+    if content_output.returncode != 0:
+        raise CompletionError("Unable to read created commit content.")
+    current_content = content_output.stdout
+    old_text = _decode_file_content(approved.old_content)
+    current_text = _decode_file_content(current_content)
+    return _CommitChange(
+        path=approved.path,
+        operation=approved.operation,
+        old_content=approved.old_content,
+        current_content=current_content,
+        old_mode=approved.old_mode,
+        current_mode=mode,
+        changed_lines=_count_changed_lines(old_text, current_text),
+        diff=_create_unified_diff(
+            approved.path,
+            old_text,
+            current_text,
+            operation=approved.operation,
+        ),
+    )
+
+
+def _read_tree_entry(
+    worktree: Path,
+    commit: str,
+    relative_path: str,
+) -> tuple[int, str]:
+    """Return one exact tree mode and blob id."""
+
+    output = _run_git(
+        worktree,
+        ("ls-tree", "-z", commit, "--", relative_path),
+    )
+    entries = [entry for entry in output.stdout.split(b"\0") if entry]
+    if output.returncode != 0 or len(entries) != 1:
+        raise CompletionError("Created commit tree entry is invalid.")
+    metadata, separator, path = entries[0].partition(b"\t")
+    parts = metadata.split()
+    if not separator or path != relative_path.encode() or len(parts) != 3:
+        raise CompletionError("Created commit tree entry is invalid.")
+    try:
+        mode = int(parts[0], 8)
+        entry_type = parts[1].decode("ascii")
+        object_id = parts[2].decode("ascii")
+    except (UnicodeDecodeError, ValueError):
+        raise CompletionError("Created commit tree entry is invalid.") from None
+    if entry_type != "blob" or not _is_full_object_id(object_id):
+        raise CompletionError("Created commit tree entry is unsupported.")
+    return mode, object_id
+
+
+def _commit_failure_message(plan: IsolatedCommitPlan, reason: str) -> str:
+    """Return bounded safe partial index/ref state for manual recovery."""
+
+    head_changed = "unknown"
+    branch = plan.branch_name
+    index_dirty = "unknown"
+    worktree_dirty = "unknown"
+    staged_paths: tuple[str, ...] = ()
+    try:
+        head_changed = (
+            "yes" if _read_head(plan.worktree.worktree_path) != plan.old_head else "no"
+        )
+    except ConfigurationError:
+        pass
+    try:
+        current_branch = _read_symbolic_branch(plan.worktree.worktree_path)
+        if current_branch:
+            branch = current_branch
+    except ConfigurationError:
+        pass
+    try:
+        staged = _run_git(
+            plan.worktree.worktree_path,
+            ("diff", "--cached", "--name-only", "-z", "--"),
+        )
+        if staged.returncode == 0:
+            decoded_paths = []
+            for raw_path in staged.stdout.split(b"\0"):
+                if not raw_path:
+                    continue
+                try:
+                    path = raw_path.decode("utf-8")
+                except UnicodeDecodeError:
+                    path = "[invalid path]"
+                decoded_paths.append(path)
+            staged_paths = tuple(sorted(decoded_paths))
+            index_dirty = "yes" if staged_paths else "no"
+    except ConfigurationError:
+        pass
+    try:
+        status = _run_git(
+            plan.worktree.worktree_path,
+            ("status", "--porcelain=v1", "-z", "--untracked-files=all"),
+        )
+        if status.returncode == 0:
+            worktree_dirty = "yes" if status.stdout else "no"
+    except ConfigurationError:
+        pass
+    staged_display = ", ".join(staged_paths) if staged_paths else "[none or unknown]"
+    return (
+        f"{reason}; manual inspection is required "
+        f"(HEAD changed: {head_changed}; branch: {branch}; "
+        f"index dirty: {index_dirty}; staged paths: {staged_display}; "
+        f"worktree dirty: {worktree_dirty}). No automatic recovery was attempted."
+    )
 
 
 def _reject_unreported_unsafe_entries(
