@@ -13,14 +13,14 @@ from agent_workbench.config import (
 from agent_workbench.context import ContextDocument
 from agent_workbench.interactive_setup import run_interactive_setup
 from agent_workbench.errors import CompletionError, ConfigurationError
-from agent_workbench.messages import ChatRequest, Message, ToolInteractionRound
+from agent_workbench.messages import ToolInteractionRound
 from agent_workbench.providers.base import ChatProvider
 from agent_workbench.providers.factory import create_provider
 from agent_workbench.agents import AgentProfile
 from agent_workbench.generation import GenerationConfig
+from agent_workbench.session import AgentSession, SessionId
 from agent_workbench.structured_outputs import JSONResponseFormat
 from agent_workbench.symbol_tools import register_symbol_tools
-from agent_workbench.tool_calling import run_tool_calling_loop
 from agent_workbench.tool_registry import ToolRegistry
 from agent_workbench.workspace import Workspace
 from agent_workbench.workspace_tools import register_workspace_tools
@@ -44,7 +44,17 @@ def run_cli(
     """Run an interactive conversation using the provided model provider."""
 
     active_generation_config = generation_config or GenerationConfig()
-    messages: list[Message] = []
+    session = AgentSession(
+        id=SessionId("cli-session"),
+        provider=provider,
+        system_prompt=system_prompt,
+        agent_profile=agent_profile,
+        context_documents=context_documents,
+        generation_config=active_generation_config,
+        response_format=response_format,
+        tool_registry=tool_registry,
+        max_tool_rounds=max_tool_rounds,
+    )
 
     header = (
         f"Agent Workbench | Provider: {provider.name} | Model: {provider.model_name}"
@@ -74,48 +84,17 @@ def run_cli(
             print("Session ended.")
             break
 
-        user_message: Message = {
-            "role": "user",
-            "content": user_input,
-        }
-        request_messages = [*messages, user_message]
-
         try:
-            request = ChatRequest(
-                messages=request_messages,
-                system_prompt=system_prompt,
-                context_documents=context_documents,
-                generation_config=active_generation_config,
-                response_format=response_format,
-                tools=tool_registry.definitions if tool_registry is not None else (),
-            )
-
-            if tool_registry is None:
-                assistant_response = provider.complete(request)
-            elif show_tool_traces:
-                assistant_response = run_tool_calling_loop(
-                    provider,
-                    request,
-                    tool_registry,
-                    max_tool_rounds,
+            if tool_registry is not None and show_tool_traces:
+                assistant_response = session.send(
+                    user_input,
                     tool_round_observer=_display_tool_round,
                 )
             else:
-                assistant_response = run_tool_calling_loop(
-                    provider,
-                    request,
-                    tool_registry,
-                    max_tool_rounds,
-                )
+                assistant_response = session.send(user_input)
         except CompletionError as exc:
             print(f"Error: {exc}\n")
             continue
-
-        assistant_message: Message = {
-            "role": "assistant",
-            "content": assistant_response.text,
-        }
-        messages = [*request_messages, assistant_message]
 
         print(f"Assistant: {assistant_response.text}\n")
 
