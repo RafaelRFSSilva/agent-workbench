@@ -27,7 +27,8 @@ Agent Workbench currently provides:
   inspection, approved structured file changes, and fixed validation commands.
 - Reusable provider-independent `AgentSession` construction.
 - Supervised local Git worktree creation, isolated session construction,
-  dirty-state preservation, and clean-only approved removal.
+  complete approved local commits, dirty-state preservation, and clean-only
+  approved removal.
 - Automated tests, Ruff checks, and GitHub Actions.
 
 The current application manages one conversation at a time.
@@ -324,8 +325,9 @@ The user remains responsible for permissions, approvals, and final decisions.
 
 ### Status
 
-The first supervised single-worktree boundary is complete. Concurrent
-worktrees, review/merge workflows, and crash recovery remain planned.
+The first supervised single-worktree boundary and its explicitly approved
+local commit completion flow are complete. Concurrent worktrees, push/PR/merge
+workflows, deletion/rename support, and crash recovery remain planned.
 
 ### Objective
 
@@ -345,14 +347,26 @@ without coordination.
 - [x] Preserve dirty, partial, failed, and ambiguous worktrees for manual
   recovery.
 - [x] Validate a real isolated local `gpt-oss:20b` coding workflow.
+- [x] Add immutable validated isolated commit plans with a clean-index
+  requirement and complete message, path, and unified-diff previews.
+- [x] Revalidate after exact one-use approval, stage only approved paths, and
+  verify the complete staged path set and diff.
+- [x] Create fixed hookless, editorless, unsigned local commits and verify
+  parent, message, paths, diff, index, worktree, and unchanged primary state.
+- [x] Preserve partial index and ambiguous ref state for manual recovery.
+- [x] Integrate commit message and complete commit approval into the CLI.
+- [x] Validate the complete local flow with `COMMIT-842`.
+- [x] Add a self-hosting operator guide.
 - [ ] Add controlled patch application.
 - [ ] Add conflict detection.
 - [ ] Add review-before-apply workflows.
-- [ ] Add automatic or approved local commits.
+- [ ] Add deletion, rename, copy, and mode-changing commits.
+- [ ] Add optional commit signing.
+- [ ] Add automatic push and Pull Request creation.
 - [ ] Add merge workflows.
 - [ ] Add branch deletion.
 - [ ] Add several concurrent worktrees and orchestration.
-- [ ] Add persistent lifecycle records and crash recovery.
+- [ ] Add persistent lifecycle records and crash-safe staging/commit recovery.
 
 A possible layout is:
 
@@ -566,18 +580,21 @@ Security must be implemented throughout the roadmap.
 
 The next implementation milestone is:
 
-> Review and completion workflows for isolated local branches.
+> Provider-independent task specifications for bounded supervised work.
 
 The completed boundary can create one approved local branch/worktree, run one
-isolated session, and preserve its dirty output. The next work should improve
-how an operator reviews and completes that local branch without introducing
-automatic push, unrestricted Git, or implicit destructive cleanup.
+isolated session, review and commit its exact eligible diff, remove the clean
+worktree separately, and preserve the local branch and commit. The next work
+should describe small acceptance-testable tasks without introducing
+orchestration, automatic push, unrestricted Git, or implicit destructive
+cleanup.
 
 ## Near-Term Sequence
 
-1. Add reviewed completion for isolated local branches.
+1. Add provider-independent immutable task specifications and session task
+   metadata.
 2. Add crash-safe transaction and worktree lifecycle recovery.
-3. Add deletion/rename transactions and task acceptance criteria.
+3. Add deletion/rename transactions and conflict handling.
 4. Build local project retrieval and project configuration.
 5. Add multi-agent foundations, then terminal and VS Code experiences.
 
@@ -588,6 +605,7 @@ automatic push, unrestricted Git, or implicit destructive cleanup.
 - [Getting Started](getting-started.md)
 - [Runtime Configuration](runtime-configuration.md)
 - [Agent Profiles](agent-profiles.md)
+- [Self-Hosting](self-hosting.md)
 - [Context Files](context-files.md)
 - [Structured Outputs](structured-outputs.md)
 - [Project Configuration](project-configuration.md)

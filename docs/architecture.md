@@ -1056,10 +1056,114 @@ created worktree and branch.
 The CLI activates this boundary only when both `--worktree-path` and
 `--worktree-branch` accompany `--workspace`. It separately prompts for
 creation, runs the normal CLI with one prebuilt isolated session, then
-re-inspects. Dirty output is preserved with safe recovery information. A
-clean worktree may be removed only after a second default-deny approval, and
-its local branch remains. Successful local Git commands cannot provide
-crash-safe guarantees; unexpected state always requires manual recovery.
+re-inspects. Dirty output is preserved with safe recovery information and may
+enter the separately approved commit boundary below. A clean worktree may be
+removed only after its own default-deny approval, and its local branch remains.
+Successful local Git commands cannot provide crash-safe guarantees; unexpected
+state always requires manual recovery.
+
+### Approved isolated commit boundary
+
+`IsolatedCommitPlan` is a frozen, slotted, validated-only snapshot associated
+with a verified `WorktreeHandle`. It pins the isolated branch and old HEAD,
+primary branch and HEAD, repository-local author identity, exact commit
+message, deterministic complete path set, operations, old and current bytes,
+complete unified diffs, aggregate counts, and a SHA-256 fingerprint. Canonical
+source and worktree paths remain private.
+
+Planning is read-only. It revalidates the source and target identities, active
+Git operations, absence of upstream tracking, and a clean real index. Every
+current change must be eligible; no path is silently excluded. The first
+boundary supports:
+
+* Modifications to tracked UTF-8 regular files.
+* New untracked UTF-8 regular files.
+
+It rejects deletions, renames, copies, mode changes, symlinks, submodules,
+binaries, conflicts, staged or intent-to-add entries, unsafe or ignored paths,
+and arbitrary path selection outside the plan. Limits are 100 KiB each for a
+file's old and current content, 500 changed lines per file, 32 files, 1 MiB
+combined old bytes, 1 MiB combined current bytes, 4,000 combined changed lines,
+a 512 KiB complete preview, and a 4 KiB UTF-8 commit message.
+
+```text
+Dirty verified isolated worktree
+        ↓
+Validate every changed entry
+        ↓
+Require clean index
+        ↓
+Create immutable commit plan
+        ↓
+Review exact message, paths, and complete diffs
+        ↓
+Approve once
+        ↓
+Revalidate branch, HEAD, index, paths, contents, and diff
+        ↓
+Stage only approved paths
+        ↓
+Verify exact staged path set and diff
+        ↓
+Create fixed local commit
+        ↓
+Verify parent, message, paths, diff, index, and worktree
+        ↓
+Verify primary worktree unchanged
+        ↓
+Optionally approve clean worktree removal
+        ↓
+Preserve local branch and commit
+```
+
+`IsolatedCommitApprovalRequest` contains an independent immutable copy of the
+complete preview. Approval is explicit, exact, one-use, and never available to
+the model. After approval, the implementation regenerates and compares the
+entire plan before any staging. It stages only the sorted approved paths,
+reconstructs their actual index blobs and modes, and requires the exact
+approved staged path set, operations, content, diffs, identity, and
+fingerprint.
+
+The only mutating commit forms are equivalent to:
+
+```text
+git -C WORKTREE add -- APPROVED_PATHS...
+
+git -C WORKTREE \
+  -c core.hooksPath=/dev/null \
+  -c commit.gpgSign=false \
+  -c tag.gpgSign=false \
+  -c core.editor=false \
+  commit \
+  --no-verify \
+  --no-gpg-sign \
+  --file=-
+```
+
+The exact message is supplied through standard input. Git hooks, signing, and
+editors are disabled; the repository-local `user.name` and `user.email` are
+required and pinned. There is no add-dot, add-all, commit-all, amend, merge,
+rebase, push, fetch, pull, reset, clean, stash, restore, checkout, switch,
+branch deletion, force removal, arbitrary Git subcommand, arbitrary flag,
+shell execution, or caller-controlled environment.
+
+After the command, verification requires one new commit whose sole parent is
+the approved old HEAD, the exact approved message, exact add/modify path set,
+tree blobs, modes, and diffs, a clean index and worktree, the same isolated
+branch without upstream, and the unchanged primary branch, HEAD, and clean
+state. `IsolatedCommitResult` exposes only safe branch, old/new HEAD, message,
+ordered paths, and counts. Clean removal is then planned and approved
+separately; it preserves the local branch and reachable commit.
+
+The boundary is deliberately not transactional across staging and commit.
+Before staging, stale state causes no Git mutation. Once staging begins, a
+failure may leave the exact or a partial index staged; the implementation
+reports bounded relative staged paths and performs no automatic unstage or
+cleanup. Once commit begins, an unexpected advanced HEAD or unverifiable
+metadata remains in place. There is no retry, amend, reset, restore, clean,
+stash, forced removal, or branch deletion. The operator must inspect the
+isolated index, HEAD, branch, and worktree manually. This is conservative
+handled-failure behavior, not crash-safe recovery.
 
 ## Agent Session Boundary
 
@@ -1198,9 +1302,11 @@ The architecture follows these current security rules:
 
 Current workspace execution adds explicit authorization, path containment,
 fixed-command confirmation, approved writes, and optional redacted traces.
-Worktree creation adds write isolation for one supervised local session.
-Broader destructive-action permissions, persistent audit records, stronger
-secret isolation, and network-access controls remain future work.
+Worktree creation adds write isolation for one supervised local session, and
+the approved commit boundary can complete eligible reviewed add/modify work on
+that isolated branch. Broader destructive-action permissions, persistent audit
+records, stronger secret isolation, and network-access controls remain future
+work.
 
 ## Architectural Non-Goals
 
@@ -1212,7 +1318,7 @@ The current architecture does not yet provide:
 * Project indexing.
 * Retrieval-Augmented Generation.
 * Persistent task state.
-* Automatic Git commits, merge, push, or branch deletion.
+* Automatic commit approval, merge, push, or branch deletion.
 * Concurrent worktree orchestration.
 * A VS Code extension.
 * Background execution.

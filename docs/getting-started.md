@@ -727,11 +727,19 @@ Construct isolated AgentSession
         ↓
 Inspect, patch, Ruff, pytest, status, diff
         ↓
-Preserve dirty worktree for manual review
+Validate every changed entry and require a clean index
         ↓
-Remove only after it becomes clean and removal is approved
+Enter an exact commit message
         ↓
-Keep local branch
+Review complete ordered paths and unified diffs
+        ↓
+Approve one exact isolated local commit
+        ↓
+Verify commit and unchanged primary worktree
+        ↓
+Separately approve clean worktree removal
+        ↓
+Keep local branch and commit
 ```
 
 Before the first prompt, `WorktreePlan` pins the canonical source root, complete
@@ -757,17 +765,40 @@ relative path and reloaded from the worktree; missing mapped or external
 context is rejected. Provider, model, profile, prompt, generation, output,
 tool, action, and trace settings remain unchanged.
 
-After the CLI exits, a dirty worktree is never offered for removal. Agent
-Workbench reports its safe target, branch, and changed-entry count and leaves
-both worktree and branch for manual review. A clean worktree receives a
-separate complete removal preview and default-deny prompt. Approved cleanup
-removes only that verified clean worktree without `--force`; it never deletes
-the local branch.
+After a dirty CLI exit, Agent Workbench reports the safe target, branch, and
+changed-entry count, then asks:
 
-The boundary intentionally provides no automatic commit, merge, push, branch
-deletion, reset, clean, stash, or forced removal. Dirty, partial, unexpected,
-and ambiguous states require manual recovery. Fixed local Git command success
-also cannot provide a crash-safe guarantee.
+```text
+Commit message (blank to preserve worktree):
+```
+
+Blank, EOF, or interruption preserves the dirty worktree without planning or
+staging. A valid non-blank message produces an immutable preview containing the
+exact branch, old HEAD, unchanged message, deterministic path list, counts, and
+every complete per-file unified diff. The operator then receives one
+default-deny prompt:
+
+```text
+Approve isolated commit? [y/N]:
+```
+
+Only `y` or `yes` approves. The implementation revalidates the complete plan,
+stages only its exact paths, verifies the staged path set and content, creates
+one fixed hookless/editorless/unsigned commit, and verifies its parent, message,
+paths, diff, index, worktree, branch, and unchanged primary source. After
+success it displays the new HEAD. Clean worktree removal remains a separate
+approval and never deletes the local branch or its commit.
+
+Supported commit entries are modified tracked and new untracked UTF-8 regular
+files. Deletions, renames, copies, mode changes, symlinks, submodules, binaries,
+conflicts, pre-staged content, and arbitrary path selection are rejected as a
+whole. Stale state before staging causes no Git mutation. Failures after
+staging begins may preserve a partially or fully staged index; failures after
+commit begins may preserve an ambiguous advanced HEAD. There is no automatic
+retry, amend, reset, restore, clean, stash, removal, or branch deletion.
+Manual inspection is required, and the boundary is not crash-safe.
+
+See [Self-Hosting](self-hosting.md) for a complete operator playbook.
 
 ## Configuration Precedence
 

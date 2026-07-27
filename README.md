@@ -33,8 +33,8 @@ Implemented capabilities:
   conversation ownership, and synchronous direct or tool-enabled sends.
 - Reusable `AgentSession` construction from resolved runtime configuration,
   including providers and deterministic optional tool registries.
-- Supervised local Git worktree isolation with separately approved creation
-  and clean-only removal.
+- Supervised local Git worktree isolation with separately approved creation,
+  exact local commits, and clean-only removal.
 - Automated tests, Ruff checks, and GitHub Actions.
 
 Arbitrary shell and network tools, RAG, MCP, asynchronous execution,
@@ -584,13 +584,19 @@ worktree command.
 
 The isolated `AgentSession` receives workspace tools for the new worktree only.
 Source-relative context files are reloaded from the corresponding isolated
-paths. A dirty worktree is preserved for manual inspection after the session.
-A clean worktree can be removed only through a second default-deny approval;
-the local branch remains.
+paths. At dirty exit, enter a commit message or leave it blank to preserve the
+worktree. Agent Workbench validates every change, requires a clean index, and
+shows the exact message, ordered paths, and complete diffs before a separate
+default-deny commit approval. A verified successful commit advances only the
+isolated local branch. Clean removal has another independent approval and
+preserves that branch and commit.
 
-This workflow never commits, merges, pushes, deletes a branch, resets, cleans,
-stashes, or force-removes a worktree. Partial, dirty, unexpected, and ambiguous
-states are preserved for manual recovery.
+The commit boundary supports modified tracked and new untracked UTF-8 regular
+files. It does not support deletion, rename, mode changes, symlinks, submodules,
+binaries, conflicts, or pre-staged content. Failures after staging begins may
+leave a partial or complete isolated index for manual recovery; there is no
+automatic reset, restore, clean, stash, retry, force removal, merge, push, or
+branch deletion. See the [self-hosting guide](docs/self-hosting.md).
 
 ## Configuration Precedence
 
@@ -619,6 +625,7 @@ Existing environment variables are not overwritten by `.env`.
 | [Product Vision](docs/product-vision.md) | Multi-agent VS Code workspace and voice input |
 | [Project Configuration](docs/project-configuration.md) | `.agent-workbench/`, skills, commands, and MCP |
 | [Roadmap](docs/roadmap.md) | Completed and planned milestones |
+| [Self-Hosting](docs/self-hosting.md) | Supervised local-agent coding and commit playbook |
 | [Development Log](DEVELOPMENT_LOG.md) | Implementation history and decisions |
 
 ## Roadmap Summary
@@ -634,12 +641,12 @@ Completed foundations:
 - [x] Provider-independent tool calling, calculator, safe workspace
   inspection, and controlled approved coding actions.
 - [x] Provider-independent AgentSession and reusable runtime factory.
+- [x] Supervised worktree isolation and approved exact local commits.
 
 Next milestones:
 
 - [ ] Local project retrieval and RAG.
 - [ ] Multi-agent orchestration.
-- [ ] Git worktree isolation.
 - [ ] Project configuration and MCP.
 - [ ] Terminal and VS Code interfaces.
 - [ ] Voice prompt input.
@@ -688,7 +695,7 @@ Agent Workbench does not yet provide:
 - Multiple simultaneous agents.
 - Multi-agent orchestration.
 - MCP integration.
-- Concurrent worktree management, automatic commits, merge, or push.
+- Concurrent worktree management, automatic approval, merge, or push.
 - A navigable terminal workspace.
 - A VS Code extension.
 - Voice prompt input.
