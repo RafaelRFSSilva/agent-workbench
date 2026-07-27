@@ -360,6 +360,11 @@ without coordination.
 - [x] Create fixed hookless, editorless, unsigned local commits and verify
   parent, message, paths, diff, index, worktree, and unchanged primary state.
 - [x] Preserve partial index and ambiguous ref state for manual recovery.
+- [x] Add immutable provider-independent recovery evidence for isolated commit
+  and worktree lifecycle failures.
+- [x] Re-inspect branch, target, registration, source HEAD, worktree HEAD,
+  index state, and staged paths after handled failures without automatic
+  reset, restore, clean, stash, forced removal, or branch deletion.
 - [x] Integrate commit message and complete commit approval into the CLI.
 - [x] Validate the complete local flow with `COMMIT-842`.
 - [x] Add a self-hosting operator guide.
@@ -584,29 +589,46 @@ Security must be implemented throughout the roadmap.
 
 ## Immediate Next Milestone
 
-The provider-independent task-specification foundation is complete.
+The provider-independent recovery-evidence foundation is complete.
 
-The current implementation provides immutable validated objectives and ordered
-acceptance criteria together with optional read-only `AgentSession` task
-metadata. It deliberately does not add automatic planning, task assignment,
-prompt injection, lifecycle state, persistence, or orchestration.
+Handled isolated-commit and worktree lifecycle failures now produce immutable
+structured evidence from conservative read-only Git inspection. The current
+implementation can report observed branch, target, registration, source HEAD,
+worktree HEAD, index, and staged-path state without performing destructive
+automatic cleanup.
+
+This foundation does not yet provide persistent lifecycle journals, restart
+recovery, automatic rollback, or recovery after process or machine failure.
 
 The next implementation milestone is:
 
-> Crash-safe transaction and worktree lifecycle recovery.
+> Autonomous coding loop.
 
-Current handled failures preserve ambiguous state for deliberate manual
-inspection. The next reliability work should improve recovery evidence and
-restart behavior without introducing automatic reset, restore, clean, stash,
-forced removal, branch deletion, or other destructive recovery.
+The first loop should allow one supervised agent to receive a development
+prompt and perform a complete bounded coding cycle:
+
+1. Convert the prompt into one explicit task specification.
+2. Inspect the workspace and relevant files.
+3. Produce an implementation plan.
+4. Apply controlled file changes through the existing workspace tools.
+5. Run the configured validation commands.
+6. Inspect validation failures and revise the implementation.
+7. Stop after success or a bounded iteration limit.
+8. Present the resulting status, validation output, and final diff.
+9. Create an exact local commit only after explicit operator approval.
+
+The initial implementation remains single-agent and single-worktree. It must
+not introduce arbitrary shell access, network access, automatic push, merge,
+branch deletion, or hidden approval.
 
 ## Near-Term Sequence
 
-1. Add crash-safe transaction and worktree lifecycle recovery.
-2. Add deletion and rename transactions with explicit conflict handling.
-3. Build local project retrieval and project configuration.
-4. Add task lifecycle, assignment, dependencies, and multi-agent foundations.
-5. Build terminal and VS Code experiences.
+1. Add the autonomous coding loop.
+2. Add persistent lifecycle records and crash-safe restart recovery.
+3. Add deletion and rename transactions with explicit conflict handling.
+4. Build local project retrieval and project configuration.
+5. Add task lifecycle, assignment, dependencies, and multi-agent foundations.
+6. Build terminal and VS Code experiences.
 
 ## Related Documentation
 
