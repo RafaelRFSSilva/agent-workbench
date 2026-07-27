@@ -1210,6 +1210,68 @@ def test_main_forwards_opt_in_tool_trace_configuration(monkeypatch) -> None:
     )
 
 
+def test_main_forwards_tool_traces_to_autonomous_task(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """Forward the trace observer to one autonomous coding task."""
+
+    configuration = RuntimeConfiguration(
+        provider_name="ollama",
+        model_name="test-model",
+        workspace_root=tmp_path,
+        enable_actions=True,
+        show_tool_traces=True,
+    )
+    session = Mock()
+    result = Mock(
+        assistant_summary="Task complete.",
+        tool_round_count=1,
+        validation_succeeded=True,
+        inspected_git_status=True,
+        inspected_git_diff=True,
+        validation_runs=(),
+    )
+    runner_mock = Mock(return_value=result)
+    trace_mock = Mock()
+
+    monkeypatch.setattr("agent_workbench.cli.load_environment", Mock())
+    monkeypatch.setattr(
+        "agent_workbench.cli.resolve_runtime_configuration",
+        Mock(return_value=configuration),
+    )
+    monkeypatch.setattr(
+        "agent_workbench.cli.create_agent_session",
+        Mock(return_value=session),
+    )
+    monkeypatch.setattr(
+        "agent_workbench.cli.run_autonomous_coding_task",
+        runner_mock,
+    )
+    monkeypatch.setattr(
+        "agent_workbench.cli._display_tool_round",
+        trace_mock,
+    )
+
+    main(
+        [
+            "--workspace",
+            str(tmp_path),
+            "--enable-actions",
+            "--show-tool-traces",
+            "--task",
+            "Fix the defect.",
+        ]
+    )
+
+    assert runner_mock.call_args.args == (
+        session,
+        "Fix the defect.",
+    )
+    assert callable(runner_mock.call_args.kwargs["tool_approval_handler"])
+    assert runner_mock.call_args.kwargs["tool_round_observer"] is trace_mock
+
+
 def test_main_reports_invalid_workspace_configuration(
     monkeypatch,
     tmp_path,

@@ -163,12 +163,13 @@ def _run_configured_cli(
     *,
     task_prompt: str | None = None,
 ) -> None:
-    """Run the configured interactive CLI or one autonomous task."""
+    """Run the configured interactive session or one autonomous task."""
 
     if task_prompt is not None:
         _run_autonomous_task(
             session,
             task_prompt,
+            show_tool_traces=runtime_configuration.show_tool_traces,
         )
         return
 
@@ -179,20 +180,32 @@ def _run_configured_cli(
         run_arguments["show_tool_traces"] = True
     if runtime_configuration.enable_actions:
         run_arguments["enable_actions"] = True
+
     run_cli(session, **run_arguments)
 
 
 def _run_autonomous_task(
     session: AgentSession,
     task_prompt: str,
+    *,
+    show_tool_traces: bool,
 ) -> None:
     """Run one supervised autonomous task and display its final result."""
+
+    def display_approved_actions(round_: ToolInteractionRound) -> None:
+        _display_approved_action_completion(
+            round_,
+            session.tool_registry,
+        )
+
+    observer = _display_tool_round if show_tool_traces else display_approved_actions
 
     try:
         result = run_autonomous_coding_task(
             session,
             task_prompt,
             tool_approval_handler=_prompt_for_tool_approval,
+            tool_round_observer=observer,
         )
     except (
         CompletionError,
