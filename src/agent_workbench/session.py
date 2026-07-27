@@ -11,6 +11,7 @@ from agent_workbench.generation import GenerationConfig
 from agent_workbench.messages import ChatRequest, ChatResponse, Message
 from agent_workbench.providers.base import ChatProvider
 from agent_workbench.structured_outputs import JSONResponseFormat
+from agent_workbench.tasks import TaskSpec
 from agent_workbench.tool_calling import ToolRoundObserver, run_tool_calling_loop
 from agent_workbench.tool_registry import ToolRegistry
 from agent_workbench.tools import ToolApprovalHandler
@@ -50,6 +51,7 @@ class AgentSession:
     _context_documents: tuple[ContextDocument, ...] = field(repr=False)
     _generation_config: GenerationConfig
     _response_format: JSONResponseFormat | None = field(repr=False)
+    _task_spec: TaskSpec | None = field(repr=False)
     _tool_registry: ToolRegistry | None = field(repr=False)
     _max_tool_rounds: int
     _messages: list[Message] = field(repr=False)
@@ -65,6 +67,7 @@ class AgentSession:
         context_documents: Iterable[ContextDocument] = (),
         generation_config: GenerationConfig | None = None,
         response_format: JSONResponseFormat | None = None,
+        task_spec: TaskSpec | None = None,
         tool_registry: ToolRegistry | None = None,
         max_tool_rounds: int = DEFAULT_MAX_TOOL_ROUNDS,
     ) -> None:
@@ -87,6 +90,7 @@ class AgentSession:
         self._context_documents = tuple(context_documents)
         self._generation_config = generation_config or GenerationConfig()
         self._response_format = response_format
+        self._task_spec = task_spec
         self._tool_registry = tool_registry
         self._max_tool_rounds = max_tool_rounds
         self._messages = []
@@ -151,6 +155,12 @@ class AgentSession:
         """Return optional immutable structured response configuration."""
 
         return self._response_format
+
+    @property
+    def task_spec(self) -> TaskSpec | None:
+        """Return optional immutable task metadata."""
+
+        return self._task_spec
 
     @property
     def tool_registry(self) -> ToolRegistry | None:

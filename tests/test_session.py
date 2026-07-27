@@ -21,6 +21,7 @@ from agent_workbench.messages import (
 )
 from agent_workbench.session import AgentSession, SessionId, SessionStatus
 from agent_workbench.structured_outputs import JSONResponseFormat
+from agent_workbench.tasks import TaskSpec
 from agent_workbench.tool_registry import ToolRegistry
 from agent_workbench.tools import ToolDefinition, ToolInvocation
 
@@ -165,6 +166,54 @@ def test_session_exposes_initial_read_only_configuration() -> None:
     assert "Context." not in repr(session)
     assert "Explicit configured prompt." not in repr(session)
     assert "FakeProvider" not in repr(session)
+
+
+def test_agent_session_task_spec_defaults_to_none() -> None:
+    """Expose no task metadata when none is configured."""
+
+    session = AgentSession(
+        id=SessionId("session-1"),
+        provider=FakeProvider([]),
+    )
+
+    assert session.task_spec is None
+
+
+def test_agent_session_preserves_task_spec_metadata() -> None:
+    """Preserve the exact immutable task metadata supplied by the caller."""
+
+    task_spec = TaskSpec(
+        objective="Implement task metadata.",
+        acceptance_criteria=[
+            "The session exposes the configured task.",
+            "Existing construction remains compatible.",
+        ],
+    )
+
+    session = AgentSession(
+        id=SessionId("session-1"),
+        provider=FakeProvider([]),
+        task_spec=task_spec,
+    )
+
+    assert session.task_spec is task_spec
+
+
+def test_agent_session_task_spec_property_is_read_only() -> None:
+    """Prevent replacement through the public task metadata property."""
+
+    task_spec = TaskSpec(
+        objective="Implement task metadata.",
+        acceptance_criteria=["The metadata remains read-only."],
+    )
+    session = AgentSession(
+        id=SessionId("session-1"),
+        provider=FakeProvider([]),
+        task_spec=task_spec,
+    )
+
+    with pytest.raises(AttributeError):
+        session.task_spec = None  # type: ignore[misc]
 
 
 def test_session_requires_a_validated_session_identifier() -> None:
