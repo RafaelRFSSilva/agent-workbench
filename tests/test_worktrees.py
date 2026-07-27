@@ -9,9 +9,18 @@ import subprocess
 import pytest
 
 from agent_workbench.errors import ConfigurationError
+from agent_workbench.tools import ToolApprovalDecision
 from agent_workbench.worktrees import (
+    WorktreeAction,
+    WorktreeApprovalRequest,
+    WorktreeHandle,
     WorktreePlan,
+    WorktreeRemovalPlan,
+    create_git_worktree,
+    inspect_git_worktree,
     plan_git_worktree,
+    plan_git_worktree_removal,
+    remove_git_worktree,
 )
 
 
@@ -476,3 +485,565 @@ def test_plan_git_output_is_bounded_and_timeout_is_safe(
     monkeypatch.setattr(worktrees, "_terminate_process_group", lambda process: None)
 
     assert_plan_error(source, "agent/timeout", tmp_path / "target", "timed out")
+
+
+def approve_worktree(request: WorktreeApprovalRequest) -> ToolApprovalDecision:
+    """Approve one supervised worktree lifecycle request."""
+
+    return ToolApprovalDecision.APPROVE
+
+
+def create_approved_worktree(
+    tmp_path: Path,
+    *,
+    branch: str = "agent/task",
+) -> tuple[Path, WorktreePlan, WorktreeHandle]:
+    """Create one real approved worktree in a disposable repository."""
+
+    source = create_repository(tmp_path / "source")
+    plan = plan_git_worktree(source, branch, tmp_path / "isolated")
+    handle = create_git_worktree(plan, approve_worktree)
+    return source, plan, handle
+
+
+def test_lifecycle_models_are_immutable_slotted_and_copy_safe(
+    tmp_path: Path,
+) -> None:
+    """Keep approval, handle, state, and removal plan data immutable and safe."""
+
+    source = create_repository(tmp_path / "source")
+    plan = plan_git_worktree(source, "agent/models", tmp_path / "isolated")
+    request = WorktreeApprovalRequest(WorktreeAction.CREATE, plan.preview)
+
+    assert not hasattr(request, "__dict__")
+    with pytest.raises(FrozenInstanceError):
+        request.action = WorktreeAction.REMOVE  # type: ignore[misc]
+    preview = request.preview
+    preview["action"] = "mutated"
+    assert request.preview["action"] == "create_worktree"
+    assert str(source.resolve()) not in repr(request)
+
+    handle = create_git_worktree(plan, approve_worktree)
+    assert isinstance(handle, WorktreeHandle)
+    assert not hasattr(handle, "__dict__")
+    assert str(source.resolve()) not in repr(handle)
+    assert str(handle.worktree_path) not in repr(handle)
+    with pytest.raises(FrozenInstanceError):
+        handle.branch_name = "other"  # type: ignore[misc]
+
+    removal = plan_git_worktree_removal(handle)
+    assert isinstance(removal, WorktreeRemovalPlan)
+    assert not hasattr(removal, "__dict__")
+    assert str(source.resolve()) not in repr(removal)
+    assert str(handle.worktree_path) not in repr(removal)
+
+
+@pytest.mark.parametrize("behavior", ["missing", "deny", "invalid", "failure"])
+def test_creation_requires_one_explicit_valid_approval(
+    tmp_path: Path,
+    behavior: str,
+) -> None:
+    """Create no branch or target without one exact explicit approval."""
+
+    source = create_repository(tmp_path / "source")
+    target = tmp_path / "isolated"
+    plan = plan_git_worktree(source, "agent/approval", target)
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        if behavior == "deny":
+            return ToolApprovalDecision.DENY
+        if behavior == "invalid":
+            return True
+        raise RuntimeError("approval unavailable")
+
+    with pytest.raises(Exception, match="approval"):
+        create_git_worktree(plan, None if behavior == "missing" else handler)
+
+    assert not target.exists()
+    assert (
+        run_git(
+            source,
+            "show-ref",
+            "--verify",
+            "--quiet",
+            "--",
+            "refs/heads/agent/approval",
+            check=False,
+        ).returncode
+        == 1
+    )
+    assert len(requests) == (0 if behavior == "missing" else 1)
+
+
+def test_creation_is_approved_once_verified_and_has_no_upstream(
+    tmp_path: Path,
+) -> None:
+    """Create one local branch/worktree only after preview and verify identity."""
+
+    source = create_repository(tmp_path / "source")
+    target = tmp_path / "isolated"
+    plan = plan_git_worktree(source, "agent/approved", target)
+    requests = []
+
+    def handler(request):
+        assert not target.exists()
+        assert (
+            run_git(
+                source,
+                "show-ref",
+                "--verify",
+                "--quiet",
+                "--",
+                "refs/heads/agent/approved",
+                check=False,
+            ).returncode
+            == 1
+        )
+        requests.append(request)
+        return ToolApprovalDecision.APPROVE
+
+    handle = create_git_worktree(plan, handler)
+
+    assert len(requests) == 1
+    assert requests[0].action is WorktreeAction.CREATE
+    assert requests[0].preview == plan.preview
+    assert handle.source_repository == source.resolve()
+    assert handle.source_head == plan.source_head
+    assert handle.branch_name == "agent/approved"
+    assert handle.worktree_path == target.resolve()
+    assert target.is_dir()
+    assert run_git(target, "rev-parse", "HEAD").stdout.strip() == plan.source_head
+    assert (
+        run_git(target, "branch", "--show-current").stdout.strip() == "agent/approved"
+    )
+    assert (
+        run_git(
+            target,
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{upstream}",
+            check=False,
+        ).returncode
+        != 0
+    )
+    assert run_git(source, "status", "--porcelain").stdout == ""
+
+
+@pytest.mark.parametrize(
+    "stale_state",
+    ["head", "dirty", "branch", "target", "unsafe_config", "parent_symlink"],
+)
+def test_creation_revalidates_every_safety_boundary_after_approval(
+    tmp_path: Path,
+    stale_state: str,
+) -> None:
+    """Perform no worktree mutation when any pinned creation state becomes stale."""
+
+    source = create_repository(tmp_path / "source")
+    target_parent = tmp_path / "targets"
+    target_parent.mkdir()
+    target = target_parent / "isolated"
+    plan = plan_git_worktree(source, "agent/stale", target)
+
+    def make_stale(_request):
+        if stale_state == "head":
+            (source / "second.txt").write_text("second\n", encoding="utf-8")
+            run_git(source, "add", "second.txt")
+            run_git(source, "commit", "-m", "second")
+        elif stale_state == "dirty":
+            (source / "tracked.txt").write_text("dirty\n", encoding="utf-8")
+        elif stale_state == "branch":
+            run_git(source, "branch", "agent/stale")
+        elif stale_state == "target":
+            target.mkdir()
+        elif stale_state == "unsafe_config":
+            run_git(source, "config", "--local", "filter.bad.smudge", "/tmp/bad")
+        else:
+            moved_parent = tmp_path / "moved-targets"
+            target_parent.rename(moved_parent)
+            target_parent.symlink_to(moved_parent, target_is_directory=True)
+        return ToolApprovalDecision.APPROVE
+
+    with pytest.raises(Exception, match="stale"):
+        create_git_worktree(plan, make_stale)
+
+    assert run_git(
+        source,
+        "show-ref",
+        "--verify",
+        "--quiet",
+        "--",
+        "refs/heads/agent/stale",
+        check=False,
+    ).returncode == (0 if stale_state == "branch" else 1)
+    if stale_state not in {"target", "parent_symlink"}:
+        assert not target.exists()
+
+
+def test_creation_uses_one_fixed_non_shell_mutation_command(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Disable hooks/fsmonitor and use no caller flags or parent environment."""
+
+    source = create_repository(tmp_path / "source")
+    target = tmp_path / "isolated"
+    plan = plan_git_worktree(source, "agent/fixed-create", target)
+    from agent_workbench import worktrees
+
+    calls = []
+    original = worktrees.subprocess.Popen
+
+    def record(command, **kwargs):
+        calls.append((command, kwargs))
+        return original(command, **kwargs)
+
+    monkeypatch.setattr(worktrees.subprocess, "Popen", record)
+    create_git_worktree(plan, approve_worktree)
+
+    mutations = [
+        (command, kwargs)
+        for command, kwargs in calls
+        if "add" in command and "worktree" in command
+    ]
+    assert len(mutations) == 1
+    command, kwargs = mutations[0]
+    assert command == [
+        "git",
+        "-C",
+        str(source.resolve()),
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.fsmonitor=false",
+        "worktree",
+        "add",
+        "-b",
+        "agent/fixed-create",
+        str(target.resolve()),
+        plan.source_head,
+    ]
+    assert kwargs["shell"] is False
+    assert kwargs["start_new_session"] is True
+    assert kwargs["env"]["GIT_CONFIG_GLOBAL"] == os.devnull
+    assert "OPENAI_API_KEY" not in kwargs["env"]
+
+
+@pytest.mark.parametrize("partial", ["branch", "target", "registered"])
+def test_creation_failure_reports_partial_state_without_cleanup(
+    tmp_path: Path,
+    monkeypatch,
+    partial: str,
+) -> None:
+    """Preserve and safely report every partial creation outcome."""
+
+    source = create_repository(tmp_path / "source")
+    target = tmp_path / "isolated"
+    plan = plan_git_worktree(source, "agent/partial", target)
+    from agent_workbench import worktrees
+
+    original = worktrees._run_git
+
+    def fail_creation(repository, arguments):
+        if arguments[:2] != ("worktree", "add"):
+            return original(repository, arguments)
+        if partial == "branch":
+            run_git(source, "branch", "agent/partial")
+        elif partial == "target":
+            target.mkdir()
+        else:
+            run_git(
+                source,
+                "worktree",
+                "add",
+                "-b",
+                "agent/partial",
+                str(target),
+                plan.source_head,
+            )
+        return worktrees._GitOutput(1, "", "injected")
+
+    monkeypatch.setattr(worktrees, "_run_git", fail_creation)
+
+    with pytest.raises(Exception, match="partial state") as raised:
+        create_git_worktree(plan, approve_worktree)
+
+    message = str(raised.value)
+    assert "agent/partial" in message
+    assert "../isolated" in message
+    assert str(source.resolve()) not in message
+    if partial == "branch":
+        assert not target.exists()
+    else:
+        assert target.exists()
+    assert run_git(
+        source,
+        "show-ref",
+        "--verify",
+        "--quiet",
+        "--",
+        "refs/heads/agent/partial",
+        check=False,
+    ).returncode == (1 if partial == "target" else 0)
+
+
+def test_inspection_reports_clean_and_all_dirty_entry_classes(
+    tmp_path: Path,
+) -> None:
+    """Report bounded immutable identity and tracked/staged/untracked dirtiness."""
+
+    _, _, handle = create_approved_worktree(tmp_path)
+
+    clean = inspect_git_worktree(handle)
+    assert clean.registered is True
+    assert clean.branch_name == "agent/task"
+    assert clean.head == handle.source_head
+    assert clean.clean is True
+    assert clean.changed_entry_count == 0
+    assert clean.target_display == "../isolated"
+    assert str(handle.worktree_path) not in repr(clean)
+
+    (handle.worktree_path / "tracked.txt").write_text("dirty\n", encoding="utf-8")
+    assert inspect_git_worktree(handle).changed_entry_count == 1
+    run_git(handle.worktree_path, "add", "tracked.txt")
+    assert inspect_git_worktree(handle).changed_entry_count == 1
+    (handle.worktree_path / "untracked.txt").write_text("new\n", encoding="utf-8")
+    dirty = inspect_git_worktree(handle)
+    assert dirty.clean is False
+    assert dirty.changed_entry_count == 2
+
+
+@pytest.mark.parametrize("identity_failure", ["branch", "detached", "missing"])
+def test_inspection_rejects_changed_or_missing_identity(
+    tmp_path: Path,
+    identity_failure: str,
+) -> None:
+    """Never trust a switched, detached, or missing worktree."""
+
+    _, _, handle = create_approved_worktree(tmp_path)
+    if identity_failure == "branch":
+        run_git(handle.worktree_path, "switch", "-c", "other")
+    elif identity_failure == "detached":
+        run_git(handle.worktree_path, "switch", "--detach")
+    else:
+        shutil.rmtree(handle.worktree_path)
+
+    with pytest.raises(Exception) as raised:
+        inspect_git_worktree(handle)
+
+    assert str(handle.worktree_path) not in str(raised.value)
+
+
+def test_clean_removal_requires_approval_and_preserves_branch(
+    tmp_path: Path,
+) -> None:
+    """Remove only the clean registered worktree while retaining its local branch."""
+
+    source, _, handle = create_approved_worktree(tmp_path)
+    removal = plan_git_worktree_removal(handle)
+    requests = []
+
+    def approve(request):
+        requests.append(request)
+        return ToolApprovalDecision.APPROVE
+
+    remove_git_worktree(removal, approve)
+
+    assert len(requests) == 1
+    assert requests[0].action is WorktreeAction.REMOVE
+    assert requests[0].preview == removal.preview
+    assert not handle.worktree_path.exists()
+    assert (
+        str(handle.worktree_path)
+        not in run_git(
+            source,
+            "worktree",
+            "list",
+            "--porcelain",
+        ).stdout
+    )
+    assert (
+        run_git(
+            source,
+            "show-ref",
+            "--verify",
+            "--quiet",
+            "--",
+            "refs/heads/agent/task",
+            check=False,
+        ).returncode
+        == 0
+    )
+    assert run_git(source, "status", "--porcelain").stdout == ""
+
+
+def test_clean_removal_uses_one_fixed_non_force_command(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Run only the exact fixed removal command without force or branch deletion."""
+
+    source, _, handle = create_approved_worktree(tmp_path)
+    removal = plan_git_worktree_removal(handle)
+    from agent_workbench import worktrees
+
+    calls = []
+    original = worktrees.subprocess.Popen
+
+    def record(command, **kwargs):
+        calls.append((command, kwargs))
+        return original(command, **kwargs)
+
+    monkeypatch.setattr(worktrees.subprocess, "Popen", record)
+    remove_git_worktree(removal, approve_worktree)
+
+    mutations = [
+        (command, kwargs)
+        for command, kwargs in calls
+        if "remove" in command and "worktree" in command
+    ]
+    assert len(mutations) == 1
+    command, kwargs = mutations[0]
+    assert command == [
+        "git",
+        "-C",
+        str(source.resolve()),
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.fsmonitor=false",
+        "worktree",
+        "remove",
+        str(handle.worktree_path),
+    ]
+    assert "--force" not in command
+    assert "-f" not in command
+    assert kwargs["shell"] is False
+    assert kwargs["start_new_session"] is True
+    assert kwargs["env"]["GIT_CONFIG_GLOBAL"] == os.devnull
+
+
+@pytest.mark.parametrize("behavior", ["missing", "deny", "invalid", "failure"])
+def test_removal_requires_one_explicit_valid_approval(
+    tmp_path: Path,
+    behavior: str,
+) -> None:
+    """Preserve the worktree and branch on absent, denied, or invalid approval."""
+
+    source, _, handle = create_approved_worktree(tmp_path)
+    removal = plan_git_worktree_removal(handle)
+
+    def handler(_request):
+        if behavior == "deny":
+            return ToolApprovalDecision.DENY
+        if behavior == "invalid":
+            return True
+        raise RuntimeError("approval unavailable")
+
+    with pytest.raises(Exception, match="approval"):
+        remove_git_worktree(removal, None if behavior == "missing" else handler)
+
+    assert handle.worktree_path.exists()
+    assert "agent/task" in run_git(source, "branch", "--list", "agent/task").stdout
+
+
+@pytest.mark.parametrize("dirty_kind", ["tracked", "staged", "untracked"])
+def test_dirty_worktree_is_rejected_before_removal_approval(
+    tmp_path: Path,
+    dirty_kind: str,
+) -> None:
+    """Reject dirty cleanup planning without requesting approval."""
+
+    _, _, handle = create_approved_worktree(tmp_path)
+    if dirty_kind == "untracked":
+        (handle.worktree_path / "untracked.txt").write_text("new\n", encoding="utf-8")
+    else:
+        (handle.worktree_path / "tracked.txt").write_text("dirty\n", encoding="utf-8")
+        if dirty_kind == "staged":
+            run_git(handle.worktree_path, "add", "tracked.txt")
+
+    with pytest.raises(Exception, match="clean"):
+        plan_git_worktree_removal(handle)
+
+    assert handle.worktree_path.exists()
+
+
+def test_locked_worktree_is_rejected_before_removal_approval(
+    tmp_path: Path,
+) -> None:
+    """Preserve a locked worktree without creating a removal plan."""
+
+    source, _, handle = create_approved_worktree(tmp_path)
+    run_git(source, "worktree", "lock", str(handle.worktree_path))
+
+    with pytest.raises(Exception, match="registration"):
+        plan_git_worktree_removal(handle)
+
+    assert handle.worktree_path.exists()
+
+
+def test_removal_revalidates_after_approval_and_never_forces(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Preserve a newly dirty target and issue no force or branch-delete command."""
+
+    source, _, handle = create_approved_worktree(tmp_path)
+    removal = plan_git_worktree_removal(handle)
+    from agent_workbench import worktrees
+
+    calls = []
+    original = worktrees._run_git
+
+    def record(repository, arguments):
+        calls.append(arguments)
+        return original(repository, arguments)
+
+    monkeypatch.setattr(worktrees, "_run_git", record)
+
+    def dirty_after_preview(_request):
+        (handle.worktree_path / "untracked.txt").write_text("new\n", encoding="utf-8")
+        return ToolApprovalDecision.APPROVE
+
+    with pytest.raises(Exception, match="stale"):
+        remove_git_worktree(removal, dirty_after_preview)
+
+    assert handle.worktree_path.exists()
+    assert not any(arguments[:2] == ("worktree", "remove") for arguments in calls)
+    assert not any("--force" in arguments or "-D" in arguments for arguments in calls)
+    assert "agent/task" in run_git(source, "branch", "--list", "agent/task").stdout
+
+
+def test_removal_command_failure_preserves_worktree_without_force(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Report failed clean removal and preserve all remaining recoverable state."""
+
+    source, _, handle = create_approved_worktree(tmp_path)
+    removal = plan_git_worktree_removal(handle)
+    from agent_workbench import worktrees
+
+    original = worktrees._run_git
+    mutation_arguments = []
+
+    def fail_removal(repository, arguments):
+        if arguments[:2] == ("worktree", "remove"):
+            mutation_arguments.append(arguments)
+            return worktrees._GitOutput(1, "", "injected")
+        return original(repository, arguments)
+
+    monkeypatch.setattr(worktrees, "_run_git", fail_removal)
+
+    with pytest.raises(Exception, match="preserved"):
+        remove_git_worktree(removal, approve_worktree)
+
+    assert handle.worktree_path.exists()
+    assert mutation_arguments == [
+        ("worktree", "remove", str(handle.worktree_path)),
+    ]
+    assert "--force" not in mutation_arguments[0]
+    assert "agent/task" in run_git(source, "branch", "--list", "agent/task").stdout
