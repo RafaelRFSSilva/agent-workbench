@@ -29,6 +29,8 @@ Implemented capabilities:
 - Provider-independent structured outputs.
 - Provider-independent tool calling with opt-in calculator and read-only
   workspace tools.
+- Provider-independent `AgentSession` identity, lifecycle, transactional
+  conversation ownership, and synchronous direct or tool-enabled sends.
 - Automated tests, Ruff checks, and GitHub Actions.
 
 Write-capable filesystem and network tools, RAG, MCP, asynchronous execution,

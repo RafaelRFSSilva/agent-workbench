@@ -1,7 +1,7 @@
 """Tests for the Agent Workbench command-line interface."""
 
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import call, Mock
 
 from agent_workbench.built_in_tools import create_built_in_tool_registry
 from agent_workbench.cli import main, run_cli
@@ -9,6 +9,7 @@ from agent_workbench.arguments import RuntimeConfiguration
 from agent_workbench.context import ContextDocument
 from agent_workbench.errors import CompletionError
 from agent_workbench.messages import ChatRequest, ChatResponse, Message
+from agent_workbench.session import SessionId
 from agent_workbench.agents import get_agent_profile
 from agent_workbench.generation import GenerationConfig
 from agent_workbench.structured_outputs import JSONResponseFormat
@@ -400,21 +401,18 @@ def test_response_format_is_forwarded_without_entering_history(
     ]
 
 
-def test_cli_without_registry_uses_direct_provider_completion(
+def test_cli_without_registry_completes_without_tool_registry(
     monkeypatch,
 ) -> None:
-    """Keep the direct provider path when no tool registry is supplied."""
+    """Keep successful no-tool behavior when no registry is supplied."""
 
     user_inputs = iter(["Respond directly.", "/exit"])
     provider = FakeProvider(["direct response"])
-    loop_mock = Mock()
 
     monkeypatch.setattr("builtins.input", lambda _: next(user_inputs))
-    monkeypatch.setattr("agent_workbench.cli.run_tool_calling_loop", loop_mock)
 
     run_cli(provider)
 
-    loop_mock.assert_not_called()
     assert provider.calls == [
         [
             {
@@ -423,6 +421,53 @@ def test_cli_without_registry_uses_direct_provider_completion(
             }
         ]
     ]
+
+
+def test_cli_constructs_and_reuses_one_agent_session(
+    monkeypatch,
+    capsys,
+) -> None:
+    """Delegate every non-exit turn to one configured AgentSession."""
+
+    provider = FakeProvider()
+    session = Mock()
+    session.send.side_effect = [
+        ChatResponse(text="First response."),
+        ChatResponse(text="Second response."),
+    ]
+    session_factory = Mock(return_value=session)
+    generation_config = GenerationConfig(temperature=0.2)
+    user_inputs = iter(["First request.", "Second request.", "/exit"])
+
+    monkeypatch.setattr("builtins.input", lambda _: next(user_inputs))
+    monkeypatch.setattr("agent_workbench.cli.AgentSession", session_factory)
+
+    run_cli(
+        provider,
+        system_prompt="Configured prompt.",
+        generation_config=generation_config,
+        max_tool_rounds=3,
+    )
+
+    session_factory.assert_called_once_with(
+        id=SessionId("cli-session"),
+        provider=provider,
+        system_prompt="Configured prompt.",
+        agent_profile=None,
+        context_documents=(),
+        generation_config=generation_config,
+        response_format=None,
+        tool_registry=None,
+        max_tool_rounds=3,
+    )
+    assert session.send.call_args_list == [
+        call("First request."),
+        call("Second request."),
+    ]
+    assert provider.calls == []
+    output = capsys.readouterr().out
+    assert "Assistant: First response." in output
+    assert "Assistant: Second response." in output
 
 
 def test_cli_forwards_registry_definitions_and_request_configuration(
