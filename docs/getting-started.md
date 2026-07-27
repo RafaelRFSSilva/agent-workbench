@@ -689,6 +689,86 @@ action, run Ruff and pytest, inspect the final Git status and diff, and
 summarize the result. Do not commit or push.
 ```
 
+## Run a Controlled Workflow in an Isolated Worktree
+
+The primary workspace can remain clean while one coding session uses a new
+local branch and sibling Git worktree:
+
+```bash
+uv run agent-workbench \
+  --provider ollama \
+  --model gpt-oss:20b \
+  --agent developer \
+  --workspace . \
+  --worktree-path ../agent-workbench-task \
+  --worktree-branch agent/task \
+  --enable-actions \
+  --show-tool-traces
+```
+
+The two worktree options are an explicit pair; neither has an inferred value.
+They require `--workspace`, and isolation does not imply `--enable-actions`.
+The source must be the clean top-level primary worktree of a non-bare
+repository with an existing HEAD. Staged, unstaged, and untracked changes or
+an in-progress Git operation prevent planning.
+
+The operator flow is:
+
+```text
+Clean primary repository
+        ↓
+Create immutable worktree plan
+        ↓
+Review and approve creation
+        ↓
+Create local branch and isolated worktree
+        ↓
+Construct isolated AgentSession
+        ↓
+Inspect, patch, Ruff, pytest, status, diff
+        ↓
+Preserve dirty worktree for manual review
+        ↓
+Remove only after it becomes clean and removal is approved
+        ↓
+Keep local branch
+```
+
+Before the first prompt, `WorktreePlan` pins the canonical source root, complete
+source HEAD, exact validated branch, canonical absent target, and safe target
+display. Planning rejects a linked or bare source, an existing branch, unsafe
+target parent or registered-worktree collision, and repository-local checkout
+filters or external diff commands that could execute programs. The target
+parent must already exist and contain no symlink component.
+
+The creation prompt displays the safe source (`.`), pinned HEAD, branch,
+target, exact fixed command, and effects. Approval is default-deny and applies
+only to that plan. Every safety-relevant condition is revalidated after
+approval. Git hooks are disabled, system and global Git configuration are
+isolated, the child environment is minimal, and the command uses no shell or
+network operation. A failed or ambiguously verified creation reports whether
+the branch, target, and registration exist and preserves that state.
+
+`WorktreeHandle` is returned only after the target registration, HEAD, branch,
+unchanged source, and absence of upstream tracking are verified. The isolated
+factory revalidates that handle and replaces only the copied runtime
+configuration's workspace. Context documents inside the source are remapped by
+relative path and reloaded from the worktree; missing mapped or external
+context is rejected. Provider, model, profile, prompt, generation, output,
+tool, action, and trace settings remain unchanged.
+
+After the CLI exits, a dirty worktree is never offered for removal. Agent
+Workbench reports its safe target, branch, and changed-entry count and leaves
+both worktree and branch for manual review. A clean worktree receives a
+separate complete removal preview and default-deny prompt. Approved cleanup
+removes only that verified clean worktree without `--force`; it never deletes
+the local branch.
+
+The boundary intentionally provides no automatic commit, merge, push, branch
+deletion, reset, clean, stash, or forced removal. Dirty, partial, unexpected,
+and ambiguous states require manual recovery. Fixed local Git command success
+also cannot provide a crash-safe guarantee.
+
 ## Configuration Precedence
 
 Runtime configuration follows this precedence:

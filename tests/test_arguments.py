@@ -639,6 +639,133 @@ def test_runtime_configuration_preserves_workspace_root() -> None:
     assert configuration.workspace_root == workspace_root
 
 
+def test_worktree_isolation_options_are_absent_by_default() -> None:
+    """Preserve the existing non-isolated CLI and runtime defaults."""
+
+    arguments = parse_cli_arguments([])
+    configuration = resolve_runtime_configuration(
+        CLIArguments(
+            provider_name="ollama",
+            model_name="test-model",
+        )
+    )
+
+    assert arguments.worktree_path is None
+    assert arguments.worktree_branch is None
+    assert configuration.worktree_path is None
+    assert configuration.worktree_branch is None
+
+
+def test_parse_worktree_options_preserves_relative_absolute_and_exact_branch() -> None:
+    """Preserve explicit target paths and never trim or infer a branch name."""
+
+    relative = parse_cli_arguments(
+        [
+            "--workspace",
+            ".",
+            "--worktree-path",
+            "../task-worktree",
+            "--worktree-branch",
+            "agent/task",
+        ]
+    )
+    absolute = parse_cli_arguments(
+        [
+            "--workspace",
+            "/tmp/source",
+            "--worktree-path",
+            "/tmp/task-worktree",
+            "--worktree-branch",
+            "agent/absolute",
+        ]
+    )
+
+    assert relative.worktree_path == Path("../task-worktree")
+    assert relative.worktree_branch == "agent/task"
+    assert absolute.worktree_path == Path("/tmp/task-worktree")
+    assert absolute.worktree_branch == "agent/absolute"
+
+
+def test_parse_worktree_branch_rejects_blank_values() -> None:
+    """Reject a blank worktree branch without silently normalizing it."""
+
+    with pytest.raises(SystemExit) as raised:
+        parse_cli_arguments(
+            [
+                "--worktree-branch",
+                "   ",
+            ]
+        )
+
+    assert raised.value.code == 2
+
+
+@pytest.mark.parametrize(
+    ("worktree_path", "worktree_branch", "workspace_root", "match"),
+    [
+        (Path("../target"), None, Path("."), "supplied together"),
+        (None, "agent/task", Path("."), "supplied together"),
+        (Path("../target"), "agent/task", None, "require --workspace"),
+    ],
+)
+def test_runtime_configuration_rejects_incomplete_worktree_isolation(
+    worktree_path,
+    worktree_branch,
+    workspace_root,
+    match,
+) -> None:
+    """Require the exact source, target, and branch triple."""
+
+    with pytest.raises(ConfigurationError, match=match):
+        resolve_runtime_configuration(
+            CLIArguments(
+                provider_name="ollama",
+                model_name="test-model",
+                workspace_root=workspace_root,
+                worktree_path=worktree_path,
+                worktree_branch=worktree_branch,
+            )
+        )
+
+
+def test_runtime_configuration_preserves_complete_worktree_isolation() -> None:
+    """Carry optional target and branch values without plans or handlers."""
+
+    target = Path("../task-worktree")
+    configuration = resolve_runtime_configuration(
+        CLIArguments(
+            provider_name="ollama",
+            model_name="test-model",
+            workspace_root=Path("."),
+            worktree_path=target,
+            worktree_branch="agent/task",
+            enable_actions=True,
+        )
+    )
+
+    assert configuration.workspace_root == Path(".")
+    assert configuration.worktree_path is target
+    assert configuration.worktree_branch == "agent/task"
+    assert configuration.enable_actions is True
+
+
+def test_setup_rejects_worktree_options_as_direct_configuration() -> None:
+    """Keep interactive setup on its unchanged no-worktree default."""
+
+    with pytest.raises(SystemExit) as raised:
+        parse_cli_arguments(
+            [
+                "--setup",
+                "--worktree-path",
+                "../task",
+                "--worktree-branch",
+                "agent/task",
+            ]
+        )
+
+    assert raised.value.code == 2
+
+
 def test_runtime_configuration_disables_tools_by_default() -> None:
     """Keep built-in tools disabled in resolved runtime configuration."""
 

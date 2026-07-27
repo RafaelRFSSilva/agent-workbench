@@ -10,6 +10,7 @@ from agent_workbench.config import (
     load_environment,
 )
 from agent_workbench.interactive_setup import run_interactive_setup
+from agent_workbench.isolated_sessions import create_isolated_agent_session
 from agent_workbench.errors import (
     CompletionError,
     ConfigurationError,
@@ -22,6 +23,15 @@ from agent_workbench.session_factory import create_agent_session
 from agent_workbench.tools import (
     ToolApprovalDecision,
     ToolApprovalRequest,
+)
+from agent_workbench.worktrees import (
+    WorktreeAction,
+    WorktreeApprovalRequest,
+    create_git_worktree,
+    inspect_git_worktree,
+    plan_git_worktree,
+    plan_git_worktree_removal,
+    remove_git_worktree,
 )
 
 EXIT_COMMANDS = {"/exit", "/quit"}
@@ -109,6 +119,15 @@ def main(
         else:
             runtime_configuration = resolve_runtime_configuration(arguments)
 
+    except ConfigurationError as exc:
+        print(f"Configuration error: {exc}")
+        return
+
+    if runtime_configuration.worktree_path is not None:
+        _run_isolated_cli(runtime_configuration)
+        return
+
+    try:
         session = create_agent_session(
             SessionId("cli-session"),
             runtime_configuration,
@@ -116,6 +135,15 @@ def main(
     except ConfigurationError as exc:
         print(f"Configuration error: {exc}")
         return
+
+    _run_configured_cli(session, runtime_configuration)
+
+
+def _run_configured_cli(
+    session: AgentSession,
+    runtime_configuration,
+) -> None:
+    """Run the existing CLI presentation with resolved optional callbacks."""
 
     run_arguments = {
         "agent_profile": runtime_configuration.agent_profile,
@@ -125,6 +153,121 @@ def main(
     if runtime_configuration.enable_actions:
         run_arguments["enable_actions"] = True
     run_cli(session, **run_arguments)
+
+
+def _run_isolated_cli(runtime_configuration) -> None:
+    """Create, run, and conservatively finish one supervised worktree session."""
+
+    source = runtime_configuration.workspace_root
+    target = runtime_configuration.worktree_path
+    branch = runtime_configuration.worktree_branch
+    if source is None or target is None or branch is None:
+        print("Configuration error: Worktree isolation configuration is incomplete.")
+        return
+
+    try:
+        plan = plan_git_worktree(source, branch, target)
+        handle = create_git_worktree(plan, _prompt_for_worktree_approval)
+    except (ConfigurationError, CompletionError) as exc:
+        print(f"Worktree error: {exc}")
+        return
+
+    try:
+        isolated = create_isolated_agent_session(
+            SessionId("cli-session"),
+            runtime_configuration,
+            handle,
+        )
+    except ConfigurationError as exc:
+        print(f"Configuration error: {exc}")
+        return
+
+    _run_configured_cli(isolated.session, runtime_configuration)
+
+    try:
+        state = inspect_git_worktree(handle)
+    except (ConfigurationError, CompletionError) as exc:
+        print(
+            "Worktree recovery required: "
+            f"{exc} The worktree was preserved for manual recovery."
+        )
+        return
+
+    if not state.clean:
+        print(
+            "Isolated worktree preserved for manual review: "
+            f"{state.target_display} on branch {state.branch_name}. "
+            f"Changed entries: {state.changed_entry_count}. "
+            "Please inspect, commit, or clean it manually."
+        )
+        return
+
+    try:
+        removal_plan = plan_git_worktree_removal(handle)
+        remove_git_worktree(
+            removal_plan,
+            _prompt_for_worktree_approval,
+        )
+    except (ConfigurationError, CompletionError) as exc:
+        print(
+            f"Worktree cleanup: {exc} The clean worktree was preserved; "
+            f"local branch {state.branch_name} remains."
+        )
+        return
+
+    print(f"Clean isolated worktree removed; local branch {state.branch_name} remains.")
+
+
+def _prompt_for_worktree_approval(
+    request: WorktreeApprovalRequest,
+) -> ToolApprovalDecision:
+    """Render one exact lifecycle preview and request explicit approval."""
+
+    preview = request.preview
+    if not isinstance(preview, dict):
+        return ToolApprovalDecision.DENY
+
+    if request.action is WorktreeAction.CREATE:
+        print("\nWorktree approval required: create")
+        print(f"  Source repository: {preview.get('source_repository', '.')}")
+        print(f"  Pinned HEAD: {preview.get('pinned_head', '[unavailable]')}")
+        print(f"  New local branch: {preview.get('branch_name', '[unavailable]')}")
+        print(f"  Target: {preview.get('target', '[unavailable]')}")
+        _print_worktree_command(preview)
+        print("  Warning: one local branch and worktree will be created.")
+        print("  No commit, merge, or push will occur.")
+        print("  The primary source working tree must remain clean.")
+        print("  Ambiguous partial creation is preserved for manual recovery.")
+        prompt = "Approve worktree creation? [y/N]: "
+    else:
+        print("\nWorktree approval required: remove")
+        print(f"  Local branch: {preview.get('branch_name', '[unavailable]')}")
+        print(f"  Worktree HEAD: {preview.get('worktree_head', '[unavailable]')}")
+        print(f"  Target: {preview.get('target', '[unavailable]')}")
+        _print_worktree_command(preview)
+        print("  Only the verified clean worktree will be removed.")
+        print("  The local branch will remain.")
+        print("  No force, branch deletion, reset, clean, or stash will occur.")
+        prompt = "Remove clean isolated worktree? [y/N]: "
+
+    try:
+        answer = input(prompt).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return ToolApprovalDecision.DENY
+    if answer in {"y", "yes"}:
+        return ToolApprovalDecision.APPROVE
+    return ToolApprovalDecision.DENY
+
+
+def _print_worktree_command(preview: dict[str, object]) -> None:
+    """Render fixed safe command tokens from one lifecycle preview."""
+
+    command = preview.get("command")
+    if isinstance(command, list) and all(isinstance(token, str) for token in command):
+        print(f"  Fixed command: {' '.join(command)}")
+    else:
+        print("  Fixed command: [unavailable]")
 
 
 def _prompt_for_tool_approval(

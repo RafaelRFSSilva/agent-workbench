@@ -16,6 +16,7 @@ A configured session currently contains:
 - An optional structured response format.
 - An optional authorized workspace root.
 - Optional controlled-action authorization.
+- An optional paired isolated-worktree target and new local branch.
 
 The same runtime configuration model is used by:
 
@@ -42,7 +43,10 @@ RuntimeConfiguration
 ├── response_format
 ├── enable_tools
 ├── workspace_root
-└── enable_actions
+├── enable_actions
+├── show_tool_traces
+├── worktree_path
+└── worktree_branch
 ```
 
 This is the final application configuration used before provider construction.
@@ -624,6 +628,12 @@ An invalid file repeats the response format question.
 --top-p
 --max-output-tokens
 --response-format-file
+--enable-tools
+--workspace
+--enable-actions
+--show-tool-traces
+--worktree-path
+--worktree-branch
 ```
 
 This keeps direct and interactive configuration as separate, unambiguous entry
@@ -647,6 +657,8 @@ points.
 | `--workspace PATH` | Authorize workspace tools for one root |
 | `--enable-actions` | Add approved file changes and fixed validation commands; requires `--workspace` |
 | `--show-tool-traces` | Display opt-in completed tool-call traces |
+| `--worktree-path PATH` | Create an isolated worktree at an explicit target; requires `--worktree-branch` and `--workspace` |
+| `--worktree-branch NAME` | Create the isolated worktree on an explicit new local branch; requires `--worktree-path` and `--workspace` |
 | `--setup` | Start prompt-based interactive setup |
 
 Display the current CLI help:
@@ -708,6 +720,8 @@ Examples include:
 - Invalid context files.
 - Invalid response format files.
 - `--enable-actions` without `--workspace`.
+- Either worktree option without the other.
+- Worktree options without `--workspace`.
 - Direct configuration combined with `--setup`.
 
 Provider or model capabilities may still differ.
@@ -749,6 +763,27 @@ commands or flags, network, Git mutation, or MCP access.
 `--show-tool-traces` defaults to false and displays no output unless a tool
 registry is active. The prompt-based setup keeps its default workspace root of
 `None`; use direct CLI configuration to authorize a workspace.
+
+`--worktree-path` and `--worktree-branch` are optional paired values in
+`RuntimeConfiguration`; no plan, handle, or approval callback is stored there.
+When present, `--workspace` identifies the clean primary source repository,
+not the session's eventual tool root. The CLI creates an immutable plan,
+requests default-deny approval, creates and verifies the worktree, then asks
+`create_isolated_agent_session()` to replace the workspace only in a copied
+configuration. Worktree isolation never enables actions implicitly.
+
+Planning requires the exact top-level primary worktree of a non-bare Git
+repository with an existing clean HEAD. It validates the new branch and absent
+target, registered-worktree collisions, safe parent chains, in-progress Git
+operations, and repository-local checkout filters or external diff helpers.
+Creation and clean removal use fixed non-shell local Git commands with hooks
+disabled, isolated system/global configuration, a minimal environment,
+post-approval revalidation, timeouts, and bounded output.
+
+Dirty worktrees are preserved without a removal prompt. Clean worktrees receive
+a second exact default-deny approval; approved removal leaves the local branch.
+There is no automatic commit, merge, push, branch deletion, reset, clean,
+stash, forced removal, or arbitrary Git command.
 
 ## Current Limitations
 

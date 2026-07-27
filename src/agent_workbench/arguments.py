@@ -48,6 +48,8 @@ class CLIArguments:
     workspace_root: Path | None = None
     enable_actions: bool = False
     show_tool_traces: bool = False
+    worktree_path: Path | None = None
+    worktree_branch: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +67,8 @@ class RuntimeConfiguration:
     workspace_root: Path | None = None
     enable_actions: bool = False
     show_tool_traces: bool = False
+    worktree_path: Path | None = None
+    worktree_branch: str | None = None
 
 
 def _non_empty_model_name(value: str) -> str:
@@ -131,6 +135,15 @@ def _workspace_path(value: str) -> Path:
         raise ArgumentTypeError("workspace path must not be blank")
 
     return Path(normalized_path).expanduser()
+
+
+def _worktree_branch(value: str) -> str:
+    """Return one exact non-blank worktree branch name."""
+
+    if not value.strip():
+        raise ArgumentTypeError("worktree branch must not be blank")
+
+    return value
 
 
 def _unit_interval(
@@ -291,6 +304,18 @@ def parse_cli_arguments(
         help="Display completed tool calls and results during the session.",
     )
 
+    parser.add_argument(
+        "--worktree-path",
+        type=_workspace_path,
+        help="New isolated Git worktree target path; requires --worktree-branch.",
+    )
+
+    parser.add_argument(
+        "--worktree-branch",
+        type=_worktree_branch,
+        help="New local branch for an isolated worktree; requires --worktree-path.",
+    )
+
     parsed_arguments = parser.parse_args(argv)
 
     setup_conflicts = (
@@ -308,6 +333,8 @@ def parse_cli_arguments(
         or parsed_arguments.workspace is not None
         or parsed_arguments.enable_actions
         or parsed_arguments.show_tool_traces
+        or parsed_arguments.worktree_path is not None
+        or parsed_arguments.worktree_branch is not None
     )
 
     if parsed_arguments.setup and setup_conflicts:
@@ -335,6 +362,8 @@ def parse_cli_arguments(
         workspace_root=parsed_arguments.workspace,
         enable_actions=parsed_arguments.enable_actions,
         show_tool_traces=parsed_arguments.show_tool_traces,
+        worktree_path=parsed_arguments.worktree_path,
+        worktree_branch=parsed_arguments.worktree_branch,
     )
 
 
@@ -348,6 +377,14 @@ def resolve_runtime_configuration(
 
     if arguments.enable_actions and arguments.workspace_root is None:
         raise ConfigurationError("--enable-actions requires --workspace.")
+
+    if (arguments.worktree_path is None) != (arguments.worktree_branch is None):
+        raise ConfigurationError(
+            "--worktree-path and --worktree-branch must be supplied together."
+        )
+
+    if arguments.worktree_path is not None and arguments.workspace_root is None:
+        raise ConfigurationError("Worktree isolation options require --workspace.")
 
     if arguments.agent_name is not None and arguments.agent_file is not None:
         raise ConfigurationError("--agent cannot be combined with --agent-file.")
@@ -404,4 +441,6 @@ def resolve_runtime_configuration(
         workspace_root=arguments.workspace_root,
         enable_actions=arguments.enable_actions,
         show_tool_traces=arguments.show_tool_traces,
+        worktree_path=arguments.worktree_path,
+        worktree_branch=arguments.worktree_branch,
     )

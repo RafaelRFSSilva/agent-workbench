@@ -948,9 +948,118 @@ forwards the callback transactionally, so denied or invalid turns roll back
 while prior successful conversation remains.
 
 Read access, controlled writes, fixed command execution, network access, and
-Git mutation remain separate permissions. Arbitrary commands, deletion,
-rename, crash-safe journaling, worktree isolation, and network/MCP capabilities
-remain future work.
+Git lifecycle mutations remain separate permissions. Arbitrary commands,
+deletion, rename, crash-safe transaction journaling, and network/MCP
+capabilities remain future work.
+
+## Git Worktree Isolation Boundary
+
+Worktree lifecycle management is operator-side application behavior, not a
+provider tool. `WorktreePlan` is a frozen, slotted, validated-only model that
+pins the canonical primary repository, complete source HEAD, exact new branch,
+canonical absent target, and safe target display. `plan_git_worktree()` is
+read-only and requires:
+
+* The supplied path itself to be the top-level primary worktree with a real
+  `.git` directory, not a linked or bare repository.
+* An existing complete HEAD and a completely clean status including staged,
+  unstaged, and untracked files.
+* No merge, rebase, cherry-pick, revert, bisect, sequencer, or lock state.
+* A non-option Git-valid new local branch that does not already exist.
+* An absent target with an existing directory parent and no symlinked parent
+  component.
+* No source containment, `.git` containment, or collision with registered,
+  locked, prunable, or ambiguous worktrees.
+* No repository-local clean, smudge, process, external-diff, command, or
+  text-conversion configuration that could execute during checkout.
+
+The plan preview exposes only `.`, the pinned HEAD, branch, safe target display,
+fixed command tokens, and explicit local-only effects. Absolute canonical paths
+remain private.
+
+```text
+Clean primary repository
+        ↓
+WorktreePlan pins source HEAD, branch, and absent target
+        ↓
+WorktreeApprovalRequest(CREATE)
+        ↓ explicit APPROVE
+post-approval complete revalidation
+        ↓
+fixed local worktree creation
+        ↓ complete identity verification
+WorktreeHandle
+        ↓
+create_isolated_agent_session()
+        ↓
+AgentSession bound only to the isolated Workspace
+```
+
+Every Git process uses `shell=False`, a short timeout, bounded streaming output,
+process-group termination, a minimal credential-free environment,
+`GIT_CONFIG_NOSYSTEM=1`, an isolated global configuration, and fixed
+`core.hooksPath=/dev/null` and `core.fsmonitor=false` overrides. Creation's
+only mutating boundary is equivalent to:
+
+```text
+git -C SOURCE \
+  -c core.hooksPath=/dev/null \
+  -c core.fsmonitor=false \
+  worktree add -b BRANCH TARGET PINNED_HEAD
+```
+
+Removal's only mutating boundary is equivalent to:
+
+```text
+git -C SOURCE \
+  -c core.hooksPath=/dev/null \
+  -c core.fsmonitor=false \
+  worktree remove TARGET
+```
+
+There is no `--force`, branch deletion, prune, checkout of the primary tree,
+commit, merge, rebase, push, fetch, reset, clean, stash, arbitrary subcommand,
+caller flag, or network operation.
+
+`create_git_worktree()` requires an explicit `ToolApprovalDecision` from a
+dedicated operator-side approval request. Approval is exact, one-use, and
+never cached. It re-plans after approval and creates only when every pinned
+condition is unchanged. A `WorktreeHandle` is returned only after registration,
+target, branch, HEAD, source cleanliness, local branch existence, and absent
+upstream are verified. On command or verification failure, bounded read-only
+inspection reports whether the branch, target, and registration exist; partial
+or ambiguous state is preserved for manual recovery.
+
+`inspect_git_worktree()` revalidates the handle's source, target,
+registration, branch, and HEAD on every call and returns only safe immutable
+state and a changed-entry count. `plan_git_worktree_removal()` accepts only a
+registered, attached, completely clean worktree; its HEAD may have advanced
+through a manual commit. `remove_git_worktree()` requests a separate exact
+approval, revalidates the clean plan, uses no force, verifies target and
+registration removal, and verifies that the local branch and source identity
+remain. Dirty, untracked, locked, switched, detached, missing, failed, or
+ambiguous worktrees are preserved.
+
+`create_isolated_agent_session()` revalidates the handle and source
+configuration, uses `dataclasses.replace()` to bind a copied
+`RuntimeConfiguration` to the worktree, and delegates to the existing session
+factory. Provider, model, profile, prompt, generation, response-format, tool,
+action, trace, and maximum-round behavior are preserved. Every registry
+workspace capability captures only the isolated `Workspace`.
+
+Context documents are not reused from the primary tree. A source-contained
+context path is mapped by its relative path, reloaded and revalidated inside
+the isolated worktree, and kept in original order. Missing mapped or external
+context is rejected. Construction failure returns no session and preserves the
+created worktree and branch.
+
+The CLI activates this boundary only when both `--worktree-path` and
+`--worktree-branch` accompany `--workspace`. It separately prompts for
+creation, runs the normal CLI with one prebuilt isolated session, then
+re-inspects. Dirty output is preserved with safe recovery information. A
+clean worktree may be removed only after a second default-deny approval, and
+its local branch remains. Successful local Git commands cannot provide
+crash-safe guarantees; unexpected state always requires manual recovery.
 
 ## Agent Session Boundary
 
@@ -1032,9 +1141,11 @@ tool-loop, maximum-round, or observer exceptions leave prior history unchanged,
 set `failed`, and propagate unchanged. A later successful send is allowed and
 returns the session to `ready`.
 
-The first boundary does not add task models, task assignment, multiple
+The base session boundary does not add task models, task assignment, multiple
 simultaneous sessions, orchestration, persistence, serialization, concurrency,
-cancellation, asynchronous APIs, RAG, MCP, worktrees, VS Code, or voice input.
+cancellation, asynchronous APIs, RAG, MCP, VS Code, or voice input. The
+additive isolated-session factory binds one such session to one validated
+worktree without changing `AgentSession` itself.
 
 ## Orchestration Boundary
 
@@ -1085,16 +1196,11 @@ The architecture follows these current security rules:
 * Automated tests do not call paid APIs.
 * Existing environment variables are not overwritten by `.env`.
 
-Future workspace execution must add:
-
-* Explicit tool permissions.
-* Path containment.
-* Command allowlists or confirmation.
-* Write isolation.
-* Destructive-action confirmation.
-* Audit traces.
-* Secret redaction.
-* Network-access controls.
+Current workspace execution adds explicit authorization, path containment,
+fixed-command confirmation, approved writes, and optional redacted traces.
+Worktree creation adds write isolation for one supervised local session.
+Broader destructive-action permissions, persistent audit records, stronger
+secret isolation, and network-access controls remain future work.
 
 ## Architectural Non-Goals
 
@@ -1102,21 +1208,21 @@ The current architecture does not yet provide:
 
 * Fully autonomous agents.
 * Multiple simultaneous agent sessions.
-* Filesystem exploration.
-* Source-code modification.
 * Shell execution.
 * Project indexing.
 * Retrieval-Augmented Generation.
 * Persistent task state.
-* Git worktree management.
+* Automatic Git commits, merge, push, or branch deletion.
+* Concurrent worktree orchestration.
 * A VS Code extension.
 * Background execution.
 * Cloud deployment.
 
 The current tool implementation is synchronous and contains the opt-in
-calculator plus explicitly authorized read-only workspace inspection. It does
-not include writes, network, MCP, asynchronous execution, or user-defined
-tools.
+calculator, explicitly authorized workspace inspection, approved structured
+file changes, and fixed Ruff/pytest validation. Worktree lifecycle operations
+remain operator-side and are not model tools. Network, MCP, asynchronous, and
+user-defined tools are not included.
 
 The presence of future-oriented abstractions in documentation does not imply
 that these capabilities are already implemented.

@@ -43,6 +43,8 @@ def test_interactive_setup_accepts_environment_defaults(
     assert configuration.enable_tools is False
     assert configuration.enable_actions is False
     assert configuration.workspace_root is None
+    assert configuration.worktree_path is None
+    assert configuration.worktree_branch is None
 
 
 def test_interactive_setup_reprompts_for_invalid_provider(

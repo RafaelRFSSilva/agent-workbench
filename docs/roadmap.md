@@ -23,15 +23,18 @@ Agent Workbench currently provides:
 - Portable generation configuration.
 - Prompt-based interactive setup.
 - Provider-independent structured outputs.
-- Provider-independent tool calling with an opt-in calculator and safe
-  read-only workspace tools.
+- Provider-independent tool calling with an opt-in calculator, safe workspace
+  inspection, approved structured file changes, and fixed validation commands.
+- Reusable provider-independent `AgentSession` construction.
+- Supervised local Git worktree creation, isolated session construction,
+  dirty-state preservation, and clean-only approved removal.
 - Automated tests, Ruff checks, and GitHub Actions.
 
 The current application manages one conversation at a time.
 
-It does not yet provide write-capable filesystem or network tools, RAG,
-asynchronous execution, user-defined tools, multiple simultaneous agents, MCP
-integration, or a VS Code interface.
+It does not yet provide deletion or rename transactions, arbitrary shell or
+network tools, RAG, asynchronous execution, user-defined tools, multiple
+simultaneous agents, MCP integration, or a VS Code interface.
 
 ## Development Direction
 
@@ -183,17 +186,18 @@ requiring every file to be attached manually.
 - [ ] Add command cancellation UI.
 - [ ] Add file deletion and rename.
 - [ ] Add crash-safe transaction journaling and recovery.
-- [ ] Add Git worktree isolation.
+- [x] Add supervised Git worktree isolation for one local session.
 - [ ] Add broader permission profiles.
 
 The available controlled workflow is inspect → patch one file or apply one
 approved multi-file transaction → format → lint → test → inspect diff →
-report. Each effectful invocation requires informed one-use approval.
+report. It can run inside a separately approved local worktree while keeping
+the clean primary tree unchanged. Each effectful invocation requires informed
+one-use approval.
 Multi-file rollback covers handled in-process failures only when rollback
 succeeds; it is not crash-safe or globally filesystem-atomic. The workflow
 does not provide arbitrary commands, deletion, rename, cancellation UI,
-worktree isolation, persistence, concurrency, automatic planning, or
-orchestration.
+persistence, concurrency, automatic planning, or orchestration.
 
 ## Phase 4 — Agent Sessions
 
@@ -318,6 +322,11 @@ The user remains responsible for permissions, approvals, and final decisions.
 
 ## Phase 7 — Isolated Agent Execution
 
+### Status
+
+The first supervised single-worktree boundary is complete. Concurrent
+worktrees, review/merge workflows, and crash recovery remain planned.
+
 ### Objective
 
 Prevent several writing agents from modifying the same working directory
@@ -325,14 +334,25 @@ without coordination.
 
 ### Planned Work
 
-- [ ] Support read-only sessions.
+- [x] Support one read-only or action-enabled isolated session.
 - [ ] Support patch-only results.
-- [ ] Add Git branch isolation.
-- [ ] Add Git worktree isolation.
+- [x] Add validated immutable worktree plans pinned to a clean primary HEAD.
+- [x] Add approved local branch and worktree creation through fixed Git
+  commands.
+- [x] Construct `AgentSession` workspace capabilities only inside the verified
+  worktree.
+- [x] Add clean-only separately approved removal while preserving the branch.
+- [x] Preserve dirty, partial, failed, and ambiguous worktrees for manual
+  recovery.
+- [x] Validate a real isolated local `gpt-oss:20b` coding workflow.
 - [ ] Add controlled patch application.
 - [ ] Add conflict detection.
 - [ ] Add review-before-apply workflows.
-- [ ] Add cleanup and failure recovery.
+- [ ] Add automatic or approved local commits.
+- [ ] Add merge workflows.
+- [ ] Add branch deletion.
+- [ ] Add several concurrent worktrees and orchestration.
+- [ ] Add persistent lifecycle records and crash recovery.
 
 A possible layout is:
 
@@ -546,19 +566,20 @@ Security must be implemented throughout the roadmap.
 
 The next implementation milestone is:
 
-> Agent sessions.
+> Review and completion workflows for isolated local branches.
 
-The completed workspace boundary provides explicit canonical read-only access.
-The next phase should introduce reusable session state and broader permissions
-without weakening that boundary.
+The completed boundary can create one approved local branch/worktree, run one
+isolated session, and preserve its dirty output. The next work should improve
+how an operator reviews and completes that local branch without introducing
+automatic push, unrestricted Git, or implicit destructive cleanup.
 
 ## Near-Term Sequence
 
-1. Introduce agent sessions.
-2. Build local project retrieval.
-3. Add initial multi-agent orchestration.
-4. Add project configuration and MCP.
-5. Build the terminal and VS Code experiences.
+1. Add reviewed completion for isolated local branches.
+2. Add crash-safe transaction and worktree lifecycle recovery.
+3. Add deletion/rename transactions and task acceptance criteria.
+4. Build local project retrieval and project configuration.
+5. Add multi-agent foundations, then terminal and VS Code experiences.
 
 ## Related Documentation
 
