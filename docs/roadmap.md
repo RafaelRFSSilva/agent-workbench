@@ -217,6 +217,14 @@ AgentSession
 - [x] Preserve successful session conversation state while excluding internal
   tool rounds.
 - [x] Add deterministic session and CLI integration tests.
+- [x] Add reusable `AgentSession` construction from resolved runtime
+  configuration.
+- [x] Separate provider, resolved profile/context forwarding, workspace, and
+  deterministic registry construction from the CLI.
+- [x] Make the CLI use the runtime factory as its single session-construction
+  boundary.
+- [x] Add deterministic factory tests for providers, configuration, tool
+  ordering, failure isolation, and workspace safety.
 - [ ] Represent tasks and task assignment.
 - [ ] Add cancellation and later completion lifecycle semantics.
 - [ ] Add persistence, serialization, and multiple-session coordination.
