@@ -513,16 +513,26 @@ uv run agent-workbench \
   --workspace .
 ```
 
-This exposes `list_files` and `read_file`. `list_files` returns sorted direct
-children only, including hidden entries, with file, directory, symlink, and
-other classifications; it refuses directories with more than 128 entries.
-`read_file` reads strict UTF-8 text up to 100 KiB and returns its canonical
+This exposes `list_files`, `read_file`, `search_text`, `inspect_git_status`,
+and `inspect_git_diff`. `list_files` returns sorted direct children only,
+including hidden entries, with file, directory, symlink, and other
+classifications; it refuses directories with more than 128 entries. `read_file`
+reads strict UTF-8 text up to 100 KiB and returns its canonical
 workspace-relative path.
 
 The workspace root and requested paths are resolved canonically. Absolute
 paths, traversal, prefix-confusion paths, and symlinks escaping the root are
-rejected. Internal symlinks remain available. The tools do not write, edit,
-delete, recurse, glob, access the network, or use MCP.
+rejected. Internal symlinks remain available. `search_text` performs literal
+recursive search in deterministic workspace-relative order, includes hidden
+files and directories, skips invalid UTF-8, and does not follow directory
+symlinks. It limits queries to 256 characters, inspects at most 512 files and
+100 KiB per file, returns at most 256 matching lines of 1,000 characters, and
+sets `truncated` when a limit applies.
+
+Git status and diff inspection use fixed non-shell commands only. Diff output
+separates unstaged from staged changes, disables external diff helpers, times
+out after three seconds, and caps combined returned output at 100 KiB. No tool
+writes, edits, deletes, globs, accesses the network, or uses MCP.
 
 Combine workspace inspection with the calculator:
 
@@ -534,10 +544,24 @@ uv run agent-workbench \
   --workspace .
 ```
 
-The combined registry is deterministic: `calculator`, `list_files`, then
-`read_file`. Tool execution remains synchronous, and internal tool rounds are
-not persisted across separate CLI user turns. Filesystem race protection
-between path resolution and later access is not yet guaranteed.
+The combined registry is deterministic: `calculator`, `list_files`,
+`read_file`, `search_text`, `inspect_git_status`, then `inspect_git_diff`.
+
+Show completed calls and results without changing conversation history:
+
+```bash
+uv run agent-workbench \
+  --provider ollama \
+  --model gpt-oss:20b \
+  --workspace . \
+  --show-tool-traces
+```
+
+Traces are opt-in, compact deterministic JSON, and redact read content and
+absolute paths. Tool execution remains synchronous, and internal tool rounds
+are not persisted across separate CLI user turns. `search_symbols`, writes,
+arbitrary command execution, and filesystem race protection between path
+resolution and later access are not yet available.
 
 ## Configuration Precedence
 

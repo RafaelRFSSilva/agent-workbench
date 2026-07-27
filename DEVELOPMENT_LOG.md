@@ -1,5 +1,42 @@
 # Development Log
 
+## 2026-07-27 — Complete Read-Only Workspace Inspection
+
+### Implemented
+
+- Added bounded literal `search_text` for deterministic recursive inspection.
+- Added fixed-command `inspect_git_status` and `inspect_git_diff` tools.
+- Extended the workspace registry with search and Git inspection after
+  `list_files` and `read_file`.
+- Added opt-in `--show-tool-traces` for completed tool-call rounds.
+
+### Security Decisions
+
+- Search includes hidden paths but skips invalid UTF-8 and directory symlinks;
+  it is bounded by query, file, byte, match, and line limits.
+- Git tools accept no caller-controlled flags, use no shell, disable external
+  diff helpers, use a minimal environment, enforce a three-second timeout, and
+  return bounded output only.
+- Traces use deterministic JSON, redact read content and absolute paths, and
+  never enter normal conversation history.
+
+### Validation
+
+- Ran a real localhost Ollama smoke test against installed `gpt-oss:20b`.
+- The model invoked `search_text`, `inspect_git_status`, and
+  `inspect_git_diff`, then returned `INSPECT-842` with the correct staged and
+  unstaged summary.
+- Direct `../outside` search and diff probes returned safe error ToolResults
+  without exposing outside data; the temporary repository remained unchanged.
+- The complete automated suite passed with 396 tests before documentation.
+
+### Current Limitations
+
+- `search_symbols`, writes, arbitrary command execution, network tools, MCP,
+  asynchronous execution, and cross-turn tool-round persistence are absent.
+- Filesystem race protection between path resolution and later access is not
+  yet guaranteed.
+
 ## 2026-07-27 — Safe Read-Only Workspace Tools
 
 ### Implemented

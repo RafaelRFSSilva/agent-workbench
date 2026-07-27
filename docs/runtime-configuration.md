@@ -643,6 +643,7 @@ points.
 | `--response-format-file` | Load a JSON response format |
 | `--enable-tools` | Enable the built-in calculator |
 | `--workspace PATH` | Authorize read-only tools for one workspace root |
+| `--show-tool-traces` | Display opt-in completed tool-call traces |
 | `--setup` | Start prompt-based interactive setup |
 
 Display the current CLI help:
@@ -724,9 +725,11 @@ Runtime configuration follows these security principles:
 - Project files are not modified by runtime configuration.
 
 The `--workspace` option grants only the current read-only `list_files` and
-`read_file` tools. It does not grant write, delete, command, network, MCP, or
-recursive-search access. The prompt-based setup keeps its default workspace
-root of `None`; use direct CLI configuration to authorize a workspace.
+`read_file`, `search_text`, `inspect_git_status`, and `inspect_git_diff` tools.
+It does not grant write, delete, arbitrary command, network, or MCP access.
+`--show-tool-traces` defaults to false and displays no output unless a tool
+registry is active. The prompt-based setup keeps its default workspace root of
+`None`; use direct CLI configuration to authorize a workspace.
 
 ## Current Limitations
 

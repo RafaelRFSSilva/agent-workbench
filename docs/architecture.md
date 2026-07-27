@@ -806,10 +806,14 @@ Provider adapters retain native protocol details:
 
 The CLI keeps tools opt-in. `--enable-tools` registers the safe synchronous
 calculator, while `--workspace PATH` authorizes the read-only `list_files` and
-`read_file` tools for one root. With both options, one registry is built in
-this order: `calculator`, `list_files`, `read_file`. Without either option, no
-tool registry is created. Internal tool rounds remain inside a single loop and
-are not persisted in normal CLI history across later user turns.
+`read_file`, `search_text`, `inspect_git_status`, and `inspect_git_diff` tools
+for one root. With both options, one registry is built in this order:
+`calculator`, `list_files`, `read_file`, `search_text`, `inspect_git_status`,
+`inspect_git_diff`. Without either option, no tool registry is created.
+`--show-tool-traces` adds an optional callback for completed provider-independent
+rounds; traces are compact JSON, redacted, and excluded from normal CLI history.
+Internal tool rounds remain inside a single loop and are not persisted in normal
+CLI history across later user turns.
 
 This separation keeps provider adapters declarative and prevents them from
 directly executing application capabilities.
@@ -834,14 +838,21 @@ Workspace
 `list_files` returns deterministic sorted direct children, including hidden
 entries, and caps a directory at 128 entries. `read_file` accepts strict UTF-8
 only and caps content at 100 KiB. Both report canonical relative paths. They
-are read-only and do not provide recursive search, globbing, network, MCP,
-write, deletion, or execution capabilities.
+are read-only. `search_text` provides bounded literal recursive search of
+regular UTF-8 files in deterministic relative order, skips invalid UTF-8 and
+directory symlinks, and reports truncation at its query, file, byte, match, and
+line limits. Git inspection runs only fixed non-shell status and diff commands
+with external helpers disabled, a three-second timeout, and 100 KiB output
+limits; it separates unstaged and staged diff results. These tools do not
+provide globbing, network, MCP, write, deletion, or arbitrary execution
+capabilities.
 
 Agents should not receive unrestricted access automatically. Filesystem race
 protection between resolution and later access is not yet guaranteed.
 
 Read access, write access, command execution, network access, and Git
-operations should be represented separately.
+operations remain separate permissions. `search_symbols` and any mutable or
+arbitrary-command capability remain future work.
 
 ## Agent Session Boundary
 

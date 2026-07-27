@@ -138,8 +138,8 @@ completed milestone.
 
 ### Status
 
-Read-only workspace inspection is completed. Write, execution, search, and
-Git inspection remain future work.
+Read-only workspace inspection is completed. Write, execution, symbol search,
+and broader Git operations remain future work.
 
 ### Objective
 
@@ -157,12 +157,12 @@ requiring every file to be attached manually.
   limit.
 - [x] Authorize workspace tools explicitly with `--workspace PATH`; preserve
   deterministic combined order with `--enable-tools`.
-- [ ] Add `search_text`.
+- [x] Add bounded literal `search_text` with deterministic recursive order,
+  hidden entries, symlink boundaries, UTF-8 skipping, and truncation reporting.
 - [ ] Add `search_symbols`.
-- [ ] Add `inspect_git_status`.
-- [ ] Add `inspect_git_diff`.
-- [ ] Add file and output size limits.
-- [ ] Add visible tool traces.
+- [x] Add fixed-command `inspect_git_status` and `inspect_git_diff`.
+- [x] Add file and output size limits.
+- [x] Add opt-in visible tool traces outside conversation history.
 
 ### Controlled Write and Execution Tools
 
