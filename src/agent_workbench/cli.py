@@ -17,6 +17,7 @@ from agent_workbench.errors import (
     WorkspacePathError,
 )
 from agent_workbench.messages import ToolInteractionRound
+from agent_workbench.tool_registry import ToolRegistry
 from agent_workbench.agents import AgentProfile
 from agent_workbench.session import AgentSession, SessionId
 from agent_workbench.session_factory import create_agent_session
@@ -75,15 +76,17 @@ def run_cli(
             break
 
         try:
-            if enable_actions and show_tool_traces:
+            if enable_actions:
                 assistant_response = session.send(
                     user_input,
-                    tool_round_observer=_display_tool_round,
-                    tool_approval_handler=_prompt_for_tool_approval,
-                )
-            elif enable_actions:
-                assistant_response = session.send(
-                    user_input,
+                    tool_round_observer=(
+                        _display_tool_round
+                        if show_tool_traces
+                        else lambda round_: _display_approved_action_completion(
+                            round_,
+                            session.tool_registry,
+                        )
+                    ),
                     tool_approval_handler=_prompt_for_tool_approval,
                 )
             elif session.tool_registry is not None and show_tool_traces:
@@ -491,6 +494,27 @@ def _prompt_for_tool_approval(
         return ToolApprovalDecision.APPROVE
 
     return ToolApprovalDecision.DENY
+
+
+def _display_approved_action_completion(
+    round_: ToolInteractionRound,
+    registry: ToolRegistry | None,
+) -> None:
+    """Display a compact result for each approval-required action."""
+
+    if registry is None:
+        return
+
+    for invocation, result in zip(
+        round_.response.tool_invocations,
+        round_.results,
+        strict=True,
+    ):
+        if not registry.requires_approval(invocation):
+            continue
+
+        print(f"Action completed: {invocation.tool_name}")
+        print(f"  Status: {result.status}")
 
 
 def _display_tool_round(round_: ToolInteractionRound) -> None:
