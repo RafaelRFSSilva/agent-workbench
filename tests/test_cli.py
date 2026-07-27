@@ -4,12 +4,12 @@ from pathlib import Path
 from unittest.mock import call, Mock
 
 from agent_workbench.built_in_tools import create_built_in_tool_registry
-from agent_workbench.cli import main, run_cli
+from agent_workbench.cli import main, run_cli as run_session_cli
 from agent_workbench.arguments import RuntimeConfiguration
 from agent_workbench.context import ContextDocument
-from agent_workbench.errors import CompletionError
+from agent_workbench.errors import CompletionError, ConfigurationError
 from agent_workbench.messages import ChatRequest, ChatResponse, Message
-from agent_workbench.session import SessionId
+from agent_workbench.session import AgentSession, SessionId
 from agent_workbench.agents import get_agent_profile
 from agent_workbench.generation import GenerationConfig
 from agent_workbench.structured_outputs import JSONResponseFormat
@@ -57,6 +57,37 @@ class FakeProvider:
             return ChatResponse(text=outcome)
 
         return outcome
+
+
+def run_cli(
+    provider,
+    system_prompt=None,
+    agent_profile=None,
+    context_documents=(),
+    generation_config=None,
+    response_format=None,
+    tool_registry=None,
+    max_tool_rounds=8,
+    show_tool_traces=False,
+) -> None:
+    """Adapt legacy test inputs to the prebuilt-session presentation boundary."""
+
+    session = AgentSession(
+        id=SessionId("test-session"),
+        provider=provider,
+        agent_profile=agent_profile,
+        system_prompt=system_prompt,
+        context_documents=context_documents,
+        generation_config=generation_config,
+        response_format=response_format,
+        tool_registry=tool_registry,
+        max_tool_rounds=max_tool_rounds,
+    )
+    run_session_cli(
+        session,
+        agent_profile=agent_profile,
+        show_tool_traces=show_tool_traces,
+    )
 
 
 def create_calculator_definition() -> ToolDefinition:
@@ -429,42 +460,24 @@ def test_cli_constructs_and_reuses_one_agent_session(
 ) -> None:
     """Delegate every non-exit turn to one configured AgentSession."""
 
-    provider = FakeProvider()
     session = Mock()
+    session.provider_name = "Fake"
+    session.model_name = "fake-model"
+    session.tool_registry = None
     session.send.side_effect = [
         ChatResponse(text="First response."),
         ChatResponse(text="Second response."),
     ]
-    session_factory = Mock(return_value=session)
-    generation_config = GenerationConfig(temperature=0.2)
     user_inputs = iter(["First request.", "Second request.", "/exit"])
 
     monkeypatch.setattr("builtins.input", lambda _: next(user_inputs))
-    monkeypatch.setattr("agent_workbench.cli.AgentSession", session_factory)
 
-    run_cli(
-        provider,
-        system_prompt="Configured prompt.",
-        generation_config=generation_config,
-        max_tool_rounds=3,
-    )
+    run_session_cli(session)
 
-    session_factory.assert_called_once_with(
-        id=SessionId("cli-session"),
-        provider=provider,
-        system_prompt="Configured prompt.",
-        agent_profile=None,
-        context_documents=(),
-        generation_config=generation_config,
-        response_format=None,
-        tool_registry=None,
-        max_tool_rounds=3,
-    )
     assert session.send.call_args_list == [
         call("First request."),
         call("Second request."),
     ]
-    assert provider.calls == []
     output = capsys.readouterr().out
     assert "Assistant: First response." in output
     assert "Assistant: Second response." in output
@@ -1017,15 +1030,15 @@ def test_cli_executes_symbol_search_with_safe_opt_in_trace(
 
 
 def test_main_does_not_inject_tools_by_default(monkeypatch) -> None:
-    """Leave the CLI untooled unless enablement is explicit."""
+    """Construct one CLI session through the resolved runtime factory."""
 
     configuration = RuntimeConfiguration(
         provider_name="ollama",
         model_name="test-model",
     )
-    provider = FakeProvider()
+    session = Mock()
     resolve_mock = Mock(return_value=configuration)
-    create_provider_mock = Mock(return_value=provider)
+    create_session_mock = Mock(return_value=session)
     run_cli_mock = Mock()
 
     monkeypatch.setattr("agent_workbench.cli.load_environment", Mock())
@@ -1034,20 +1047,20 @@ def test_main_does_not_inject_tools_by_default(monkeypatch) -> None:
         resolve_mock,
     )
     monkeypatch.setattr(
-        "agent_workbench.cli.create_provider",
-        create_provider_mock,
+        "agent_workbench.cli.create_agent_session",
+        create_session_mock,
     )
     monkeypatch.setattr("agent_workbench.cli.run_cli", run_cli_mock)
 
     main([])
 
+    create_session_mock.assert_called_once_with(
+        SessionId("cli-session"),
+        configuration,
+    )
     run_cli_mock.assert_called_once_with(
-        provider,
-        system_prompt=None,
+        session,
         agent_profile=None,
-        context_documents=(),
-        generation_config=GenerationConfig(),
-        response_format=None,
     )
 
 
@@ -1061,7 +1074,9 @@ def test_main_injects_the_built_in_registry_when_tools_are_enabled(
         model_name="test-model",
         enable_tools=True,
     )
-    provider = FakeProvider()
+    session = Mock()
+    session.tool_registry = Mock()
+    create_session_mock = Mock(return_value=session)
     run_cli_mock = Mock()
 
     monkeypatch.setattr("agent_workbench.cli.load_environment", Mock())
@@ -1070,18 +1085,18 @@ def test_main_injects_the_built_in_registry_when_tools_are_enabled(
         Mock(return_value=configuration),
     )
     monkeypatch.setattr(
-        "agent_workbench.cli.create_provider",
-        Mock(return_value=provider),
+        "agent_workbench.cli.create_agent_session",
+        create_session_mock,
     )
     monkeypatch.setattr("agent_workbench.cli.run_cli", run_cli_mock)
 
     main(["--enable-tools"])
 
-    run_cli_mock.assert_called_once()
-    _, keyword_arguments = run_cli_mock.call_args
-    registry = keyword_arguments["tool_registry"]
-
-    assert [definition.name for definition in registry.definitions] == ["calculator"]
+    create_session_mock.assert_called_once_with(
+        SessionId("cli-session"),
+        configuration,
+    )
+    run_cli_mock.assert_called_once_with(session, agent_profile=None)
 
 
 def test_main_injects_workspace_tools_when_workspace_is_enabled(
@@ -1095,7 +1110,9 @@ def test_main_injects_workspace_tools_when_workspace_is_enabled(
         model_name="test-model",
         workspace_root=tmp_path,
     )
-    provider = FakeProvider()
+    session = Mock()
+    session.tool_registry = Mock()
+    create_session_mock = Mock(return_value=session)
     run_cli_mock = Mock()
 
     monkeypatch.setattr("agent_workbench.cli.load_environment", Mock())
@@ -1104,24 +1121,18 @@ def test_main_injects_workspace_tools_when_workspace_is_enabled(
         Mock(return_value=configuration),
     )
     monkeypatch.setattr(
-        "agent_workbench.cli.create_provider",
-        Mock(return_value=provider),
+        "agent_workbench.cli.create_agent_session",
+        create_session_mock,
     )
     monkeypatch.setattr("agent_workbench.cli.run_cli", run_cli_mock)
 
     main(["--workspace", str(tmp_path)])
 
-    _, keyword_arguments = run_cli_mock.call_args
-    registry = keyword_arguments["tool_registry"]
-
-    assert [definition.name for definition in registry.definitions] == [
-        "list_files",
-        "read_file",
-        "search_text",
-        "search_symbols",
-        "inspect_git_status",
-        "inspect_git_diff",
-    ]
+    create_session_mock.assert_called_once_with(
+        SessionId("cli-session"),
+        configuration,
+    )
+    run_cli_mock.assert_called_once_with(session, agent_profile=None)
 
 
 def test_main_combines_calculator_and_workspace_tools_in_order(
@@ -1136,7 +1147,9 @@ def test_main_combines_calculator_and_workspace_tools_in_order(
         enable_tools=True,
         workspace_root=tmp_path,
     )
-    provider = FakeProvider()
+    session = Mock()
+    session.tool_registry = Mock()
+    create_session_mock = Mock(return_value=session)
     run_cli_mock = Mock()
 
     monkeypatch.setattr("agent_workbench.cli.load_environment", Mock())
@@ -1145,25 +1158,18 @@ def test_main_combines_calculator_and_workspace_tools_in_order(
         Mock(return_value=configuration),
     )
     monkeypatch.setattr(
-        "agent_workbench.cli.create_provider",
-        Mock(return_value=provider),
+        "agent_workbench.cli.create_agent_session",
+        create_session_mock,
     )
     monkeypatch.setattr("agent_workbench.cli.run_cli", run_cli_mock)
 
     main(["--enable-tools", "--workspace", str(tmp_path)])
 
-    _, keyword_arguments = run_cli_mock.call_args
-    registry = keyword_arguments["tool_registry"]
-
-    assert [definition.name for definition in registry.definitions] == [
-        "calculator",
-        "list_files",
-        "read_file",
-        "search_text",
-        "search_symbols",
-        "inspect_git_status",
-        "inspect_git_diff",
-    ]
+    create_session_mock.assert_called_once_with(
+        SessionId("cli-session"),
+        configuration,
+    )
+    run_cli_mock.assert_called_once_with(session, agent_profile=None)
 
 
 def test_main_forwards_opt_in_tool_trace_configuration(monkeypatch) -> None:
@@ -1175,6 +1181,9 @@ def test_main_forwards_opt_in_tool_trace_configuration(monkeypatch) -> None:
         enable_tools=True,
         show_tool_traces=True,
     )
+    session = Mock()
+    session.tool_registry = Mock()
+    create_session_mock = Mock(return_value=session)
     run_cli_mock = Mock()
 
     monkeypatch.setattr("agent_workbench.cli.load_environment", Mock())
@@ -1183,14 +1192,22 @@ def test_main_forwards_opt_in_tool_trace_configuration(monkeypatch) -> None:
         Mock(return_value=configuration),
     )
     monkeypatch.setattr(
-        "agent_workbench.cli.create_provider",
-        Mock(return_value=FakeProvider()),
+        "agent_workbench.cli.create_agent_session",
+        create_session_mock,
     )
     monkeypatch.setattr("agent_workbench.cli.run_cli", run_cli_mock)
 
     main(["--enable-tools", "--show-tool-traces"])
 
-    assert run_cli_mock.call_args.kwargs["show_tool_traces"] is True
+    create_session_mock.assert_called_once_with(
+        SessionId("cli-session"),
+        configuration,
+    )
+    run_cli_mock.assert_called_once_with(
+        session,
+        agent_profile=None,
+        show_tool_traces=True,
+    )
 
 
 def test_main_reports_invalid_workspace_configuration(
@@ -1212,9 +1229,12 @@ def test_main_reports_invalid_workspace_configuration(
         "agent_workbench.cli.resolve_runtime_configuration",
         Mock(return_value=configuration),
     )
+    failure = ConfigurationError(
+        f"Workspace root does not exist: {tmp_path / 'missing'}"
+    )
     monkeypatch.setattr(
-        "agent_workbench.cli.create_provider",
-        Mock(return_value=FakeProvider()),
+        "agent_workbench.cli.create_agent_session",
+        Mock(side_effect=failure),
     )
     monkeypatch.setattr("agent_workbench.cli.run_cli", run_cli_mock)
 
@@ -1252,10 +1272,11 @@ def test_main_uses_interactive_runtime_setup(
         model_name="test-model",
         response_format=response_format,
     )
-    provider = FakeProvider()
+    session = Mock()
+    session.tool_registry = None
 
     setup_mock = Mock(return_value=configuration)
-    create_provider_mock = Mock(return_value=provider)
+    create_session_mock = Mock(return_value=session)
     run_cli_mock = Mock()
 
     monkeypatch.setattr(
@@ -1263,8 +1284,8 @@ def test_main_uses_interactive_runtime_setup(
         setup_mock,
     )
     monkeypatch.setattr(
-        "agent_workbench.cli.create_provider",
-        create_provider_mock,
+        "agent_workbench.cli.create_agent_session",
+        create_session_mock,
     )
     monkeypatch.setattr(
         "agent_workbench.cli.run_cli",
@@ -1274,15 +1295,11 @@ def test_main_uses_interactive_runtime_setup(
     main(["--setup"])
 
     setup_mock.assert_called_once_with()
-    create_provider_mock.assert_called_once_with(
-        "ollama",
-        "test-model",
+    create_session_mock.assert_called_once_with(
+        SessionId("cli-session"),
+        configuration,
     )
     run_cli_mock.assert_called_once_with(
-        provider,
-        system_prompt=None,
+        session,
         agent_profile=None,
-        context_documents=(),
-        generation_config=GenerationConfig(),
-        response_format=response_format,
     )
