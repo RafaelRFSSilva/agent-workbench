@@ -7,6 +7,7 @@ from agent_workbench.errors import CompletionError, ConfigurationError
 from agent_workbench.messages import ChatRequest, ChatResponse, ToolInteractionRound
 from agent_workbench.providers.base import ChatProvider
 from agent_workbench.tool_registry import ToolRegistry
+from agent_workbench.tools import ToolApprovalDecision, ToolApprovalHandler
 
 type ToolRoundObserver = Callable[[ToolInteractionRound], None]
 
@@ -17,6 +18,7 @@ def run_tool_calling_loop(
     registry: ToolRegistry,
     max_tool_rounds: int,
     tool_round_observer: ToolRoundObserver | None = None,
+    tool_approval_handler: ToolApprovalHandler | None = None,
 ) -> ChatResponse:
     """Complete a request, executing requested tools until text is returned."""
 
@@ -41,6 +43,32 @@ def run_tool_calling_loop(
             raise CompletionError(
                 "The maximum number of tool execution rounds was exceeded."
             )
+
+        approval_required = tuple(
+            invocation
+            for invocation in response.tool_invocations
+            if registry.requires_approval(invocation)
+        )
+        if approval_required:
+            if len(response.tool_invocations) != 1:
+                raise CompletionError(
+                    "Approval-required tool actions must be requested one at a time."
+                )
+
+            approval_request = registry.create_approval_request(approval_required[0])
+            if tool_approval_handler is None:
+                raise CompletionError("Tool action approval is required.")
+
+            try:
+                decision = tool_approval_handler(approval_request)
+            except Exception:
+                raise CompletionError("Tool approval handler failed.") from None
+
+            if decision is ToolApprovalDecision.DENY:
+                raise CompletionError("Tool action approval was denied.")
+
+            if decision is not ToolApprovalDecision.APPROVE:
+                raise CompletionError("Tool approval decision is invalid.")
 
         results = tuple(
             registry.execute(invocation) for invocation in response.tool_invocations

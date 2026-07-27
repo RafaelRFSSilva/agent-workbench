@@ -138,8 +138,9 @@ completed milestone.
 
 ### Status
 
-The read-only Workspace Inspection subset is completed. Write, approved
-execution, and broader Git operations remain future work.
+Safe read-only inspection and the initial controlled local single-agent coding
+workflow are completed. Broader write profiles and Git operations remain
+future work.
 
 ### Objective
 
@@ -167,22 +168,24 @@ requiring every file to be attached manually.
 
 ### Controlled Write and Execution Tools
 
-- [ ] Add patch-based file updates.
-- [ ] Add approved formatter execution.
-- [ ] Add approved static-analysis execution.
-- [ ] Add approved test execution.
-- [ ] Add confirmation for commands.
-- [ ] Add timeouts and cancellation.
-- [ ] Add destructive-action protection.
+- [x] Add patch-based single-file updates.
+- [x] Add approved formatter execution.
+- [x] Add approved static-analysis execution.
+- [x] Add approved test execution.
+- [x] Add explicit confirmation for fixed commands.
+- [x] Add fixed command allowlists.
+- [x] Add timeouts and bounded output.
+- [x] Add initial destructive-action protection.
+- [ ] Add command cancellation UI.
+- [ ] Add file deletion and rename.
+- [ ] Add multi-file write transactions.
+- [ ] Add broader permission profiles.
 
-Write and execution tools should be introduced only after read-only access and
-permissions are stable.
-
-The completed read-only subset is limited to contained file listing and
-reading, literal text and Python symbol search, fixed Git status/diff
-inspection, and visible traces. It does not complete controlled writes,
-approved execution, permissions, cancellation, or destructive-action
-protection.
+The available controlled workflow is inspect → patch one file → format → lint
+→ test → inspect diff → report. Each effectful invocation requires informed
+one-use approval. It does not provide arbitrary commands, deletion, rename,
+multi-file transactions, cancellation UI, worktree isolation, persistence,
+concurrency, automatic planning, or orchestration.
 
 ## Phase 4 — Agent Sessions
 

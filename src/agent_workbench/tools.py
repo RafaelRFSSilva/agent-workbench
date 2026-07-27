@@ -3,7 +3,9 @@
 import json
 import math
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Literal, cast
 
 from agent_workbench.errors import ConfigurationError
@@ -104,6 +106,48 @@ class ToolInvocation:
             JSONObject,
             json.loads(self._arguments_json),
         )
+
+
+class ToolApprovalDecision(StrEnum):
+    """Represent an explicit caller-owned action approval decision."""
+
+    APPROVE = "approve"
+    DENY = "deny"
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class ToolApprovalRequest:
+    """Represent one immutable provider-independent approval request."""
+
+    invocation: ToolInvocation
+    _preview_json: str = field(repr=False)
+
+    def __init__(
+        self,
+        invocation: ToolInvocation,
+        preview: JSONValue = None,
+    ) -> None:
+        """Store an invocation and an immutable strict-JSON preview snapshot."""
+
+        preview_json = _serialize_json_value(
+            preview,
+            context="tool approval preview",
+        )
+
+        object.__setattr__(self, "invocation", invocation)
+        object.__setattr__(self, "_preview_json", preview_json)
+
+    @property
+    def preview(self) -> JSONValue:
+        """Return an independent copy of the approval preview."""
+
+        return cast(JSONValue, json.loads(self._preview_json))
+
+
+type ToolApprovalHandler = Callable[
+    [ToolApprovalRequest],
+    ToolApprovalDecision,
+]
 
 
 @dataclass(frozen=True, slots=True, init=False)

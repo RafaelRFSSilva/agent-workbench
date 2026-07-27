@@ -13,6 +13,7 @@ from agent_workbench.providers.base import ChatProvider
 from agent_workbench.structured_outputs import JSONResponseFormat
 from agent_workbench.tool_calling import ToolRoundObserver, run_tool_calling_loop
 from agent_workbench.tool_registry import ToolRegistry
+from agent_workbench.tools import ToolApprovalHandler
 
 DEFAULT_MAX_TOOL_ROUNDS = 8
 
@@ -174,6 +175,7 @@ class AgentSession:
         content: str,
         *,
         tool_round_observer: ToolRoundObserver | None = None,
+        tool_approval_handler: ToolApprovalHandler | None = None,
     ) -> ChatResponse:
         """Complete and transactionally commit one conversation turn."""
 
@@ -215,6 +217,7 @@ class AgentSession:
                     self._tool_registry,
                     self._max_tool_rounds,
                     tool_round_observer=tool_round_observer,
+                    tool_approval_handler=tool_approval_handler,
                 )
         except Exception:
             self._status = SessionStatus.FAILED

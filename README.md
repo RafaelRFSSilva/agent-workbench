@@ -27,15 +27,15 @@ Implemented capabilities:
 - Provider-independent generation settings.
 - Prompt-based interactive setup.
 - Provider-independent structured outputs.
-- Provider-independent tool calling with opt-in calculator and read-only
-  workspace tools.
+- Provider-independent tool calling with an opt-in calculator, read-only
+  workspace inspection, and explicitly approved controlled workspace actions.
 - Provider-independent `AgentSession` identity, lifecycle, transactional
   conversation ownership, and synchronous direct or tool-enabled sends.
 - Reusable `AgentSession` construction from resolved runtime configuration,
   including providers and deterministic optional tool registries.
 - Automated tests, Ruff checks, and GitHub Actions.
 
-Write-capable filesystem and network tools, RAG, MCP, asynchronous execution,
+Arbitrary shell and network tools, RAG, MCP, asynchronous execution,
 user-defined tools, multiple simultaneous agents, and the VS Code interface
 are planned but not yet implemented.
 
@@ -455,9 +455,66 @@ uv run agent-workbench \
   --show-tool-traces
 ```
 
-These tools are read-only: they do not edit, delete, glob, access the network,
-or use MCP. Writes, arbitrary command execution, and filesystem race
-protection between resolution and later access remain future work.
+These inspection tools remain read-only. They do not edit, delete, glob,
+access the network, or use MCP.
+
+### Controlled Workspace Actions
+
+Controlled actions are disabled by default. `--enable-actions` requires an
+explicit `--workspace PATH` and adds `apply_file_patch`, `run_ruff_format`,
+`run_ruff_check`, and `run_pytest` after the read-only tools:
+
+```bash
+uv run agent-workbench \
+  --provider ollama \
+  --model gpt-oss:20b \
+  --agent developer \
+  --workspace . \
+  --enable-actions \
+  --show-tool-traces
+```
+
+Every effectful invocation displays a complete deterministic preview and
+prompts `Approve action? [y/N]:`. Approval is default-deny, applies once to the
+exact invocation, and is never cached. An approval-required action must be the
+only invocation in its tool round. There is no automatic approval and no
+arbitrary shell or caller-controlled command flag.
+
+`apply_file_patch` performs one structured optimistic UTF-8 update or creation.
+It compares the complete expected content, shows the complete unified diff,
+and revalidates after approval. Existing files are replaced atomically while
+preserving portable permission bits; new files use exclusive creation in an
+existing directory. Writes reject absolute paths, traversal, every symlink
+component, `.git`, binaries, stale content, missing parents, content over
+100 KiB, more than 500 changed lines, and complete diff previews over 64 KiB.
+Deletion, rename, directory creation, mode changes, and multi-file
+transactions are unsupported.
+
+Validation uses only fixed non-shell commands against a canonical
+workspace-relative target: Ruff format and check have 30-second timeouts,
+while pytest has a 120-second timeout. Stdout and stderr are independently
+bounded to 100 KiB, and the child environment is minimal and offline. The
+tools cannot install dependencies or access the public network. Non-zero Ruff
+and pytest exit codes are returned to the model for diagnosis. Ruff format may
+modify files, and pytest executes project code, so all three commands require
+approval.
+
+With `--workspace` and `--enable-actions`, tool order is `list_files`,
+`read_file`, `search_text`, `search_symbols`, `inspect_git_status`,
+`inspect_git_diff`, `apply_file_patch`, `run_ruff_format`, `run_ruff_check`,
+then `run_pytest`. With `--enable-tools`, the order is `calculator`,
+`list_files`, `read_file`, `search_text`, `search_symbols`,
+`inspect_git_status`, `inspect_git_diff`, `apply_file_patch`,
+`run_ruff_format`, `run_ruff_check`, then `run_pytest`.
+
+Example request:
+
+```text
+Inspect the relevant files, propose one small change, request approval before
+every write or validation action, apply the approved patch, run Ruff and
+pytest, inspect the final Git diff, and summarize the result. Do not commit or
+push.
+```
 
 See [Architecture](docs/architecture.md) for the shared tool models and
 provider translations.
@@ -501,12 +558,12 @@ Completed foundations:
 - [x] Generation configuration.
 - [x] Prompt-based setup.
 - [x] Structured outputs.
-- [x] Provider-independent tool calling, calculator, and safe read-only
-  workspace tools.
+- [x] Provider-independent tool calling, calculator, safe workspace
+  inspection, and controlled approved coding actions.
+- [x] Provider-independent AgentSession and reusable runtime factory.
 
 Next milestones:
 
-- [ ] Agent sessions.
 - [ ] Local project retrieval and RAG.
 - [ ] Multi-agent orchestration.
 - [ ] Git worktree isolation.
@@ -536,15 +593,18 @@ Current protections include:
 - Context and response-format files are validated before provider creation.
 - Automated tests do not call paid APIs.
 
-Future workspace execution will require explicit permissions, path containment,
-command confirmation, repository and MCP trust, and visible audit traces.
+Controlled workspace execution uses explicit authorization, canonical path
+containment, exact-invocation confirmation, fixed commands, timeouts, output
+limits, and visible previews. Broader repository and MCP trust remain future
+work.
 
 ## Current Limitations
 
 Agent Workbench does not yet provide:
 
-- Write-capable filesystem or network tools.
-- Shell command execution.
+- Arbitrary shell or network tools.
+- File deletion, rename, or multi-file write transactions.
+- Caller-controlled commands or command flags.
 - User-defined tools.
 - Asynchronous tool execution.
 - Project indexing or RAG.

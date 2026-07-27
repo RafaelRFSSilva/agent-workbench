@@ -15,13 +15,13 @@ Agent Workbench currently supports:
 * Portable generation configuration.
 * Portable structured outputs.
 * Prompt-based interactive runtime setup.
-* Opt-in provider-independent tool calling, including safe read-only workspace
-  inspection.
+* Opt-in provider-independent tool calling, including safe workspace
+  inspection and explicitly approved controlled coding actions.
 
 The current application runs as a command-line interface.
 
-Multi-agent orchestration, workspace writes, MCP integration, project
-retrieval, and the VS Code interface are future milestones.
+Multi-agent orchestration, arbitrary shell/network access, MCP integration,
+project retrieval, and the VS Code interface are future milestones.
 
 ## Requirements
 
@@ -390,7 +390,8 @@ Each file must:
 The current implementation sends the complete selected file contents with each
 request.
 
-Project-wide discovery, file tools, indexing, and RAG are not yet implemented.
+Project indexing and RAG are not yet implemented; opt-in workspace tools can
+inspect files and Python symbols on demand.
 
 ## Configure Generation
 
@@ -578,11 +579,77 @@ uv run agent-workbench \
   --show-tool-traces
 ```
 
-Traces are opt-in, compact deterministic JSON, and redact read content and
-absolute paths. Tool execution remains synchronous, and internal tool rounds
-are not persisted across separate CLI user turns. Writes, arbitrary command
-execution, and filesystem race protection between path resolution and later
-access are not yet available.
+Traces are opt-in, compact deterministic JSON, and redact read content,
+file-patch content, and absolute paths. Tool execution remains synchronous,
+and internal tool rounds are not persisted across separate CLI user turns.
+
+## Run a Controlled Coding Workflow
+
+Controlled writes and validation are disabled by default. Enable them only for
+an explicitly authorized workspace:
+
+```bash
+uv run agent-workbench \
+  --provider ollama \
+  --model gpt-oss:20b \
+  --agent developer \
+  --workspace . \
+  --enable-actions \
+  --show-tool-traces
+```
+
+`--enable-actions` cannot be used without `--workspace`. It adds, after the
+six read-only workspace tools:
+
+1. `apply_file_patch`
+2. `run_ruff_format`
+3. `run_ruff_check`
+4. `run_pytest`
+
+When the calculator is also enabled it remains first, followed by the six
+read-only tools and these four actions.
+
+Every action displays an informed preview and asks:
+
+```text
+Approve action? [y/N]:
+```
+
+Only `y` or `yes`, case-insensitively, approves. Blank input, EOF, interruption,
+or any other text denies. Approval is one-use and exact-invocation only. The
+model must request one effectful action per tool round; mixed or multiple
+actions are rejected before execution.
+
+`apply_file_patch` accepts exactly `path`, `expected_content`,
+`replacement_content`, and optional `create_if_missing`. It updates one
+existing UTF-8 file only when its complete current content matches, or creates
+one new file in an existing directory when explicitly requested. The complete
+unified diff is shown before approval, then target state is revalidated.
+Existing files use same-directory atomic replacement. Writes never follow
+symlinks and never target `.git`.
+
+Patch content and existing files are limited to 100 KiB, one patch may change
+at most 500 removed/added lines, and the complete preview must fit within
+64 KiB without truncation. File deletion, rename, directory creation, binary
+files, mode changes, and multi-file transactions are unsupported.
+
+The validation tools run fixed commands without a shell or caller flags,
+against a canonical workspace-relative target. Ruff commands time out after
+30 seconds; pytest times out after 120 seconds. Stdout and stderr are
+independently capped at 100 KiB. The minimal offline environment provides no
+dependency installation or public-network capability. Ruff and pytest
+non-zero exit codes are returned normally so the model can diagnose them.
+Ruff format may change files, and pytest executes project code, so review each
+preview carefully.
+
+Suggested request:
+
+```text
+Inspect the relevant files, propose one small change, request approval before
+every write or validation action, apply the approved patch, run Ruff and
+pytest, inspect the final Git diff, and summarize the result. Do not commit or
+push.
+```
 
 ## Configuration Precedence
 
