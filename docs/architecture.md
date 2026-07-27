@@ -876,10 +876,45 @@ capabilities remain future work.
 ## Agent Session Boundary
 
 `AgentSession` is the provider-independent application boundary for one
-configured synchronous conversation. The CLI creates one session and remains
-responsible for input, output, headers, exit handling, configuration/provider
-construction, workspace registry construction, error rendering, and tool-trace
-formatting.
+configured synchronous conversation. The CLI requests one session and remains
+responsible for input, output, headers, exit handling, configuration
+resolution, error rendering, and tool-trace formatting.
+
+Session construction is reusable through `create_agent_session()`. Callers
+supply an explicit `SessionId` and an already resolved `RuntimeConfiguration`.
+Argument parsing, environment resolution, profile/context loading, and
+interactive setup happen before this boundary. The factory creates the
+provider, forwards the resolved profile, prompt, context, generation, and
+response-format models, constructs the optional workspace and registry, and
+returns one `AgentSession`. It performs no input, output, trace rendering,
+completion, lifecycle management, or conversation mutation.
+
+```text
+RuntimeConfiguration resolution
+        ↓
+create_agent_session()
+        ↓
+AgentSession
+        ↓
+ChatProvider / run_tool_calling_loop()
+        ↓
+CLI rendering
+```
+
+Factory tool construction remains deterministic:
+
+* No tool options: no registry.
+* Calculator only: `calculator`.
+* Workspace only: `list_files`, `read_file`, `search_text`,
+  `search_symbols`, `inspect_git_status`, `inspect_git_diff`.
+* Combined: `calculator`, followed by the workspace-only order.
+
+All workspace registrations share one canonical `Workspace`. Trace enablement
+stays in runtime presentation configuration and is never applied by the
+factory. The CLI now owns only configuration resolution, its explicit
+CLI-scoped session identifier, terminal presentation, trace formatting, and
+error presentation; it does not construct providers, workspaces, registries,
+or session fields.
 
 ```text
 AgentSession

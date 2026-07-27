@@ -31,6 +31,8 @@ Implemented capabilities:
   workspace tools.
 - Provider-independent `AgentSession` identity, lifecycle, transactional
   conversation ownership, and synchronous direct or tool-enabled sends.
+- Reusable `AgentSession` construction from resolved runtime configuration,
+  including providers and deterministic optional tool registries.
 - Automated tests, Ruff checks, and GitHub Actions.
 
 Write-capable filesystem and network tools, RAG, MCP, asynchronous execution,

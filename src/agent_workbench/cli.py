@@ -6,58 +6,29 @@ from agent_workbench.arguments import (
     parse_cli_arguments,
     resolve_runtime_configuration,
 )
-from agent_workbench.built_in_tools import create_built_in_tool_registry
 from agent_workbench.config import (
     load_environment,
 )
-from agent_workbench.context import ContextDocument
 from agent_workbench.interactive_setup import run_interactive_setup
 from agent_workbench.errors import CompletionError, ConfigurationError
 from agent_workbench.messages import ToolInteractionRound
-from agent_workbench.providers.base import ChatProvider
-from agent_workbench.providers.factory import create_provider
 from agent_workbench.agents import AgentProfile
-from agent_workbench.generation import GenerationConfig
 from agent_workbench.session import AgentSession, SessionId
-from agent_workbench.structured_outputs import JSONResponseFormat
-from agent_workbench.symbol_tools import register_symbol_tools
-from agent_workbench.tool_registry import ToolRegistry
-from agent_workbench.workspace import Workspace
-from agent_workbench.workspace_tools import register_workspace_tools
-from agent_workbench.git_tools import register_git_tools
+from agent_workbench.session_factory import create_agent_session
 
 EXIT_COMMANDS = {"/exit", "/quit"}
-DEFAULT_MAX_TOOL_ROUNDS = 8
 
 
 def run_cli(
-    provider: ChatProvider,
-    system_prompt: str | None = None,
+    session: AgentSession,
     agent_profile: AgentProfile | None = None,
-    context_documents: tuple[ContextDocument, ...] = (),
-    generation_config: GenerationConfig | None = None,
-    response_format: JSONResponseFormat | None = None,
-    tool_registry: ToolRegistry | None = None,
-    max_tool_rounds: int = DEFAULT_MAX_TOOL_ROUNDS,
     show_tool_traces: bool = False,
 ) -> None:
-    """Run an interactive conversation using the provided model provider."""
-
-    active_generation_config = generation_config or GenerationConfig()
-    session = AgentSession(
-        id=SessionId("cli-session"),
-        provider=provider,
-        system_prompt=system_prompt,
-        agent_profile=agent_profile,
-        context_documents=context_documents,
-        generation_config=active_generation_config,
-        response_format=response_format,
-        tool_registry=tool_registry,
-        max_tool_rounds=max_tool_rounds,
-    )
+    """Run an interactive conversation using one configured session."""
 
     header = (
-        f"Agent Workbench | Provider: {provider.name} | Model: {provider.model_name}"
+        f"Agent Workbench | Provider: {session.provider_name} "
+        f"| Model: {session.model_name}"
     )
 
     if agent_profile is not None:
@@ -85,7 +56,7 @@ def run_cli(
             break
 
         try:
-            if tool_registry is not None and show_tool_traces:
+            if session.tool_registry is not None and show_tool_traces:
                 assistant_response = session.send(
                     user_input,
                     tool_round_observer=_display_tool_round,
@@ -113,57 +84,24 @@ def main(
         else:
             runtime_configuration = resolve_runtime_configuration(arguments)
 
-        provider = create_provider(
-            runtime_configuration.provider_name,
-            runtime_configuration.model_name,
+        session = create_agent_session(
+            SessionId("cli-session"),
+            runtime_configuration,
         )
-
-        tool_registry = (
-            create_built_in_tool_registry()
-            if runtime_configuration.enable_tools
-            else None
-        )
-
-        if runtime_configuration.workspace_root is not None:
-            workspace = Workspace(runtime_configuration.workspace_root)
-            if tool_registry is None:
-                tool_registry = ToolRegistry()
-            register_workspace_tools(tool_registry, workspace)
-            register_symbol_tools(tool_registry, workspace)
-            register_git_tools(tool_registry, workspace)
     except ConfigurationError as exc:
         print(f"Configuration error: {exc}")
         return
 
-    if tool_registry is not None and runtime_configuration.show_tool_traces:
+    if session.tool_registry is not None and runtime_configuration.show_tool_traces:
         run_cli(
-            provider,
-            system_prompt=runtime_configuration.system_prompt,
+            session,
             agent_profile=runtime_configuration.agent_profile,
-            context_documents=runtime_configuration.context_documents,
-            generation_config=runtime_configuration.generation_config,
-            response_format=runtime_configuration.response_format,
-            tool_registry=tool_registry,
             show_tool_traces=True,
-        )
-    elif tool_registry is not None:
-        run_cli(
-            provider,
-            system_prompt=runtime_configuration.system_prompt,
-            agent_profile=runtime_configuration.agent_profile,
-            context_documents=runtime_configuration.context_documents,
-            generation_config=runtime_configuration.generation_config,
-            response_format=runtime_configuration.response_format,
-            tool_registry=tool_registry,
         )
     else:
         run_cli(
-            provider,
-            system_prompt=runtime_configuration.system_prompt,
+            session,
             agent_profile=runtime_configuration.agent_profile,
-            context_documents=runtime_configuration.context_documents,
-            generation_config=runtime_configuration.generation_config,
-            response_format=runtime_configuration.response_format,
         )
 
 

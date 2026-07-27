@@ -1,5 +1,50 @@
 # Development Log
 
+## 2026-07-27 — AgentSession Runtime Factory
+
+### Implemented
+
+- Added `create_agent_session()` in commit `a31a28f` as the reusable boundary
+  from resolved `RuntimeConfiguration` to one configured `AgentSession`.
+- Moved provider, workspace, deterministic registry, and session construction
+  out of the CLI in commit `ec461ac`.
+- Preserved already resolved profile/system-prompt precedence, ordered context,
+  generation configuration, optional structured response format, provider
+  behavior, workspace errors, and trace presentation.
+
+### Architecture Decisions
+
+- Keep argument parsing, environment resolution, profile/context loading, and
+  interactive setup before the factory.
+- Create providers through the existing provider factory and never add
+  provider-specific session behavior.
+- Build a fresh optional registry per factory call: none by default,
+  calculator when enabled, six ordered workspace tools when authorized, and
+  calculator followed by those tools when combined.
+- Bind all workspace registrations to one canonical `Workspace`; keep traces,
+  conversation, lifecycle, completion, commit, and rollback outside the
+  construction factory.
+
+### Validation
+
+- A real factory-created localhost `gpt-oss:20b` session returned
+  `FACTORY-842`, then `FACTORY-HISTORY-842 FACTORY-842`.
+- A calculator-enabled factory session invoked `(29 * 31) + 1` once, observed
+  one successful result of 900, and returned `FACTORY-900 result: 900`.
+- A workspace factory session invoked the exact `FactoryProbe731` symbol
+  search and returned `FACTORY-731 src/factory_probe.py FactoryProbe731`.
+- Direct checks confirmed absent unauthorized workspace tools, safe invalid
+  workspace failure followed by successful construction, unchanged process
+  directory and files, no inspected-code execution, and no external-content
+  exposure.
+- The complete automated suite passed with 461 tests before documentation.
+
+### Current Limitations
+
+- The factory constructs one session at a time; it does not manage a session
+  collection, tasks, assignment, orchestration, persistence, concurrency,
+  cancellation, or expanded lifecycle semantics.
+
 ## 2026-07-27 — Provider-Independent AgentSession Foundation
 
 ### Implemented
