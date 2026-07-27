@@ -138,8 +138,8 @@ completed milestone.
 
 ### Status
 
-Read-only workspace inspection is completed. Write, execution, symbol search,
-and broader Git operations remain future work.
+The read-only Workspace Inspection subset is completed. Write, approved
+execution, and broader Git operations remain future work.
 
 ### Objective
 
@@ -159,7 +159,8 @@ requiring every file to be attached manually.
   deterministic combined order with `--enable-tools`.
 - [x] Add bounded literal `search_text` with deterministic recursive order,
   hidden entries, symlink boundaries, UTF-8 skipping, and truncation reporting.
-- [ ] Add `search_symbols`.
+- [x] Add bounded Python `search_symbols` using non-executing standard-library
+  AST parsing, lexical symbol kinds, async metadata, and deterministic results.
 - [x] Add fixed-command `inspect_git_status` and `inspect_git_diff`.
 - [x] Add file and output size limits.
 - [x] Add opt-in visible tool traces outside conversation history.
@@ -176,6 +177,12 @@ requiring every file to be attached manually.
 
 Write and execution tools should be introduced only after read-only access and
 permissions are stable.
+
+The completed read-only subset is limited to contained file listing and
+reading, literal text and Python symbol search, fixed Git status/diff
+inspection, and visible traces. It does not complete controlled writes,
+approved execution, permissions, cancellation, or destructive-action
+protection.
 
 ## Phase 4 — Agent Sessions
 

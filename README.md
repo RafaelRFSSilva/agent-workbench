@@ -286,7 +286,8 @@ Supported extensions:
 Each file must contain valid UTF-8 and must not exceed 100 KiB.
 
 The current implementation sends complete selected files with every request.
-Workspace tools and RAG are future milestones.
+Read-only workspace inspection is also available on demand; project indexing
+and RAG remain future milestones.
 
 See [Context Files](docs/context-files.md).
 
@@ -369,8 +370,8 @@ rounds are not persisted across separate user turns.
 ### Read-Only Workspace Tools
 
 Authorize one workspace explicitly with `--workspace` to expose `list_files`,
-`read_file`, `search_text`, `inspect_git_status`, and `inspect_git_diff`; no
-workspace tools are available without it:
+`read_file`, `search_text`, `search_symbols`, `inspect_git_status`, and
+`inspect_git_diff`; no workspace tools are available without it:
 
 ```bash
 uv run agent-workbench \
@@ -380,8 +381,8 @@ uv run agent-workbench \
 ```
 
 Combine it with `--enable-tools` to expose all tools in deterministic order:
-`calculator`, `list_files`, `read_file`, `search_text`, `inspect_git_status`,
-then `inspect_git_diff`.
+`calculator`, `list_files`, `read_file`, `search_text`, `search_symbols`,
+`inspect_git_status`, then `inspect_git_diff`.
 
 ```bash
 uv run agent-workbench \
@@ -404,6 +405,23 @@ directory symlinks. It skips invalid UTF-8 safely and is bounded to a
 256-character query, 512 files, 100 KiB per file, 256 matching lines, and
 1,000 returned characters per line; its `truncated` result indicates a limit.
 
+`search_symbols` uses the standard-library Python AST without importing or
+executing inspected code. It finds classes, functions, asynchronous functions,
+methods, and nested definitions by literal name or qualified-name substring.
+The valid `kind` values are exactly `any`, `class`, `function`, and `method`;
+asynchronous state is reported separately through `is_async`. Matching is
+case-insensitive by default, results use canonical relative paths and
+deterministic file/line/qualified-name order, and hidden Python paths are
+included. Directory symlinks are not followed, while an explicitly requested
+internal file symlink resolves to its canonical target. Directory searches
+skip invalid UTF-8, invalid syntax, and oversized Python files; explicit file
+requests reject them with safe errors.
+
+Symbol search limits are a 256-character query, 512 Python files, 100 KiB per
+file, 256 matches, and 512 characters per returned qualified name.
+`files_skipped` reports malformed or oversized files, and `truncated` reports
+file, match, or qualified-name limits.
+
 Git inspection uses only fixed non-shell commands: status is equivalent to
 `git status --short --branch`, while diff returns separate unstaged and staged
 fixed-command output. Commands have a three-second timeout, disable external
@@ -414,10 +432,28 @@ JSON invocation and result records before the final response. Traces are
 opt-in, redact read content and absolute paths, and are not placed in
 conversation history.
 
+```bash
+uv run agent-workbench \
+  --provider ollama \
+  --model gpt-oss:20b \
+  --workspace . \
+  --show-tool-traces
+```
+
+The calculator, all workspace tools, and traces can be enabled together:
+
+```bash
+uv run agent-workbench \
+  --provider ollama \
+  --model gpt-oss:20b \
+  --enable-tools \
+  --workspace . \
+  --show-tool-traces
+```
+
 These tools are read-only: they do not edit, delete, glob, access the network,
-or use MCP. `search_symbols`, writes, arbitrary command execution, and
-filesystem race protection between resolution and later access remain future
-work.
+or use MCP. Writes, arbitrary command execution, and filesystem race
+protection between resolution and later access remain future work.
 
 See [Architecture](docs/architecture.md) for the shared tool models and
 provider translations.
@@ -503,7 +539,7 @@ command confirmation, repository and MCP trust, and visible audit traces.
 
 Agent Workbench does not yet provide:
 
-- Filesystem or network tools.
+- Write-capable filesystem or network tools.
 - Shell command execution.
 - User-defined tools.
 - Asynchronous tool execution.

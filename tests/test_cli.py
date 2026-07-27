@@ -12,6 +12,7 @@ from agent_workbench.messages import ChatRequest, ChatResponse, Message
 from agent_workbench.agents import get_agent_profile
 from agent_workbench.generation import GenerationConfig
 from agent_workbench.structured_outputs import JSONResponseFormat
+from agent_workbench.symbol_tools import register_symbol_tools
 from agent_workbench.tool_registry import ToolRegistry
 from agent_workbench.tools import ToolDefinition, ToolInvocation
 from agent_workbench.workspace import Workspace
@@ -902,6 +903,74 @@ def test_cli_executes_workspace_list_and_read_tools(
     assert "Assistant: The code word is WORKSPACE-731." in captured.out
 
 
+def test_cli_executes_symbol_search_with_safe_opt_in_trace(
+    monkeypatch,
+    tmp_path,
+    capsys,
+) -> None:
+    """Trace symbol search without leaking paths or changing later history."""
+
+    source_path = tmp_path / "src" / "models.py"
+    source_path.parent.mkdir()
+    source_path.write_text(
+        "class WorkspaceModel:\n    async def inspect_workspace(self):\n        pass\n",
+        encoding="utf-8",
+    )
+    registry = ToolRegistry()
+    register_symbol_tools(registry, Workspace(tmp_path))
+    provider = FakeProvider(
+        [
+            create_tool_response(
+                ToolInvocation(
+                    id="symbol-call",
+                    tool_name="search_symbols",
+                    arguments={"query": "WorkspaceModel"},
+                )
+            ),
+            "Found WorkspaceModel in src/models.py.",
+            "History remains clean.",
+        ]
+    )
+    user_inputs = iter(["Find the model.", "Continue.", "/exit"])
+
+    monkeypatch.setattr("builtins.input", lambda _: next(user_inputs))
+
+    run_cli(
+        provider,
+        tool_registry=registry,
+        max_tool_rounds=1,
+        show_tool_traces=True,
+    )
+
+    captured = capsys.readouterr()
+    trace_position = captured.out.index("Tool trace: search_symbols (symbol-call)")
+    response_position = captured.out.index(
+        "Assistant: Found WorkspaceModel in src/models.py."
+    )
+    result = provider.requests[1].tool_interactions[0].results[0]
+
+    assert trace_position < response_position
+    assert result.status == "success"
+    assert result.output["matches"][0]["qualified_name"] == "WorkspaceModel"
+    assert '"path":"src/models.py"' in captured.out
+    assert str(tmp_path) not in captured.out
+    assert provider.calls[2] == [
+        {
+            "role": "user",
+            "content": "Find the model.",
+        },
+        {
+            "role": "assistant",
+            "content": "Found WorkspaceModel in src/models.py.",
+        },
+        {
+            "role": "user",
+            "content": "Continue.",
+        },
+    ]
+    assert "Tool trace:" not in str(provider.calls[2])
+
+
 def test_main_does_not_inject_tools_by_default(monkeypatch) -> None:
     """Leave the CLI untooled unless enablement is explicit."""
 
@@ -1004,6 +1073,7 @@ def test_main_injects_workspace_tools_when_workspace_is_enabled(
         "list_files",
         "read_file",
         "search_text",
+        "search_symbols",
         "inspect_git_status",
         "inspect_git_diff",
     ]
@@ -1045,6 +1115,7 @@ def test_main_combines_calculator_and_workspace_tools_in_order(
         "list_files",
         "read_file",
         "search_text",
+        "search_symbols",
         "inspect_git_status",
         "inspect_git_diff",
     ]

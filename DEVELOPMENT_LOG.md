@@ -1,5 +1,53 @@
 # Development Log
 
+## 2026-07-27 — Safe Python Symbol Search
+
+### Implemented
+
+- Added provider-independent `search_symbols` in commit `7f9bee7`.
+- Registered it automatically for authorized CLI workspaces in commit
+  `c8a7548`.
+- Preserved deterministic registry order between `search_text` and the Git
+  inspection tools.
+- Added focused coverage for symbol semantics, containment, bounds,
+  non-execution, registry construction, CLI traces, and history isolation.
+
+### Security Decisions
+
+- Parse Python with the standard-library AST only; inspected modules are never
+  imported or executed.
+- Use lexical scope for classes, functions, methods, nested definitions, and
+  qualified names. Async remains `is_async` metadata rather than a distinct
+  kind; valid filters are exactly `any`, `class`, `function`, and `method`.
+- Include hidden Python paths, skip directory symlinks, and allow explicit
+  internal file symlinks only through canonical `Workspace` resolution.
+- Skip invalid UTF-8, invalid syntax, and oversized files during directory
+  search; reject the same conditions safely for explicit files.
+- Limit queries to 256 characters, inspection to 512 Python files and 100 KiB
+  per file, results to 256 matches, and qualified names to 512 characters.
+
+### Validation
+
+- Ran a real localhost Ollama smoke against installed `gpt-oss:20b`.
+- The model made exact class and method searches for `SymbolProbe842` and
+  `SymbolProbe842.inspect_workspace`, observed `is_async=true`, and returned
+  `SYMBOL-842` with `src/domain/models.py`.
+- Traversal, absolute external paths, an external directory symlink, invalid
+  UTF-8, invalid syntax, and an explicit non-Python file all produced safe
+  error ToolResults without exposing external content.
+- Inspected Python was not executed, the marker remained absent, and temporary
+  workspace contents were unchanged.
+- The complete automated suite passed with 418 tests before documentation.
+
+### Current Limitations
+
+- Workspace tools remain read-only and synchronous.
+- Controlled writes, approved execution, permissions, cancellation,
+  destructive-action protection, network tools, MCP, and cross-turn
+  tool-round persistence remain future work.
+- Filesystem race protection between resolution and later access is not yet
+  guaranteed.
+
 ## 2026-07-27 — Complete Read-Only Workspace Inspection
 
 ### Implemented

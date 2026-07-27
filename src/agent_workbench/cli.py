@@ -19,6 +19,7 @@ from agent_workbench.providers.factory import create_provider
 from agent_workbench.agents import AgentProfile
 from agent_workbench.generation import GenerationConfig
 from agent_workbench.structured_outputs import JSONResponseFormat
+from agent_workbench.symbol_tools import register_symbol_tools
 from agent_workbench.tool_calling import run_tool_calling_loop
 from agent_workbench.tool_registry import ToolRegistry
 from agent_workbench.workspace import Workspace
@@ -149,6 +150,7 @@ def main(
             if tool_registry is None:
                 tool_registry = ToolRegistry()
             register_workspace_tools(tool_registry, workspace)
+            register_symbol_tools(tool_registry, workspace)
             register_git_tools(tool_registry, workspace)
     except ConfigurationError as exc:
         print(f"Configuration error: {exc}")
