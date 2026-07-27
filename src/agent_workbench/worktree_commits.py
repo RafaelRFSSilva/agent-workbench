@@ -15,6 +15,11 @@ import threading
 from typing import cast
 
 from agent_workbench.errors import CompletionError, ConfigurationError
+from agent_workbench.recovery import (
+    IsolatedCommitRecoveryEvidence,
+    IsolatedCommitRecoveryPhase,
+    RecoveryStatus,
+)
 from agent_workbench.tools import (
     JSONObject,
     JSONValue,
@@ -385,16 +390,30 @@ def create_isolated_commit(
         )
     except ConfigurationError:
         raise CompletionError(
-            _commit_failure_message(plan, "Exact staging failed")
+            _commit_failure_message(
+                plan,
+                "Exact staging failed",
+                IsolatedCommitRecoveryPhase.EXACT_STAGING,
+            )
         ) from None
     if stage_outcome.returncode != 0:
-        raise CompletionError(_commit_failure_message(plan, "Exact staging failed"))
+        raise CompletionError(
+            _commit_failure_message(
+                plan,
+                "Exact staging failed",
+                IsolatedCommitRecoveryPhase.EXACT_STAGING,
+            )
+        )
 
     try:
         _verify_staged_plan(plan)
     except (CompletionError, ConfigurationError):
         raise CompletionError(
-            _commit_failure_message(plan, "Staged-state verification failed")
+            _commit_failure_message(
+                plan,
+                "Staged-state verification failed",
+                IsolatedCommitRecoveryPhase.STAGED_STATE_VERIFICATION,
+            )
         ) from None
 
     commit_arguments = (
@@ -418,11 +437,19 @@ def create_isolated_commit(
         )
     except ConfigurationError:
         raise CompletionError(
-            _commit_failure_message(plan, "Local commit creation failed")
+            _commit_failure_message(
+                plan,
+                "Local commit creation failed",
+                IsolatedCommitRecoveryPhase.LOCAL_COMMIT_CREATION,
+            )
         ) from None
     if commit_outcome.returncode != 0:
         raise CompletionError(
-            _commit_failure_message(plan, "Local commit creation failed")
+            _commit_failure_message(
+                plan,
+                "Local commit creation failed",
+                IsolatedCommitRecoveryPhase.LOCAL_COMMIT_CREATION,
+            )
         )
 
     try:
@@ -430,7 +457,11 @@ def create_isolated_commit(
         _verify_created_commit(plan, new_head)
     except (CompletionError, ConfigurationError):
         raise CompletionError(
-            _commit_failure_message(plan, "Commit verification failed")
+            _commit_failure_message(
+                plan,
+                "Commit verification failed",
+                IsolatedCommitRecoveryPhase.COMMIT_VERIFICATION,
+            )
         ) from None
 
     return IsolatedCommitResult(
@@ -1038,60 +1069,114 @@ def _read_tree_entry(
     return mode, object_id
 
 
-def _commit_failure_message(plan: IsolatedCommitPlan, reason: str) -> str:
-    """Return bounded safe partial index/ref state for manual recovery."""
+def _collect_commit_recovery_evidence(
+    plan: IsolatedCommitPlan,
+    phase: IsolatedCommitRecoveryPhase,
+) -> IsolatedCommitRecoveryEvidence:
+    """Collect bounded read-only Git evidence after an isolated-commit failure."""
 
-    head_changed = "unknown"
-    branch = plan.branch_name
-    index_dirty = "unknown"
-    worktree_dirty = "unknown"
+    observed_head: str | None = None
+    observed_branch: str | None = None
+    index_dirty = RecoveryStatus.UNKNOWN
+    worktree_dirty = RecoveryStatus.UNKNOWN
     staged_paths: tuple[str, ...] = ()
+
     try:
-        head_changed = (
-            "yes" if _read_head(plan.worktree.worktree_path) != plan.old_head else "no"
-        )
+        observed_head = _read_head(plan.worktree.worktree_path)
     except ConfigurationError:
         pass
+
     try:
-        current_branch = _read_symbolic_branch(plan.worktree.worktree_path)
-        if current_branch:
-            branch = current_branch
+        observed_branch = _read_symbolic_branch(plan.worktree.worktree_path)
     except ConfigurationError:
         pass
+
     try:
         staged = _run_git(
             plan.worktree.worktree_path,
             ("diff", "--cached", "--name-only", "-z", "--"),
         )
         if staged.returncode == 0:
-            decoded_paths = []
+            decoded_paths: list[str] = []
+            paths_are_safe = True
+
             for raw_path in staged.stdout.split(b"\0"):
                 if not raw_path:
                     continue
                 try:
-                    path = raw_path.decode("utf-8")
-                except UnicodeDecodeError:
-                    path = "[invalid path]"
-                decoded_paths.append(path)
-            staged_paths = tuple(sorted(decoded_paths))
-            index_dirty = "yes" if staged_paths else "no"
+                    relative_path, _target = _resolve_changed_path(
+                        plan.worktree.worktree_path,
+                        raw_path,
+                    )
+                except ConfigurationError:
+                    paths_are_safe = False
+                    break
+                decoded_paths.append(relative_path)
+
+            if paths_are_safe:
+                staged_paths = tuple(sorted(decoded_paths))
+                index_dirty = RecoveryStatus.YES if staged_paths else RecoveryStatus.NO
     except ConfigurationError:
         pass
+
     try:
         status = _run_git(
             plan.worktree.worktree_path,
             ("status", "--porcelain=v1", "-z", "--untracked-files=all"),
         )
         if status.returncode == 0:
-            worktree_dirty = "yes" if status.stdout else "no"
+            worktree_dirty = RecoveryStatus.YES if status.stdout else RecoveryStatus.NO
     except ConfigurationError:
         pass
-    staged_display = ", ".join(staged_paths) if staged_paths else "[none or unknown]"
+
+    try:
+        return IsolatedCommitRecoveryEvidence(
+            phase=phase,
+            target_display=plan.worktree.target_display,
+            expected_branch=plan.branch_name,
+            observed_branch=observed_branch,
+            expected_head=plan.old_head,
+            observed_head=observed_head,
+            index_dirty=index_dirty,
+            staged_paths=staged_paths,
+            worktree_dirty=worktree_dirty,
+        )
+    except ConfigurationError:
+        return IsolatedCommitRecoveryEvidence(
+            phase=phase,
+            target_display=plan.worktree.target_display,
+            expected_branch=plan.branch_name,
+            observed_branch=None,
+            expected_head=plan.old_head,
+            observed_head=None,
+            index_dirty=RecoveryStatus.UNKNOWN,
+            staged_paths=(),
+            worktree_dirty=RecoveryStatus.UNKNOWN,
+        )
+
+
+def _commit_failure_message(
+    plan: IsolatedCommitPlan,
+    reason: str,
+    phase: IsolatedCommitRecoveryPhase,
+) -> str:
+    """Format bounded structured recovery evidence for manual inspection."""
+
+    evidence = _collect_commit_recovery_evidence(plan, phase)
+    branch = evidence.observed_branch or evidence.expected_branch
+    staged_display = (
+        ", ".join(evidence.staged_paths)
+        if evidence.staged_paths
+        else "[none or unknown]"
+    )
+
     return (
         f"{reason}; manual inspection is required "
-        f"(HEAD changed: {head_changed}; branch: {branch}; "
-        f"index dirty: {index_dirty}; staged paths: {staged_display}; "
-        f"worktree dirty: {worktree_dirty}). No automatic recovery was attempted."
+        f"(HEAD changed: {evidence.head_changed.value}; branch: {branch}; "
+        f"index dirty: {evidence.index_dirty.value}; "
+        f"staged paths: {staged_display}; "
+        f"worktree dirty: {evidence.worktree_dirty.value}). "
+        "No automatic recovery was attempted."
     )
 
 
