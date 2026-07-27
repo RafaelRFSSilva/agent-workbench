@@ -712,6 +712,7 @@ Application Layer
 Tool Execution Layer
 ├── ToolRegistry
 ├── synchronous handlers
+├── immutable approval requests
 ├── ToolInteractionRound
 └── run_tool_calling_loop
 
@@ -794,6 +795,15 @@ stops on a response without tool invocations. Its positive maximum-round
 argument protects against unbounded new tool rounds; pre-existing rounds are
 forwarded without re-execution.
 
+Registrations may mark a handler as approval-required and supply a deterministic
+preview callback. `ToolApprovalRequest` snapshots the exact immutable
+invocation and strict-JSON preview. Only the caller-owned
+`ToolApprovalHandler` can return explicit `APPROVE` or `DENY`. An effectful
+invocation must be alone in its provider response, approval is never cached,
+and preview, absence, denial, invalid decision, or handler failure all prevent
+execution. Approval data is not inserted into provider history or normal
+session messages.
+
 Provider adapters retain native protocol details:
 
 * Ollama translates function definitions, assistant `tool_calls`, and ordered
@@ -805,12 +815,12 @@ Provider adapters retain native protocol details:
   user `tool_result` blocks.
 
 The CLI keeps tools opt-in. `--enable-tools` registers the safe synchronous
-calculator, while `--workspace PATH` authorizes the read-only `list_files` and
+calculator, while `--workspace PATH` authorizes the read-only `list_files`,
 `read_file`, `search_text`, `search_symbols`, `inspect_git_status`, and
-`inspect_git_diff` tools for one root. With both options, one registry is built
-in this order: `calculator`, `list_files`, `read_file`, `search_text`,
-`search_symbols`, `inspect_git_status`, `inspect_git_diff`. Without either
-option, no tool registry is created.
+`inspect_git_diff` tools for one root. `--enable-actions` requires that
+workspace and appends `apply_file_patch`, `run_ruff_format`, `run_ruff_check`,
+and `run_pytest`. The calculator, when enabled, remains first. Without a tool
+option or workspace, no registry is created.
 `--show-tool-traces` adds an optional callback for completed provider-independent
 rounds; traces are compact JSON, redacted, and excluded from normal CLI history.
 Internal tool rounds remain inside a single loop and are not persisted in normal
@@ -863,15 +873,31 @@ requested explicitly. Limits are 256 query characters, 512 Python files,
 
 Git inspection runs only fixed non-shell status and diff commands with external
 helpers disabled, a three-second timeout, and 100 KiB output limits; it
-separates unstaged and staged diff results. These tools do not provide
-globbing, network, MCP, write, deletion, or arbitrary execution capabilities.
+separates unstaged and staged diff results.
 
-Agents should not receive unrestricted access automatically. Filesystem race
-protection between resolution and later access is not yet guaranteed.
+The controlled write boundary is intentionally stricter than reads.
+`apply_file_patch` never follows a target or parent symlink, rejects `.git`,
+and supports only one complete-content compare-and-swap update or creation.
+The preview contains the complete deterministic unified diff and bounded
+metadata. Execution validates again after approval; existing files use a
+same-directory temporary file and atomic replacement with portable permission
+preservation, while new files use exclusive creation.
 
-Read access, write access, command execution, network access, and Git
-operations remain separate permissions. Mutable or arbitrary-command
-capabilities remain future work.
+Validation uses the current Python interpreter with fixed Ruff or pytest
+module arguments, `shell=False`, a canonical workspace cwd, minimal offline
+environment, isolated process groups, timeouts, and streaming 100 KiB limits
+for each output stream. Ruff and pytest findings are normal results; start,
+capture, module, and timeout failures are safe errors.
+
+The reusable factory constructs definitions and handlers but never prompts.
+The CLI owns informed display and exact-invocation approval. `AgentSession`
+forwards the callback transactionally, so denied or invalid turns roll back
+while prior successful conversation remains.
+
+Read access, controlled writes, fixed command execution, network access, and
+Git mutation remain separate permissions. Arbitrary commands, deletion,
+rename, multi-file transactions, and network/MCP capabilities remain future
+work.
 
 ## Agent Session Boundary
 

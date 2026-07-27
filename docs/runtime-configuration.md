@@ -15,6 +15,7 @@ A configured session currently contains:
 - Optional generation settings.
 - An optional structured response format.
 - An optional authorized workspace root.
+- Optional controlled-action authorization.
 
 The same runtime configuration model is used by:
 
@@ -40,7 +41,8 @@ RuntimeConfiguration
 ├── generation_config
 ├── response_format
 ├── enable_tools
-└── workspace_root
+├── workspace_root
+└── enable_actions
 ```
 
 This is the final application configuration used before provider construction.
@@ -642,7 +644,8 @@ points.
 | `--max-output-tokens` | Configure the output-token limit |
 | `--response-format-file` | Load a JSON response format |
 | `--enable-tools` | Enable the built-in calculator |
-| `--workspace PATH` | Authorize read-only tools for one workspace root |
+| `--workspace PATH` | Authorize workspace tools for one root |
+| `--enable-actions` | Add approved file changes and fixed validation commands; requires `--workspace` |
 | `--show-tool-traces` | Display opt-in completed tool-call traces |
 | `--setup` | Start prompt-based interactive setup |
 
@@ -704,6 +707,7 @@ Examples include:
 - Invalid generation ranges.
 - Invalid context files.
 - Invalid response format files.
+- `--enable-actions` without `--workspace`.
 - Direct configuration combined with `--setup`.
 
 Provider or model capabilities may still differ.
@@ -724,7 +728,7 @@ Runtime configuration follows these security principles:
 - Automated tests use simulated provider clients.
 - Project files are not modified by runtime configuration.
 
-The `--workspace` option grants only the current read-only `list_files`,
+The `--workspace` option grants the read-only `list_files`,
 `read_file`, `search_text`, `search_symbols`, `inspect_git_status`, and
 `inspect_git_diff` tools. They are registered in that order; when
 `--enable-tools` is also supplied, `calculator` comes first. `search_symbols`
@@ -732,8 +736,15 @@ is Python-only, uses non-executing standard-library AST parsing, and reports
 asynchronous definitions through `is_async` while accepting only `any`,
 `class`, `function`, or `method` as its `kind`.
 
-Workspace authorization does not grant write, delete, arbitrary command,
-network, or MCP access.
+`--enable-actions` is a separate default-false authorization and requires the
+workspace root. It appends `apply_file_patch`, `run_ruff_format`,
+`run_ruff_check`, and `run_pytest` in that order. It does not store approval
+callbacks or terminal functions in `RuntimeConfiguration`; the CLI owns the
+default-deny, one-use approval prompt. Interactive setup keeps actions false
+without asking another question.
+
+Workspace action authorization does not grant deletion, rename, arbitrary
+commands or flags, network, Git mutation, or MCP access.
 `--show-tool-traces` defaults to false and displays no output unless a tool
 registry is active. The prompt-based setup keeps its default workspace root of
 `None`; use direct CLI configuration to authorize a workspace.

@@ -2320,3 +2320,68 @@ yet introduce unrestricted filesystem or shell access.
 - Filesystem, network, MCP, asynchronous, and user-defined tools are not
   implemented.
 - Internal tool rounds are not persisted across separate CLI user turns.
+
+## 2026-07-27 — Controlled Single-Agent Coding Actions
+
+### Implemented
+
+- `75aff3e feat: add tool action approvals`
+- `0587936 feat: add approved workspace file patches`
+- `bb79303 feat: add approved validation tools`
+- `d42444b feat: add controlled workspace actions to CLI`
+- Added immutable exact-invocation approval requests and explicit approve/deny
+  decisions without provider-specific fields.
+- Added registry approval metadata and deterministic previews while preserving
+  provider-facing tool schemas.
+- Added one approved single-file complete-content compare-and-swap patch tool.
+- Added fixed approved Ruff format/check and pytest tools.
+- Added opt-in `--enable-actions`, requiring an explicit workspace, with
+  default-deny CLI approval.
+
+### Safety Design
+
+- Approval is caller-owned, one-use, and valid only for the exact invocation.
+- Approval-required tools must be requested alone in a provider response.
+- Patch previews are complete unified diffs; preview and execution both verify
+  content and path state.
+- Writes reject absolute paths, traversal, all symlink components, `.git`,
+  non-regular or invalid UTF-8 files, missing parents, stale content, oversized
+  content, more than 500 changed lines, and previews over 64 KiB.
+- Existing-file writes use same-directory atomic replacement and preserve
+  portable permission bits; new files use exclusive creation.
+- Validation commands are fixed non-shell Python module invocations with no
+  caller flags or environment, minimal offline variables, isolated process
+  groups, 30-second Ruff and 120-second pytest timeouts, and independent
+  100 KiB stdout/stderr limits.
+- Non-zero Ruff and pytest exits are returned to the model for diagnosis.
+
+### Validation
+
+- The complete automated suite passed with 557 tests.
+- Ruff formatting, Ruff linting, and Git whitespace checks passed after every
+  tracked stage.
+- A real localhost `gpt-oss:20b` session created only through
+  `create_agent_session()` read the source and test, requested one approved
+  patch, formatted the source, ran Ruff, ran pytest, inspected the final Git
+  diff, and returned `CODING-842`, `ruff: passed`, and `pytest: passed`.
+- Only `demo/math_ops.py` changed in the temporary Git workspace; external
+  content, tests, project configuration, `.git`, Git history, and the
+  production repository remained unchanged.
+- No external content was exposed and no unapproved action executed.
+- Direct smokes confirmed absent/denied approval blocks patches and processes,
+  multiple actions are rejected before execution, session retry remains
+  possible, unsafe patch targets are rejected, option-like targets cannot
+  inject flags, the environment is minimal, output is bounded, and timeouts
+  terminate safely.
+
+### Current Limitations
+
+- Execution is synchronous.
+- Writes are one file per invocation and cannot delete, rename, create
+  directories, or form multi-file transactions.
+- Only Ruff format/check and pytest are executable; arbitrary commands and
+  caller-controlled flags are unavailable.
+- Approval is interactive and not persisted.
+- Internal tool rounds are not persisted across separate CLI user turns.
+- Worktrees, broader permission profiles, task orchestration, persistence,
+  concurrency, async execution, network tools, and MCP remain future work.
