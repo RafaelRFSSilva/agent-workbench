@@ -186,6 +186,7 @@ class AgentSession:
         *,
         tool_round_observer: ToolRoundObserver | None = None,
         tool_approval_handler: ToolApprovalHandler | None = None,
+        recover_approval_preview_errors: bool = False,
     ) -> ChatResponse:
         """Complete and transactionally commit one conversation turn."""
 
@@ -228,6 +229,7 @@ class AgentSession:
                     self._max_tool_rounds,
                     tool_round_observer=tool_round_observer,
                     tool_approval_handler=tool_approval_handler,
+                    recover_approval_preview_errors=recover_approval_preview_errors,
                 )
         except Exception:
             self._status = SessionStatus.FAILED

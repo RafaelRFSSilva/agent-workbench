@@ -229,3 +229,83 @@ def test_runs_complete_inspect_edit_validate_and_diff_cycle(
 
     assert run_git(repository, "status", "--short").stdout == " M module.py\n"
     assert "return left + right" in run_git(repository, "diff").stdout
+
+
+def test_recovers_from_invalid_validation_preview_and_retries(
+    tmp_path: Path,
+) -> None:
+    """Return an invalid approval preview to the model and accept its retry."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    (repository / "module.py").write_text(
+        "def add(left: int, right: int) -> int:\n    return left + right\n",
+        encoding="utf-8",
+    )
+
+    workspace = Workspace(repository)
+    registry = create_coding_registry(workspace)
+
+    provider = ScriptedProvider(
+        [
+            tool_response(
+                "invalid-pytest",
+                "run_pytest",
+                {"path": "tests/test_module.py"},
+            ),
+            tool_response(
+                "valid-pytest",
+                "run_pytest",
+                {"path": "."},
+            ),
+            ChatResponse(text="Recovered from the invalid path and completed pytest."),
+        ]
+    )
+
+    session = AgentSession(
+        id=SessionId("preview-recovery-test"),
+        provider=provider,
+        tool_registry=registry,
+        max_tool_rounds=2,
+    )
+
+    approval_requests = []
+
+    def approve(request):
+        approval_requests.append(request)
+        return ToolApprovalDecision.APPROVE
+
+    result = run_autonomous_coding_task(
+        session,
+        "Run the project tests.",
+        tool_approval_handler=approve,
+    )
+
+    assert len(approval_requests) == 1
+    assert approval_requests[0].invocation.id == "valid-pytest"
+
+    assert result.tool_round_count == 2
+    assert result.executed_tool_names == (
+        "run_pytest",
+        "run_pytest",
+    )
+    assert result.approved_action_names == ("run_pytest",)
+
+    assert tuple(validation.result_status for validation in result.validation_runs) == (
+        "error",
+        "success",
+    )
+    assert tuple(validation.exit_code for validation in result.validation_runs) == (
+        None,
+        0,
+    )
+
+    invalid_result = provider.requests[1].tool_interactions[0].results[0]
+    assert invalid_result.status == "error"
+    assert invalid_result.error == (
+        "Approval preview failed for run_pytest: "
+        "Workspace path does not exist: tests/test_module.py"
+    )
+
+    valid_result = provider.requests[2].tool_interactions[1].results[0]
+    assert valid_result.status == "success"
+    assert valid_result.output["exit_code"] == 0

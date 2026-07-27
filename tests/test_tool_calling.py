@@ -15,7 +15,12 @@ from agent_workbench.messages import (
 from agent_workbench.structured_outputs import JSONResponseFormat
 from agent_workbench.tool_calling import run_tool_calling_loop
 from agent_workbench.tool_registry import ToolRegistry
-from agent_workbench.tools import ToolDefinition, ToolInvocation, ToolResult
+from agent_workbench.tools import (
+    ToolApprovalDecision,
+    ToolDefinition,
+    ToolInvocation,
+    ToolResult,
+)
 
 
 class FakeProvider:
@@ -640,3 +645,107 @@ def test_does_not_mutate_the_original_request_or_tool_data() -> None:
             3,
         ],
     }
+
+
+def test_approval_preview_failure_remains_fatal_by_default() -> None:
+    """Preserve the existing fatal behavior unless recovery is enabled."""
+
+    registry = ToolRegistry()
+    executions = []
+    approvals = []
+
+    def fail_preview(_arguments):
+        raise CompletionError("invalid target")
+
+    def approve(request):
+        approvals.append(request)
+        return ToolApprovalDecision.APPROVE
+
+    registry.register(
+        create_calculator_definition(),
+        lambda arguments: executions.append(arguments),
+        requires_approval=True,
+        approval_preview=fail_preview,
+    )
+    requested_response = create_tool_response(
+        ToolInvocation(
+            id="invalid-call",
+            tool_name="calculator",
+            arguments={"expression": "2 + 2"},
+        )
+    )
+    provider = FakeProvider([requested_response])
+
+    with pytest.raises(
+        CompletionError,
+        match="Approval preview failed for calculator: invalid target",
+    ):
+        run_tool_calling_loop(
+            provider,
+            ChatRequest(messages=[]),
+            registry,
+            max_tool_rounds=1,
+            tool_approval_handler=approve,
+        )
+
+    assert executions == []
+    assert approvals == []
+
+
+def test_recovers_approval_preview_failure_as_tool_error_when_enabled() -> None:
+    """Return a failed preview to the provider without approval or execution."""
+
+    registry = ToolRegistry()
+    executions = []
+    approvals = []
+    observed_rounds = []
+
+    def fail_preview(_arguments):
+        raise CompletionError("invalid target")
+
+    def approve(request):
+        approvals.append(request)
+        return ToolApprovalDecision.APPROVE
+
+    registry.register(
+        create_calculator_definition(),
+        lambda arguments: executions.append(arguments),
+        requires_approval=True,
+        approval_preview=fail_preview,
+    )
+    requested_response = create_tool_response(
+        ToolInvocation(
+            id="invalid-call",
+            tool_name="calculator",
+            arguments={"expression": "2 + 2"},
+        )
+    )
+    final_response = ChatResponse(text="Recovered.")
+    provider = FakeProvider([requested_response, final_response])
+
+    result = run_tool_calling_loop(
+        provider,
+        ChatRequest(messages=[]),
+        registry,
+        max_tool_rounds=1,
+        tool_round_observer=observed_rounds.append,
+        tool_approval_handler=approve,
+        recover_approval_preview_errors=True,
+    )
+
+    expected_round = ToolInteractionRound(
+        response=requested_response,
+        results=(
+            ToolResult(
+                invocation_id="invalid-call",
+                status="error",
+                error=("Approval preview failed for calculator: invalid target"),
+            ),
+        ),
+    )
+
+    assert result is final_response
+    assert executions == []
+    assert approvals == []
+    assert observed_rounds == [expected_round]
+    assert provider.requests[1].tool_interactions == (expected_round,)
