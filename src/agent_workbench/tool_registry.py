@@ -5,20 +5,33 @@ from dataclasses import dataclass, field
 
 from agent_workbench.errors import ConfigurationError
 from agent_workbench.tools import (
+    JSONValue,
     JSONObject,
+    ToolApprovalRequest,
     ToolDefinition,
     ToolInvocation,
     ToolResult,
 )
 
 type ToolHandler = Callable[[JSONObject], object]
+type ToolApprovalPreview = Callable[[JSONObject], JSONValue]
+
+
+@dataclass(frozen=True, slots=True)
+class _ToolRegistration:
+    """Store one private immutable tool registration."""
+
+    definition: ToolDefinition
+    handler: ToolHandler = field(repr=False)
+    requires_approval: bool
+    approval_preview: ToolApprovalPreview | None = field(repr=False)
 
 
 @dataclass(slots=True)
 class ToolRegistry:
     """Register provider-independent tools and execute their handlers."""
 
-    _registrations: dict[str, tuple[ToolDefinition, ToolHandler]] = field(
+    _registrations: dict[str, _ToolRegistration] = field(
         default_factory=dict,
     )
 
@@ -26,21 +39,55 @@ class ToolRegistry:
     def definitions(self) -> tuple[ToolDefinition, ...]:
         """Return registered tool definitions in registration order."""
 
-        return tuple(definition for definition, _ in self._registrations.values())
+        return tuple(
+            registration.definition for registration in self._registrations.values()
+        )
 
     def register(
         self,
         definition: ToolDefinition,
         handler: ToolHandler,
+        *,
+        requires_approval: bool = False,
+        approval_preview: ToolApprovalPreview | None = None,
     ) -> None:
         """Register a synchronous handler for a tool definition."""
 
         if definition.name in self._registrations:
             raise ConfigurationError(f"Tool '{definition.name}' is already registered.")
 
-        self._registrations[definition.name] = (
-            definition,
-            handler,
+        self._registrations[definition.name] = _ToolRegistration(
+            definition=definition,
+            handler=handler,
+            requires_approval=requires_approval,
+            approval_preview=approval_preview,
+        )
+
+    def requires_approval(self, invocation: ToolInvocation) -> bool:
+        """Return whether a registered invocation requires caller approval."""
+
+        registration = self._registrations.get(invocation.tool_name)
+        return registration is not None and registration.requires_approval
+
+    def create_approval_request(
+        self,
+        invocation: ToolInvocation,
+    ) -> ToolApprovalRequest:
+        """Create a copy-safe approval request for a registered invocation."""
+
+        registration = self._registrations.get(invocation.tool_name)
+
+        if registration is None:
+            raise ConfigurationError(f"Unknown tool '{invocation.tool_name}'.")
+
+        preview = (
+            registration.approval_preview(invocation.arguments)
+            if registration.approval_preview is not None
+            else None
+        )
+        return ToolApprovalRequest(
+            invocation=invocation,
+            preview=preview,
         )
 
     def execute(self, invocation: ToolInvocation) -> ToolResult:
@@ -55,10 +102,8 @@ class ToolRegistry:
                 error=f"Unknown tool '{invocation.tool_name}'.",
             )
 
-        _, handler = registration
-
         try:
-            output = handler(invocation.arguments)
+            output = registration.handler(invocation.arguments)
 
             return ToolResult(
                 invocation_id=invocation.id,
