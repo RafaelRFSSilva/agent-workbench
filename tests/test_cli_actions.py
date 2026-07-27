@@ -489,3 +489,395 @@ def test_main_forwards_action_mode_only_when_enabled(
         agent_profile=None,
         enable_actions=True,
     )
+
+
+def transaction_preview() -> dict[str, object]:
+    """Create one mixed deterministic transaction approval preview."""
+
+    return {
+        "operation_count": 2,
+        "created_count": 1,
+        "updated_count": 1,
+        "total_old_size_bytes": 4,
+        "total_new_size_bytes": 8,
+        "total_changed_lines": 3,
+        "changes": [
+            {
+                "path": "a.py",
+                "operation": "create",
+                "old_size_bytes": 0,
+                "new_size_bytes": 4,
+                "changed_lines": 1,
+                "diff": "--- /dev/null\n+++ b/a.py\n+new\n",
+            },
+            {
+                "path": "z.py",
+                "operation": "update",
+                "old_size_bytes": 4,
+                "new_size_bytes": 4,
+                "changed_lines": 2,
+                "diff": "--- a/z.py\n+++ b/z.py\n-old\n+new\n",
+            },
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    ("answer", "expected"),
+    [
+        ("y", ToolApprovalDecision.APPROVE),
+        ("YES", ToolApprovalDecision.APPROVE),
+        ("", ToolApprovalDecision.DENY),
+        ("approve", ToolApprovalDecision.DENY),
+    ],
+)
+def test_transaction_approval_renders_complete_plan_and_limits_once(
+    monkeypatch,
+    capsys,
+    answer,
+    expected,
+) -> None:
+    """Show every diff and the precise rollback boundary before one prompt."""
+
+    prompts: list[str] = []
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda prompt: prompts.append(prompt) or answer,
+    )
+
+    decision = _prompt_for_tool_approval(
+        approval_request(
+            "apply_workspace_changes",
+            transaction_preview(),
+        )
+    )
+
+    output = capsys.readouterr().out
+    assert decision is expected
+    assert prompts == ["Approve action? [y/N]: "]
+    assert "Transactional workspace change" in output
+    assert "Files: 2" in output
+    assert "Created: 1" in output
+    assert "Updated: 1" in output
+    assert "Total changed lines: 3" in output
+    assert output.index("a.py") < output.index("z.py")
+    assert "--- /dev/null" in output
+    assert "--- a/z.py" in output
+    assert "exact listed transaction only" in output
+    assert "handled in-process failures" in output
+    assert "power loss" in output
+    assert "abrupt process termination" in output
+    assert "filesystem failure" in output
+    assert "rollback failure" in output
+
+
+def test_transaction_trace_redacts_all_contents_and_diffs(capsys) -> None:
+    """Expose only safe path, count, flag, and bounded result metadata."""
+
+    invocation = ToolInvocation(
+        id="transaction",
+        tool_name="apply_workspace_changes",
+        arguments={
+            "changes": [
+                {
+                    "path": "a.py",
+                    "expected_content": "SECRET-OLD",
+                    "replacement_content": "SECRET-NEW",
+                    "create_if_missing": False,
+                },
+                {
+                    "path": "/absolute/b.py",
+                    "expected_content": "",
+                    "replacement_content": "SECOND-SECRET",
+                    "create_if_missing": True,
+                },
+            ]
+        },
+    )
+    round_ = ToolInteractionRound(
+        response=ChatResponse(tool_invocations=(invocation,)),
+        results=(
+            ToolResult(
+                invocation_id="transaction",
+                status="success",
+                output={
+                    "operation_count": 2,
+                    "created_count": 1,
+                    "updated_count": 1,
+                    "total_old_size_bytes": 10,
+                    "total_new_size_bytes": 22,
+                    "total_changed_lines": 3,
+                    "changes": [
+                        {
+                            "path": "a.py",
+                            "operation": "update",
+                            "old_size_bytes": 10,
+                            "new_size_bytes": 10,
+                            "changed_lines": 2,
+                        }
+                    ],
+                },
+            ),
+        ),
+    )
+
+    _display_tool_round(round_)
+
+    output = capsys.readouterr().out
+    assert "SECRET-OLD" not in output
+    assert "SECRET-NEW" not in output
+    assert "SECOND-SECRET" not in output
+    assert '"operation_count":2' in output
+    assert '"path":"a.py"' in output
+    assert '"expected_content_bytes":10' in output
+    assert '"replacement_content_bytes":10' in output
+    assert "[redacted absolute path]" in output
+    assert '"created_count":1' in output
+    assert "diff" not in output.lower()
+
+
+def test_cli_approved_transaction_reaches_final_response(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    """Apply one approved mixed transaction through AgentSession and the CLI."""
+
+    target = tmp_path / "z.py"
+    target.write_text("old\n", encoding="utf-8")
+    provider = FakeProvider(
+        [
+            ChatResponse(
+                tool_invocations=(
+                    ToolInvocation(
+                        id="transaction",
+                        tool_name="apply_workspace_changes",
+                        arguments={
+                            "changes": [
+                                {
+                                    "path": "z.py",
+                                    "expected_content": "old\n",
+                                    "replacement_content": "new\n",
+                                },
+                                {
+                                    "path": "a.py",
+                                    "expected_content": "",
+                                    "replacement_content": "new\n",
+                                    "create_if_missing": True,
+                                },
+                            ]
+                        },
+                    ),
+                )
+            ),
+            ChatResponse(text="Transaction complete."),
+        ]
+    )
+    session = AgentSession(
+        id=SessionId("transaction"),
+        provider=provider,
+        tool_registry=action_registry(Workspace(tmp_path)),
+    )
+    inputs = iter(["Change both.", "yes", "/exit"])
+    monkeypatch.setattr("builtins.input", lambda _: next(inputs))
+
+    run_cli(
+        session,
+        enable_actions=True,
+        show_tool_traces=True,
+    )
+
+    output = capsys.readouterr().out
+    assert output.count("Approve action?") == 0
+    assert "Transaction complete." in output
+    assert target.read_text(encoding="utf-8") == "new\n"
+    assert (tmp_path / "a.py").read_text(encoding="utf-8") == "new\n"
+    assert session.messages == (
+        {"role": "user", "content": "Change both."},
+        {"role": "assistant", "content": "Transaction complete."},
+    )
+    result = provider.requests[1].tool_interactions[0].results[0]
+    assert result.status == "success"
+    assert result.output["operation_count"] == 2
+
+
+def test_cli_transaction_denial_writes_nothing_and_later_turn_succeeds(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    """Keep denied transaction turns out of history and continue safely."""
+
+    target = tmp_path / "module.py"
+    target.write_text("old\n", encoding="utf-8")
+    provider = FakeProvider(
+        [
+            ChatResponse(
+                tool_invocations=(
+                    ToolInvocation(
+                        id="transaction",
+                        tool_name="apply_workspace_changes",
+                        arguments={
+                            "changes": [
+                                {
+                                    "path": "module.py",
+                                    "expected_content": "old\n",
+                                    "replacement_content": "new\n",
+                                }
+                            ]
+                        },
+                    ),
+                )
+            ),
+            ChatResponse(text="Recovered."),
+        ]
+    )
+    session = AgentSession(
+        id=SessionId("transaction-denial"),
+        provider=provider,
+        tool_registry=action_registry(Workspace(tmp_path)),
+    )
+    inputs = iter(["Change.", "", "Continue.", "/exit"])
+    monkeypatch.setattr("builtins.input", lambda _: next(inputs))
+
+    run_cli(session, enable_actions=True)
+
+    output = capsys.readouterr().out
+    assert "approval was denied" in output
+    assert "Assistant: Recovered." in output
+    assert target.read_text(encoding="utf-8") == "old\n"
+    assert provider.requests[1].messages == [{"role": "user", "content": "Continue."}]
+
+
+def test_cli_stale_transaction_error_is_safe_and_rolls_back_turn(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    """Render a stale transaction without traceback or failed-turn history."""
+
+    target = tmp_path / "module.py"
+    target.write_text("old\n", encoding="utf-8")
+    provider = FakeProvider(
+        [
+            ChatResponse(
+                tool_invocations=(
+                    ToolInvocation(
+                        id="transaction",
+                        tool_name="apply_workspace_changes",
+                        arguments={
+                            "changes": [
+                                {
+                                    "path": "module.py",
+                                    "expected_content": "old\n",
+                                    "replacement_content": "new\n",
+                                }
+                            ]
+                        },
+                    ),
+                )
+            ),
+            ChatResponse(text="Recovered."),
+        ]
+    )
+    session = AgentSession(
+        id=SessionId("transaction-stale"),
+        provider=provider,
+        tool_registry=action_registry(Workspace(tmp_path)),
+    )
+
+    def approve_after_change(request):
+        target.write_text("concurrent\n", encoding="utf-8")
+        return ToolApprovalDecision.APPROVE
+
+    monkeypatch.setattr(
+        "agent_workbench.cli._prompt_for_tool_approval",
+        approve_after_change,
+    )
+    inputs = iter(["Change.", "Continue.", "/exit"])
+    monkeypatch.setattr("builtins.input", lambda _: next(inputs))
+
+    run_cli(session, enable_actions=True)
+
+    output = capsys.readouterr().out
+    assert "transaction is stale" in output
+    assert "Traceback" not in output
+    assert str(tmp_path) not in output
+    assert "Assistant: Recovered." in output
+    assert target.read_text(encoding="utf-8") == "concurrent\n"
+    assert provider.requests[1].messages == [{"role": "user", "content": "Continue."}]
+
+
+def test_cli_incomplete_rollback_warns_with_relative_paths(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    """Tell the operator to inspect safe affected paths after rollback failure."""
+
+    first = tmp_path / "a.py"
+    second = tmp_path / "b.py"
+    first.write_text("one\n", encoding="utf-8")
+    second.write_text("two\n", encoding="utf-8")
+    provider = FakeProvider(
+        [
+            ChatResponse(
+                tool_invocations=(
+                    ToolInvocation(
+                        id="transaction",
+                        tool_name="apply_workspace_changes",
+                        arguments={
+                            "changes": [
+                                {
+                                    "path": "a.py",
+                                    "expected_content": "one\n",
+                                    "replacement_content": "ONE\n",
+                                },
+                                {
+                                    "path": "b.py",
+                                    "expected_content": "two\n",
+                                    "replacement_content": "TWO\n",
+                                },
+                            ]
+                        },
+                    ),
+                )
+            ),
+            ChatResponse(text="Inspecting manually."),
+        ]
+    )
+    session = AgentSession(
+        id=SessionId("transaction-rollback"),
+        provider=provider,
+        tool_registry=action_registry(Workspace(tmp_path)),
+    )
+    from agent_workbench import workspace_actions
+
+    original_commit = workspace_actions._commit_prepared_change
+    commits = 0
+
+    def fail_second(change):
+        nonlocal commits
+        commits += 1
+        if commits == 2:
+            raise OSError("injected")
+        original_commit(change)
+
+    monkeypatch.setattr(workspace_actions, "_commit_prepared_change", fail_second)
+    monkeypatch.setattr(
+        workspace_actions,
+        "_rollback_applied_change",
+        lambda change: (_ for _ in ()).throw(OSError("rollback injected")),
+    )
+    inputs = iter(["Change.", "y", "Continue.", "/exit"])
+    monkeypatch.setattr("builtins.input", lambda _: next(inputs))
+
+    run_cli(session, enable_actions=True)
+
+    output = capsys.readouterr().out
+    assert "rollback was incomplete" in output
+    assert "inspect these paths manually: a.py" in output
+    assert str(tmp_path) not in output
+    assert "Traceback" not in output
+    assert "Assistant: Inspecting manually." in output
+    assert provider.requests[1].messages == [{"role": "user", "content": "Continue."}]
