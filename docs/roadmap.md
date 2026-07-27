@@ -241,7 +241,10 @@ AgentSession
   boundary.
 - [x] Add deterministic factory tests for providers, configuration, tool
   ordering, failure isolation, and workspace safety.
-- [ ] Represent tasks and task assignment.
+- [x] Add immutable provider-independent task specifications with exact
+  objectives and ordered acceptance criteria.
+- [x] Attach optional read-only task metadata to `AgentSession`.
+- [ ] Add task assignment, lifecycle, dependencies, and handoff semantics.
 - [ ] Add cancellation and later completion lifecycle semantics.
 - [ ] Add persistence, serialization, and multiple-session coordination.
 
@@ -308,7 +311,10 @@ User Approval
 
 ### Planned Work
 
-- [ ] Define tasks, dependencies, and acceptance criteria.
+- [x] Define bounded immutable task specifications with objectives and
+  acceptance criteria.
+- [ ] Define task identifiers, dependencies, lifecycle, assignment, and
+  handoff semantics.
 - [ ] Add structured agent handoffs.
 - [ ] Allow manual task assignment.
 - [ ] Allow a Planner to propose tasks.
@@ -578,30 +584,35 @@ Security must be implemented throughout the roadmap.
 
 ## Immediate Next Milestone
 
+The provider-independent task-specification foundation is complete.
+
+The current implementation provides immutable validated objectives and ordered
+acceptance criteria together with optional read-only `AgentSession` task
+metadata. It deliberately does not add automatic planning, task assignment,
+prompt injection, lifecycle state, persistence, or orchestration.
+
 The next implementation milestone is:
 
-> Provider-independent task specifications for bounded supervised work.
+> Crash-safe transaction and worktree lifecycle recovery.
 
-The completed boundary can create one approved local branch/worktree, run one
-isolated session, review and commit its exact eligible diff, remove the clean
-worktree separately, and preserve the local branch and commit. The next work
-should describe small acceptance-testable tasks without introducing
-orchestration, automatic push, unrestricted Git, or implicit destructive
-cleanup.
+Current handled failures preserve ambiguous state for deliberate manual
+inspection. The next reliability work should improve recovery evidence and
+restart behavior without introducing automatic reset, restore, clean, stash,
+forced removal, branch deletion, or other destructive recovery.
 
 ## Near-Term Sequence
 
-1. Add provider-independent immutable task specifications and session task
-   metadata.
-2. Add crash-safe transaction and worktree lifecycle recovery.
-3. Add deletion/rename transactions and conflict handling.
-4. Build local project retrieval and project configuration.
-5. Add multi-agent foundations, then terminal and VS Code experiences.
+1. Add crash-safe transaction and worktree lifecycle recovery.
+2. Add deletion and rename transactions with explicit conflict handling.
+3. Build local project retrieval and project configuration.
+4. Add task lifecycle, assignment, dependencies, and multi-agent foundations.
+5. Build terminal and VS Code experiences.
 
 ## Related Documentation
 
 - [Product Vision](product-vision.md)
 - [Architecture](architecture.md)
+- [Task Specifications](task-specifications.md)
 - [Getting Started](getting-started.md)
 - [Runtime Configuration](runtime-configuration.md)
 - [Agent Profiles](agent-profiles.md)
