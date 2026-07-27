@@ -33,6 +33,8 @@ Implemented capabilities:
   conversation ownership, and synchronous direct or tool-enabled sends.
 - Reusable `AgentSession` construction from resolved runtime configuration,
   including providers and deterministic optional tool registries.
+- Supervised local Git worktree isolation with separately approved creation
+  and clean-only removal.
 - Automated tests, Ruff checks, and GitHub Actions.
 
 Arbitrary shell and network tools, RAG, MCP, asynchronous execution,
@@ -556,6 +558,40 @@ summarize the result. Do not commit or push.
 See [Architecture](docs/architecture.md) for the shared tool models and
 provider translations.
 
+## Run in an Isolated Git Worktree
+
+Keep a clean primary repository untouched while the agent works on a new local
+branch in a sibling worktree:
+
+```bash
+uv run agent-workbench \
+  --provider ollama \
+  --model gpt-oss:20b \
+  --agent developer \
+  --workspace . \
+  --worktree-path ../agent-workbench-task \
+  --worktree-branch agent/task \
+  --enable-actions \
+  --show-tool-traces
+```
+
+`--worktree-path` and `--worktree-branch` must be supplied together and require
+`--workspace`, which must identify the clean primary non-bare repository root.
+Agent Workbench validates and pins its current HEAD, branch name, absent target,
+registered worktrees, and checkout-sensitive local Git configuration before
+showing an exact creation preview. Only `y` or `yes` approves the fixed local
+worktree command.
+
+The isolated `AgentSession` receives workspace tools for the new worktree only.
+Source-relative context files are reloaded from the corresponding isolated
+paths. A dirty worktree is preserved for manual inspection after the session.
+A clean worktree can be removed only through a second default-deny approval;
+the local branch remains.
+
+This workflow never commits, merges, pushes, deletes a branch, resets, cleans,
+stashes, or force-removes a worktree. Partial, dirty, unexpected, and ambiguous
+states are preserved for manual recovery.
+
 ## Configuration Precedence
 
 ```text
@@ -632,8 +668,10 @@ Current protections include:
 
 Controlled workspace execution uses explicit authorization, canonical path
 containment, exact-invocation confirmation, fixed commands, timeouts, output
-limits, and visible previews. Broader repository and MCP trust remain future
-work.
+limits, and visible previews. Supervised worktree creation additionally
+requires a clean primary repository, pinned HEAD, safe branch and target,
+separate lifecycle approvals, and conservative recovery. Broader repository
+and MCP trust remain future work.
 
 ## Current Limitations
 
@@ -650,7 +688,7 @@ Agent Workbench does not yet provide:
 - Multiple simultaneous agents.
 - Multi-agent orchestration.
 - MCP integration.
-- Git worktree management.
+- Concurrent worktree management, automatic commits, merge, or push.
 - A navigable terminal workspace.
 - A VS Code extension.
 - Voice prompt input.

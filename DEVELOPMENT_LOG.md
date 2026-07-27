@@ -1,5 +1,112 @@
 # Development Log
 
+## 2026-07-27 — Supervised Git Worktree Isolation
+
+### Implemented
+
+- Added immutable validated `WorktreePlan` creation in commit `6919568`.
+- Added separately approved fixed-command worktree creation, inspection, and
+  clean-only removal with verified `WorktreeHandle` state in commit `b9c318d`.
+- Added `create_isolated_agent_session()` with source-relative context remapping
+  and an isolated copied runtime configuration in commit `8261af4`.
+- Added paired `--worktree-path` and `--worktree-branch` CLI integration,
+  default-deny lifecycle prompts, dirty preservation, and optional clean
+  removal in commit `c001cfa`.
+
+### Security and Recovery Decisions
+
+- Require the supplied source itself to be a clean top-level primary non-bare
+  repository with an existing pinned HEAD and no in-progress Git operation.
+- Validate new branch names through fixed `check-ref-format`, require local
+  branch absence, and never infer or rewrite a name.
+- Require an absent target with an existing non-symlinked parent; reject source
+  and `.git` containment plus registered, locked, prunable, and ambiguous
+  worktree collisions.
+- Reject repository-local checkout filters, processes, external diff commands,
+  and text conversions that could execute external programs.
+- Isolate system/global Git configuration, disable hooks and fsmonitor, use a
+  minimal credential-free environment, `shell=False`, bounded output, short
+  timeouts, and process-group termination.
+- Revalidate all safety-relevant state after exact one-use approval. Never
+  cache approval or expose worktree lifecycle operations to the model as
+  tools.
+- Preserve dirty, partial, failed, unexpected, and ambiguous state for manual
+  recovery. Never force-remove a worktree or automatically delete its branch.
+
+### Fixed Git Mutation Boundary
+
+Creation is limited to the equivalent fixed token sequence:
+
+```text
+git -C SOURCE \
+  -c core.hooksPath=/dev/null \
+  -c core.fsmonitor=false \
+  worktree add -b BRANCH TARGET PINNED_HEAD
+```
+
+Clean removal is limited to:
+
+```text
+git -C SOURCE \
+  -c core.hooksPath=/dev/null \
+  -c core.fsmonitor=false \
+  worktree remove TARGET
+```
+
+Read-only planning and verification use fixed `rev-parse`, `status`,
+`worktree list`, `check-ref-format`, `show-ref`, `config`, `symbolic-ref`, and
+upstream-inspection forms only. There is no force, prune, branch deletion,
+commit, checkout of the primary tree, merge, rebase, push, fetch, reset, clean,
+stash, arbitrary Git command, caller-controlled flag, or network operation.
+
+### Isolated Session Boundary
+
+- Return `WorktreeHandle` only after verifying target registration, pinned
+  HEAD, requested branch, clean unchanged primary source, local branch
+  existence, and absence of upstream tracking.
+- Revalidate the handle before constructing a session and replace only the
+  copied `RuntimeConfiguration.workspace_root`; every registered workspace
+  capability targets the isolated worktree.
+- Map context files inside the source by relative path and reload them from the
+  isolated worktree in original order. Reject missing mapped or external
+  context.
+- Preserve provider, model, profile, prompt, generation, response format,
+  opt-in tools, controlled actions, traces, and maximum-round behavior.
+
+### WORKTREE-842 Validation
+
+- A real local `gpt-oss:20b` session was created only through
+  `create_isolated_agent_session()` from a worktree pinned to the clean primary
+  HEAD.
+- The model read `demo/math_ops.py`, `demo/labels.py`, and
+  `tests/test_demo.py`; requested one approved two-file transaction; ran Ruff
+  format, Ruff check, and pytest; inspected Git status and diff; and returned
+  the four required `WORKTREE-842`, isolation, Ruff, and pytest markers.
+- Exactly the two source files changed in the isolated worktree. Ruff and
+  pytest exited successfully. The primary tracked bytes, Git status, branch,
+  and HEAD remained unchanged; the external file and secret remained
+  untouched; no commit or upstream was created.
+- Dirty inspection reported two changed entries and rejected removal planning
+  before approval, preserving the worktree and branch.
+- A separate clean worktree was removed after its own exact approval; its
+  registration and directory disappeared, its local branch remained, and the
+  primary repository stayed clean.
+- Direct smokes confirmed creation denial, stale HEAD, dirty source, branch and
+  target collisions, partial-state reporting, session-construction
+  preservation, removal denial, untracked-file rejection, failed-removal
+  preservation, and absence of force or branch deletion.
+- The complete automated suite passes with 728 tests.
+
+### Current Limitations
+
+- Worktree lifecycle operations are synchronous and local.
+- There is no automatic commit, merge, push, branch deletion, reset, clean,
+  stash, forced removal, crash-safe lifecycle journal, concurrent worktree
+  coordination, orchestration, persistence, network tool, or MCP integration.
+- Successful local Git commands cannot guarantee recovery after power loss,
+  abrupt process termination, filesystem failure, or other external
+  interruption; uncertain state requires manual inspection.
+
 ## 2026-07-27 — Approved Atomic Workspace Changes
 
 ### Implemented
