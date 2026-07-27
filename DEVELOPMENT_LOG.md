@@ -1,5 +1,81 @@
 # Development Log
 
+## 2026-07-27 — Approved Atomic Workspace Changes
+
+### Implemented
+
+- Added deterministic multi-file planning, complete combined approval
+  previews, execution preparation, commit, and reverse-order rollback in
+  commit `cc41632`.
+- Registered `apply_workspace_changes` after `apply_file_patch` and integrated
+  transaction previews, safe completion errors, trace redaction, and CLI
+  warnings in commit `9cb4e47`.
+- Improved the model-facing tool description and transaction-specific nested
+  validation errors without weakening the closed schema in commit `bfde0e9`.
+- Preserved single-file action behavior, provider-independent definitions,
+  exact one-use approval, and the fixed Ruff and pytest execution boundary.
+
+### Schema and Limits
+
+- Accept one closed top-level object containing only `changes`; each array
+  element is a closed object requiring `path`, `expected_content`, and
+  `replacement_content`, with optional boolean `create_if_missing`.
+- Validate and sort the internal plan by canonical relative path, reject
+  duplicate canonical targets, and leave caller-supplied arguments and content
+  unmodified.
+- Retain per-file limits of 100 KiB for existing, expected, and replacement
+  content and 500 changed lines.
+- Limit one transaction to 16 files, 512 KiB each of combined expected and
+  replacement content, 2,000 changed lines, and a complete 256 KiB combined
+  approval preview.
+
+### Transaction and Recovery Boundary
+
+- Preflight every target and complete diff before approval, prepare every
+  replacement and rollback artifact without changing targets, revalidate the
+  complete plan after approval, then commit changes in sorted order.
+- On a handled in-process commit failure, roll back applied changes in reverse
+  order by restoring updates and removing transaction-created files.
+- The guarantee applies only when rollback succeeds. It does not promise global
+  filesystem atomicity or recovery from power loss, `SIGKILL`, abrupt process
+  or operating-system termination, filesystem or disk failure, or rollback
+  failure.
+- An incomplete rollback reports only the relative paths requiring manual
+  inspection. Preparation and stale-plan failures write nothing, and temporary
+  transaction artifacts are cleaned after handled outcomes.
+
+### Validation
+
+- Focused recovery tests first failed in 7 cases because transaction nested
+  validation reused the single-file error and the description did not list the
+  required change fields; the focused suite passed with 81 tests after the
+  minimal correction.
+- The complete automated suite passed with 610 tests before documentation.
+- Direct fault-injection smokes confirmed stale plans write nothing; complete
+  rollback restores updates, removes creations, leaves later targets
+  untouched, and cleans temporaries; incomplete rollback reports safe relative
+  paths for manual inspection.
+- A real factory-created localhost `gpt-oss:20b` session completed on its first
+  attempt. It read `demo/math_ops.py`, `demo/labels.py`, and
+  `tests/test_demo.py`; requested exactly one approved transaction changing
+  only the two source files; ran Ruff format, Ruff check, and pytest; inspected
+  Git status and diff; and returned:
+
+  ```text
+  ATOMIC-842
+  transaction: passed
+  ruff: passed
+  pytest: passed
+  ```
+
+### Current Limitations
+
+- Transactions cannot delete, rename, create directories, change modes, or
+  accept arbitrary commands.
+- Rollback is synchronous and in-process; crash-safe journaling, cross-device
+  atomicity, cancellation, worktree isolation, persistence, concurrency,
+  asynchronous execution, network tools, and MCP remain future work.
+
 ## 2026-07-27 — AgentSession Runtime Factory
 
 ### Implemented

@@ -818,9 +818,10 @@ The CLI keeps tools opt-in. `--enable-tools` registers the safe synchronous
 calculator, while `--workspace PATH` authorizes the read-only `list_files`,
 `read_file`, `search_text`, `search_symbols`, `inspect_git_status`, and
 `inspect_git_diff` tools for one root. `--enable-actions` requires that
-workspace and appends `apply_file_patch`, `run_ruff_format`, `run_ruff_check`,
-and `run_pytest`. The calculator, when enabled, remains first. Without a tool
-option or workspace, no registry is created.
+workspace and appends `apply_file_patch`, `apply_workspace_changes`,
+`run_ruff_format`, `run_ruff_check`, and `run_pytest`. The calculator, when
+enabled, remains first. Without a tool option or workspace, no registry is
+created.
 `--show-tool-traces` adds an optional callback for completed provider-independent
 rounds; traces are compact JSON, redacted, and excluded from normal CLI history.
 Internal tool rounds remain inside a single loop and are not persisted in normal
@@ -883,6 +884,58 @@ metadata. Execution validates again after approval; existing files use a
 same-directory temporary file and atomic replacement with portable permission
 preservation, while new files use exclusive creation.
 
+`apply_workspace_changes` adds an immutable multi-file plan without weakening
+that per-file boundary. Its provider-independent schema is one closed object
+containing a `changes` array. Each closed change object requires `path`,
+`expected_content`, and `replacement_content`, with optional
+`create_if_missing`. No alternate nested patch shape or automatic argument
+repair is accepted.
+
+```text
+request
+  ↓
+preflight every target and complete diff
+  ↓
+canonical-path duplicate rejection and relative-path sorting
+  ↓
+one complete combined approval preview
+  ↓
+prepare replacement and rollback material for every change
+  ↓
+post-approval full-plan revalidation
+  ↓
+commit in sorted order
+  ↓ handled in-process failure
+rollback applied changes in reverse order
+```
+
+Both the original request order and supplied content remain unmodified; only
+the internal plan is sorted by canonical relative path for deterministic
+preview, commit, result metadata, and rollback. Duplicate canonical targets
+are rejected even when written with different relative spellings. Preflight
+and post-approval revalidation cover every target, complete expected content,
+operation, diff, and limit so a stale plan writes nothing.
+
+The existing, expected, and replacement content for each file is limited to
+100 KiB, with at most 500 added and removed lines. A transaction contains
+1–16 files and allows at most 512 KiB of combined expected content, 512 KiB
+of combined replacement content, 2,000 changed lines, and 256 KiB for the
+complete JSON approval preview containing every diff.
+
+The preparation phase writes same-directory replacement files and update
+backups without changing targets. The commit phase atomically replaces updates
+or exclusively creates missing targets one at a time. If a handled commit
+failure occurs, rollback restores applied updates and removes applied
+creations in reverse order, then temporary artifacts are cleaned.
+
+This is transaction-like recovery for handled in-process failures, not global
+filesystem atomicity. The guarantee holds only when rollback itself succeeds;
+it does not cover power loss, `SIGKILL`, abrupt process or operating-system
+termination, filesystem or disk failure, or rollback failure. An incomplete
+rollback raises a safe completion error containing only the relative paths
+that must be inspected manually. The CLI renders the warning without exposing
+absolute host paths or committing the failed conversation turn.
+
 Validation uses the current Python interpreter with fixed Ruff or pytest
 module arguments, `shell=False`, a canonical workspace cwd, minimal offline
 environment, isolated process groups, timeouts, and streaming 100 KiB limits
@@ -896,8 +949,8 @@ while prior successful conversation remains.
 
 Read access, controlled writes, fixed command execution, network access, and
 Git mutation remain separate permissions. Arbitrary commands, deletion,
-rename, multi-file transactions, and network/MCP capabilities remain future
-work.
+rename, crash-safe journaling, worktree isolation, and network/MCP capabilities
+remain future work.
 
 ## Agent Session Boundary
 

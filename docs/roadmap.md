@@ -176,16 +176,24 @@ requiring every file to be attached manually.
 - [x] Add fixed command allowlists.
 - [x] Add timeouts and bounded output.
 - [x] Add initial destructive-action protection.
+- [x] Add approved deterministic multi-file write transactions.
+- [x] Add complete combined previews and post-approval full-plan revalidation.
+- [x] Add handled-failure reverse-order rollback with explicit incomplete
+  rollback reporting.
 - [ ] Add command cancellation UI.
 - [ ] Add file deletion and rename.
-- [ ] Add multi-file write transactions.
+- [ ] Add crash-safe transaction journaling and recovery.
+- [ ] Add Git worktree isolation.
 - [ ] Add broader permission profiles.
 
-The available controlled workflow is inspect → patch one file → format → lint
-→ test → inspect diff → report. Each effectful invocation requires informed
-one-use approval. It does not provide arbitrary commands, deletion, rename,
-multi-file transactions, cancellation UI, worktree isolation, persistence,
-concurrency, automatic planning, or orchestration.
+The available controlled workflow is inspect → patch one file or apply one
+approved multi-file transaction → format → lint → test → inspect diff →
+report. Each effectful invocation requires informed one-use approval.
+Multi-file rollback covers handled in-process failures only when rollback
+succeeds; it is not crash-safe or globally filesystem-atomic. The workflow
+does not provide arbitrary commands, deletion, rename, cancellation UI,
+worktree isolation, persistence, concurrency, automatic planning, or
+orchestration.
 
 ## Phase 4 — Agent Sessions
 
