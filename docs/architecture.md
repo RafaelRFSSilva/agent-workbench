@@ -875,25 +875,52 @@ capabilities remain future work.
 
 ## Agent Session Boundary
 
-The current CLI manages one conversation at a time.
-
-A future `AgentSession` should combine:
+`AgentSession` is the provider-independent application boundary for one
+configured synchronous conversation. The CLI creates one session and remains
+responsible for input, output, headers, exit handling, configuration/provider
+construction, workspace registry construction, error rendering, and tool-trace
+formatting.
 
 ```text
 AgentSession
-├── identity
-├── provider configuration
-├── model configuration
-├── conversation
-├── task
-├── workspace scope
-├── tools
-├── permissions
-└── status
+├── SessionId
+├── ChatProvider
+│   ├── provider name
+│   └── provider-derived model name
+├── optional AgentProfile metadata
+├── resolved system prompt
+├── ContextDocument tuple
+├── GenerationConfig
+├── optional JSONResponseFormat
+├── optional ToolRegistry
+├── maximum tool rounds
+├── owned successful Message history
+└── SessionStatus
+    ├── ready
+    ├── completing
+    └── failed
 ```
 
-An agent session should use the current provider-independent request and
-provider layers rather than replacing them.
+`SessionId` is immutable and caller-supplied. Model identity is read from the
+configured provider rather than duplicated. Context, generation, response
+format, and ordered tool definitions are forwarded through the existing
+`ChatRequest` contract on every turn.
+
+The synchronous `send()` operation rejects blank content and re-entrant sends,
+sets the status to `completing`, and selects direct provider completion or the
+existing `run_tool_calling_loop()`. It forwards the maximum-round limit and an
+optional observer without implementing another tool loop.
+
+Conversation updates are transactional. A successful send appends the user
+message and final assistant text exactly once and returns to `ready`; internal
+tool rounds are not persisted in normal conversation history. Provider,
+tool-loop, maximum-round, or observer exceptions leave prior history unchanged,
+set `failed`, and propagate unchanged. A later successful send is allowed and
+returns the session to `ready`.
+
+The first boundary does not add task models, task assignment, multiple
+simultaneous sessions, orchestration, persistence, serialization, concurrency,
+cancellation, asynchronous APIs, RAG, MCP, worktrees, VS Code, or voice input.
 
 ## Orchestration Boundary
 

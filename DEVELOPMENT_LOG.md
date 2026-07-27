@@ -1,5 +1,50 @@
 # Development Log
 
+## 2026-07-27 — Provider-Independent AgentSession Foundation
+
+### Implemented
+
+- Added immutable `SessionId`, `SessionStatus`, and synchronous `AgentSession`
+  in commit `fb99377`.
+- Moved conversation ownership, request construction, direct completion,
+  tool-loop selection, and transactional commit/rollback out of the CLI in
+  commit `7eaf724`.
+- Preserved the existing `run_cli()` signature and all CLI presentation,
+  configuration, provider construction, workspace registration, errors, and
+  trace rendering.
+
+### Architecture Decisions
+
+- Derive provider and model identity from the configured `ChatProvider`.
+- Keep already-loaded profiles, resolved system prompts, immutable context,
+  generation configuration, response format, and optional `ToolRegistry`
+  provider-independent.
+- Commit only the user message and final assistant response after a complete
+  successful send; never persist internal tool rounds in normal history.
+- Roll back the pending turn on direct, tool-loop, maximum-round, or observer
+  failure, preserve the original exception, mark the session failed, and allow
+  a later successful retry.
+- Reject obvious nested sends while completing without introducing locks,
+  threads, asynchronous APIs, or cancellation.
+
+### Validation
+
+- A real localhost `gpt-oss:20b` session returned `SESSION-842`, then
+  `HISTORY-842 SESSION-842` with exact ordered two-turn history.
+- A separate real tool-enabled session invoked calculator exactly once with
+  `(37 * 23) + 9`, observed one successful result of 860, and returned
+  `TOOL-860 and result: 860`.
+- Controlled smoke checks confirmed failure rollback, retry from `failed`,
+  re-entrant-send rejection, no partial commit, and recovery to `ready`.
+- The complete automated suite passed with 446 tests before documentation.
+
+### Current Limitations
+
+- Sessions are synchronous, process-local, and not serializable or persistent.
+- Tasks, assignment, multiple simultaneous sessions, orchestration,
+  concurrency, cancellation, extended lifecycle states, async APIs, RAG, MCP,
+  worktrees, VS Code, and voice input remain future work.
+
 ## 2026-07-27 — Safe Python Symbol Search
 
 ### Implemented

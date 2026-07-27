@@ -208,15 +208,20 @@ AgentSession
 
 ### Planned Work
 
-- [ ] Define session identifiers.
-- [ ] Separate session state from CLI presentation.
-- [ ] Represent tasks and session status.
-- [ ] Attach workspace scope and tools.
-- [ ] Add lifecycle, cancellation, failure, and completion states.
-- [ ] Preserve session conversation state.
-- [ ] Add deterministic session tests.
+- [x] Define immutable validated session identifiers.
+- [x] Separate transactional conversation state from CLI presentation.
+- [x] Add initial ready, completing, and failed session states with retry after
+  failure and re-entrant-send rejection.
+- [x] Attach existing profile/system-prompt, context, generation, structured
+  response, and optional tool-registry configuration.
+- [x] Preserve successful session conversation state while excluding internal
+  tool rounds.
+- [x] Add deterministic session and CLI integration tests.
+- [ ] Represent tasks and task assignment.
+- [ ] Add cancellation and later completion lifecycle semantics.
+- [ ] Add persistence, serialization, and multiple-session coordination.
 
-The existing CLI should become one client of the session layer.
+The existing CLI is now a presentation client of the session layer.
 
 ## Phase 5 — Local Project Retrieval
 
