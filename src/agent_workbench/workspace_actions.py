@@ -1,12 +1,15 @@
 """Approved optimistic single-file actions inside an authorized workspace."""
 
 import difflib
+import json
 import os
+import secrets
 import stat
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 
+from agent_workbench.errors import WorkspaceTransactionError
 from agent_workbench.tool_registry import ToolRegistry
 from agent_workbench.tools import JSONObject, ToolDefinition
 from agent_workbench.workspace import Workspace
@@ -20,6 +23,21 @@ MAX_CHANGED_LINES = 500
 
 MAX_PATCH_PREVIEW_BYTES = 64 * 1024
 """Maximum byte size of the complete approval diff."""
+
+MAX_TRANSACTION_FILES = 16
+"""Maximum number of files in one approved workspace transaction."""
+
+MAX_TRANSACTION_EXPECTED_BYTES = 512 * 1024
+"""Maximum combined expected-content bytes in one transaction."""
+
+MAX_TRANSACTION_REPLACEMENT_BYTES = 512 * 1024
+"""Maximum combined replacement-content bytes in one transaction."""
+
+MAX_TRANSACTION_CHANGED_LINES = 2_000
+"""Maximum combined added and removed lines in one transaction."""
+
+MAX_TRANSACTION_PREVIEW_BYTES = 256 * 1024
+"""Maximum byte size of one complete combined transaction preview."""
 
 APPLY_FILE_PATCH_DEFINITION = ToolDefinition(
     name="apply_file_patch",
@@ -36,6 +54,39 @@ APPLY_FILE_PATCH_DEFINITION = ToolDefinition(
             "create_if_missing": {"type": "boolean", "default": False},
         },
         "required": ["path", "expected_content", "replacement_content"],
+        "additionalProperties": False,
+    },
+)
+
+_CHANGE_SCHEMA: JSONObject = {
+    "type": "object",
+    "properties": {
+        "path": {"type": "string"},
+        "expected_content": {"type": "string"},
+        "replacement_content": {"type": "string"},
+        "create_if_missing": {"type": "boolean", "default": False},
+    },
+    "required": ["path", "expected_content", "replacement_content"],
+    "additionalProperties": False,
+}
+
+APPLY_WORKSPACE_CHANGES_DEFINITION = ToolDefinition(
+    name="apply_workspace_changes",
+    description=(
+        "Apply one approved transactional set of UTF-8 file creations and "
+        "updates inside the authorized workspace."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "changes": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": MAX_TRANSACTION_FILES,
+                "items": _CHANGE_SCHEMA,
+            }
+        },
+        "required": ["changes"],
         "additionalProperties": False,
     },
 )
@@ -68,6 +119,46 @@ class _PreparedPatch:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class _WorkspaceChangePlan:
+    """Store one immutable validated deterministic transaction plan."""
+
+    patches: tuple[_PreparedPatch, ...]
+    created_count: int
+    updated_count: int
+    total_old_size_bytes: int
+    total_new_size_bytes: int
+    total_changed_lines: int
+
+    def metadata(self, *, include_diffs: bool) -> JSONObject:
+        """Return deterministic safe preview or result metadata."""
+
+        changes = []
+        for patch in self.patches:
+            change = patch.metadata()
+            if include_diffs:
+                change["diff"] = patch.diff
+            changes.append(change)
+        return {
+            "operation_count": len(self.patches),
+            "created_count": self.created_count,
+            "updated_count": self.updated_count,
+            "total_old_size_bytes": self.total_old_size_bytes,
+            "total_new_size_bytes": self.total_new_size_bytes,
+            "total_changed_lines": self.total_changed_lines,
+            "changes": changes,
+        }
+
+
+@dataclass(slots=True)
+class _PreparedTransactionChange:
+    """Store prepared replacement and rollback material for one change."""
+
+    patch: _PreparedPatch
+    replacement_path: Path | None = None
+    rollback_path: Path | None = None
+
+
 def register_workspace_action_tools(
     registry: ToolRegistry,
     workspace: Workspace,
@@ -80,6 +171,16 @@ def register_workspace_action_tools(
         requires_approval=True,
         approval_preview=lambda arguments: preview_file_patch(workspace, arguments),
     )
+    registry.register(
+        APPLY_WORKSPACE_CHANGES_DEFINITION,
+        lambda arguments: apply_workspace_changes(workspace, arguments),
+        requires_approval=True,
+        approval_preview=lambda arguments: preview_workspace_changes(
+            workspace,
+            arguments,
+        ),
+        propagates_completion_errors=True,
+    )
 
 
 def preview_file_patch(
@@ -88,7 +189,11 @@ def preview_file_patch(
 ) -> JSONObject:
     """Validate one patch and return its complete deterministic approval preview."""
 
-    patch = _prepare_patch(workspace, arguments)
+    patch = _prepare_patch(
+        workspace,
+        arguments,
+        preview_limit_bytes=MAX_PATCH_PREVIEW_BYTES,
+    )
     return {
         **patch.metadata(),
         "diff": patch.diff,
@@ -101,7 +206,11 @@ def apply_file_patch(
 ) -> JSONObject:
     """Revalidate and atomically apply one optimistic single-file patch."""
 
-    patch = _prepare_patch(workspace, arguments)
+    patch = _prepare_patch(
+        workspace,
+        arguments,
+        preview_limit_bytes=MAX_PATCH_PREVIEW_BYTES,
+    )
 
     if patch.operation == "create":
         _create_file_exclusively(patch)
@@ -111,9 +220,80 @@ def apply_file_patch(
     return patch.metadata()
 
 
+def preview_workspace_changes(
+    workspace: Workspace,
+    arguments: object,
+) -> JSONObject:
+    """Return one complete deterministic transaction approval preview."""
+
+    return _prepare_workspace_change_plan(workspace, arguments).metadata(
+        include_diffs=True,
+    )
+
+
+def apply_workspace_changes(
+    workspace: Workspace,
+    arguments: object,
+) -> JSONObject:
+    """Apply one revalidated transaction with handled-failure rollback."""
+
+    try:
+        plan = _prepare_workspace_change_plan(workspace, arguments)
+    except ValueError:
+        raise WorkspaceTransactionError(
+            "Workspace transaction is stale or invalid; no files were changed."
+        ) from None
+
+    try:
+        prepared = _prepare_transaction_changes(plan)
+    except Exception:
+        raise WorkspaceTransactionError(
+            "Workspace transaction preparation failed; no files were changed."
+        ) from None
+
+    try:
+        try:
+            current_plan = _prepare_workspace_change_plan(workspace, arguments)
+        except ValueError:
+            raise WorkspaceTransactionError(
+                "Workspace transaction is stale; no files were changed."
+            ) from None
+        if current_plan != plan:
+            raise WorkspaceTransactionError(
+                "Workspace transaction is stale; no files were changed."
+            )
+
+        applied: list[_PreparedTransactionChange] = []
+        try:
+            for change in prepared:
+                _commit_prepared_change(change)
+                applied.append(change)
+        except Exception:
+            rollback_failures = _rollback_applied_changes(applied)
+            if rollback_failures:
+                affected = ", ".join(rollback_failures)
+                raise WorkspaceTransactionError(
+                    "Workspace transaction failed and rollback was incomplete; "
+                    f"inspect these paths manually: {affected}."
+                ) from None
+            if applied:
+                raise WorkspaceTransactionError(
+                    "Workspace transaction failed; applied changes were rolled back."
+                ) from None
+            raise WorkspaceTransactionError(
+                "Workspace transaction failed before any files were changed."
+            ) from None
+    finally:
+        _cleanup_prepared_changes(prepared)
+
+    return plan.metadata(include_diffs=False)
+
+
 def _prepare_patch(
     workspace: Workspace,
     arguments: object,
+    *,
+    preview_limit_bytes: int | None,
 ) -> _PreparedPatch:
     """Validate arguments, target state, limits, and the complete diff."""
 
@@ -159,9 +339,12 @@ def _prepare_patch(
         replacement_content,
         operation=operation,
     )
-    if len(diff.encode("utf-8")) > MAX_PATCH_PREVIEW_BYTES:
+    if (
+        preview_limit_bytes is not None
+        and len(diff.encode("utf-8")) > preview_limit_bytes
+    ):
         raise ValueError(
-            f"complete patch preview exceeds the {MAX_PATCH_PREVIEW_BYTES}-byte limit."
+            f"complete patch preview exceeds the {preview_limit_bytes}-byte limit."
         )
 
     return _PreparedPatch(
@@ -176,6 +359,90 @@ def _prepare_patch(
         diff=diff,
         existing_mode=existing_mode,
     )
+
+
+def _prepare_workspace_change_plan(
+    workspace: Workspace,
+    arguments: object,
+) -> _WorkspaceChangePlan:
+    """Validate every requested change and return one sorted immutable plan."""
+
+    changes = _get_workspace_change_arguments(arguments)
+    patches = tuple(
+        sorted(
+            (
+                _prepare_patch(
+                    workspace,
+                    change,
+                    preview_limit_bytes=None,
+                )
+                for change in changes
+            ),
+            key=lambda patch: patch.relative_path,
+        )
+    )
+    normalized_targets = [os.path.normcase(str(patch.target)) for patch in patches]
+    if len(normalized_targets) != len(set(normalized_targets)):
+        raise ValueError("workspace transaction contains duplicate target paths.")
+
+    total_expected_bytes = sum(
+        len(patch.expected_content.encode("utf-8")) for patch in patches
+    )
+    total_replacement_bytes = sum(patch.new_size_bytes for patch in patches)
+    total_changed_lines = sum(patch.changed_lines for patch in patches)
+    if total_expected_bytes > MAX_TRANSACTION_EXPECTED_BYTES:
+        raise ValueError(
+            "workspace transaction exceeds the combined expected-content limit."
+        )
+    if total_replacement_bytes > MAX_TRANSACTION_REPLACEMENT_BYTES:
+        raise ValueError(
+            "workspace transaction exceeds the combined replacement-content limit."
+        )
+    if total_changed_lines > MAX_TRANSACTION_CHANGED_LINES:
+        raise ValueError(
+            "workspace transaction exceeds the combined changed-line limit."
+        )
+
+    plan = _WorkspaceChangePlan(
+        patches=patches,
+        created_count=sum(patch.operation == "create" for patch in patches),
+        updated_count=sum(patch.operation == "update" for patch in patches),
+        total_old_size_bytes=sum(patch.old_size_bytes for patch in patches),
+        total_new_size_bytes=total_replacement_bytes,
+        total_changed_lines=total_changed_lines,
+    )
+    preview_bytes = json.dumps(
+        plan.metadata(include_diffs=True),
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    if len(preview_bytes) > MAX_TRANSACTION_PREVIEW_BYTES:
+        raise ValueError(
+            "complete workspace transaction preview exceeds the "
+            f"{MAX_TRANSACTION_PREVIEW_BYTES}-byte limit."
+        )
+    return plan
+
+
+def _get_workspace_change_arguments(
+    arguments: object,
+) -> tuple[dict[str, object], ...]:
+    """Validate the closed transaction argument container."""
+
+    if not isinstance(arguments, dict) or set(arguments) != {"changes"}:
+        raise ValueError("apply_workspace_changes requires a changes array.")
+    changes = arguments["changes"]
+    if not isinstance(changes, list):
+        raise ValueError("apply_workspace_changes changes must be an array.")
+    if not 1 <= len(changes) <= MAX_TRANSACTION_FILES:
+        raise ValueError(
+            "apply_workspace_changes changes must contain between 1 and "
+            f"{MAX_TRANSACTION_FILES} items."
+        )
+    if not all(isinstance(change, dict) for change in changes):
+        raise ValueError("apply_workspace_changes changes must contain objects.")
+    return tuple(change.copy() for change in changes)
 
 
 def _get_patch_arguments(
@@ -220,7 +487,10 @@ def _encode_patch_content(field_name: str, content: str) -> bytes:
     if "\0" in content:
         raise ValueError(f"apply_file_patch {field_name} must not contain NUL bytes.")
 
-    content_bytes = content.encode("utf-8")
+    try:
+        content_bytes = content.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError("apply_file_patch requires valid UTF-8.") from None
     if len(content_bytes) > MAX_PATCH_CONTENT_BYTES:
         raise ValueError(
             f"apply_file_patch {field_name} exceeds the "
@@ -305,11 +575,31 @@ def _read_existing_file(
             f"workspace file exceeds the {MAX_PATCH_CONTENT_BYTES}-byte limit."
         )
 
+    descriptor: int | None = None
     try:
-        with target.open("rb") as source:
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(target, flags)
+        opened_status = os.fstat(descriptor)
+        if (
+            opened_status.st_dev,
+            opened_status.st_ino,
+        ) != (
+            target_status.st_dev,
+            target_status.st_ino,
+        ):
+            raise ValueError("apply_file_patch target changed while reading.")
+        with os.fdopen(descriptor, "rb") as source:
+            descriptor = None
             content = source.read(MAX_PATCH_CONTENT_BYTES + 1)
+    except ValueError:
+        raise
     except OSError:
         raise ValueError("Unable to read patch target.") from None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
     if len(content) > MAX_PATCH_CONTENT_BYTES:
         raise ValueError(
             f"workspace file exceeds the {MAX_PATCH_CONTENT_BYTES}-byte limit."
@@ -423,6 +713,7 @@ def _replace_file_atomically(
                 "replacement_content": patch.replacement_content,
                 "create_if_missing": False,
             },
+            preview_limit_bytes=MAX_PATCH_PREVIEW_BYTES,
         )
         if current.operation != "update":
             raise ValueError("apply_file_patch target changed before replacement.")
@@ -439,3 +730,129 @@ def _replace_file_atomically(
                 temporary_path.unlink()
             except OSError:
                 pass
+
+
+def _prepare_transaction_changes(
+    plan: _WorkspaceChangePlan,
+) -> list[_PreparedTransactionChange]:
+    """Prepare all update replacement and rollback files before mutation."""
+
+    prepared: list[_PreparedTransactionChange] = []
+    reserved_paths = {patch.target for patch in plan.patches}
+    try:
+        for patch in plan.patches:
+            change = _PreparedTransactionChange(patch=patch)
+            prepared.append(change)
+            if patch.operation == "update":
+                assert patch.existing_mode is not None
+                change.replacement_path = _write_transaction_temp(
+                    patch.target.parent,
+                    patch.replacement_content.encode("utf-8"),
+                    patch.existing_mode,
+                    reserved_paths,
+                )
+                change.rollback_path = _write_transaction_temp(
+                    patch.target.parent,
+                    patch.expected_content.encode("utf-8"),
+                    patch.existing_mode,
+                    reserved_paths,
+                )
+    except Exception:
+        _cleanup_prepared_changes(prepared)
+        raise
+    return prepared
+
+
+def _write_transaction_temp(
+    parent: Path,
+    content: bytes,
+    mode: int,
+    reserved_paths: set[Path],
+) -> Path:
+    """Write one collision-safe same-directory transaction temporary file."""
+
+    while True:
+        candidate = parent / (f".agent-workbench-transaction-{secrets.token_hex(16)}")
+        if candidate not in reserved_paths:
+            break
+
+    descriptor: int | None = None
+    completed = False
+    try:
+        descriptor = os.open(
+            candidate,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        reserved_paths.add(candidate)
+        with os.fdopen(descriptor, "wb") as destination:
+            descriptor = None
+            destination.write(content)
+            destination.flush()
+            os.fsync(destination.fileno())
+        os.chmod(candidate, mode)
+        completed = True
+        return candidate
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if not completed:
+            try:
+                candidate.unlink()
+            except OSError:
+                pass
+
+
+def _commit_prepared_change(change: _PreparedTransactionChange) -> None:
+    """Commit one prepared change in deterministic plan order."""
+
+    if change.patch.operation == "create":
+        _create_file_exclusively(change.patch)
+        return
+    if change.replacement_path is None:
+        raise OSError("transaction replacement was not prepared")
+    os.replace(change.replacement_path, change.patch.target)
+
+
+def _rollback_applied_change(change: _PreparedTransactionChange) -> None:
+    """Restore one applied update or remove one transaction-created file."""
+
+    if change.patch.operation == "create":
+        change.patch.target.unlink()
+        return
+    if change.rollback_path is None:
+        raise OSError("transaction rollback was not prepared")
+    os.replace(change.rollback_path, change.patch.target)
+    if change.patch.existing_mode is not None:
+        os.chmod(change.patch.target, change.patch.existing_mode)
+
+
+def _rollback_applied_changes(
+    applied: list[_PreparedTransactionChange],
+) -> list[str]:
+    """Attempt reverse-order rollback and return safe failed relative paths."""
+
+    failures = []
+    for change in reversed(applied):
+        try:
+            _rollback_applied_change(change)
+        except Exception:
+            failures.append(change.patch.relative_path)
+    return failures
+
+
+def _cleanup_prepared_changes(
+    prepared: list[_PreparedTransactionChange],
+) -> None:
+    """Remove all remaining transaction temporary files."""
+
+    for change in prepared:
+        for temporary_path in (
+            change.replacement_path,
+            change.rollback_path,
+        ):
+            if temporary_path is not None:
+                try:
+                    temporary_path.unlink()
+                except OSError:
+                    pass

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_workbench.errors import CompletionError
+from agent_workbench.errors import CompletionError, WorkspaceTransactionError
 from agent_workbench.messages import ChatRequest, ChatResponse
 from agent_workbench.tool_calling import run_tool_calling_loop
 from agent_workbench.tool_registry import ToolRegistry
@@ -18,10 +18,17 @@ from agent_workbench.tools import (
 from agent_workbench.workspace import Workspace
 from agent_workbench.workspace_actions import (
     APPLY_FILE_PATCH_DEFINITION,
+    APPLY_WORKSPACE_CHANGES_DEFINITION,
     MAX_CHANGED_LINES,
     MAX_PATCH_CONTENT_BYTES,
+    MAX_TRANSACTION_CHANGED_LINES,
+    MAX_TRANSACTION_EXPECTED_BYTES,
+    MAX_TRANSACTION_FILES,
+    MAX_TRANSACTION_REPLACEMENT_BYTES,
     apply_file_patch,
+    apply_workspace_changes,
     preview_file_patch,
+    preview_workspace_changes,
     register_workspace_action_tools,
 )
 
@@ -64,6 +71,14 @@ def patch_arguments(
         "replacement_content": replacement,
         "create_if_missing": create,
     }
+
+
+def transaction_arguments(
+    *changes: dict[str, object],
+) -> dict[str, object]:
+    """Create one transaction argument mapping."""
+
+    return {"changes": list(changes)}
 
 
 def invoke_patch(
@@ -119,7 +134,11 @@ def test_registration_preserves_existing_tools_and_exact_definition(
 
     register_workspace_action_tools(registry, workspace)
 
-    assert registry.definitions == (existing, APPLY_FILE_PATCH_DEFINITION)
+    assert registry.definitions == (
+        existing,
+        APPLY_FILE_PATCH_DEFINITION,
+        APPLY_WORKSPACE_CHANGES_DEFINITION,
+    )
     assert APPLY_FILE_PATCH_DEFINITION.name == "apply_file_patch"
     assert APPLY_FILE_PATCH_DEFINITION.description == (
         "Apply one approved optimistic UTF-8 file patch inside the authorized "
@@ -597,3 +616,846 @@ def test_calls_preserve_cwd_arguments_results_and_registry_isolation(
     assert preview_file_patch(workspace, arguments)["path"] == "module.py"
     assert second.definitions == ()
     assert Path.cwd() == original_cwd
+
+
+def test_transaction_registration_uses_exact_closed_nested_schema(
+    tmp_path: Path,
+) -> None:
+    """Append the transaction after the compatible single-file action."""
+
+    _, workspace = create_workspace(tmp_path)
+    registry = ToolRegistry()
+
+    register_workspace_action_tools(registry, workspace)
+
+    assert registry.definitions == (
+        APPLY_FILE_PATCH_DEFINITION,
+        APPLY_WORKSPACE_CHANGES_DEFINITION,
+    )
+    assert APPLY_WORKSPACE_CHANGES_DEFINITION.name == "apply_workspace_changes"
+    assert APPLY_WORKSPACE_CHANGES_DEFINITION.description == (
+        "Apply one approved transactional set of UTF-8 file creations and "
+        "updates inside the authorized workspace."
+    )
+    assert APPLY_WORKSPACE_CHANGES_DEFINITION.input_schema == {
+        "type": "object",
+        "properties": {
+            "changes": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 16,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "expected_content": {"type": "string"},
+                        "replacement_content": {"type": "string"},
+                        "create_if_missing": {
+                            "type": "boolean",
+                            "default": False,
+                        },
+                    },
+                    "required": [
+                        "path",
+                        "expected_content",
+                        "replacement_content",
+                    ],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "required": ["changes"],
+        "additionalProperties": False,
+    }
+    assert registry.requires_approval(
+        ToolInvocation(
+            id="transaction",
+            tool_name="apply_workspace_changes",
+            arguments=transaction_arguments(
+                patch_arguments(
+                    path="created.py",
+                    expected="",
+                    replacement="new\n",
+                    create=True,
+                )
+            ),
+        )
+    )
+
+
+def test_transaction_preview_is_complete_sorted_and_non_mutating(
+    tmp_path: Path,
+) -> None:
+    """Plan all targets and complete diffs before writing in canonical order."""
+
+    root, workspace = create_workspace(tmp_path)
+    (root / "z.py").write_text("old\n", encoding="utf-8")
+    arguments = transaction_arguments(
+        patch_arguments(
+            path="z.py",
+            expected="old\n",
+            replacement="updated\n",
+        ),
+        patch_arguments(
+            path="./a.py",
+            expected="",
+            replacement="created\n",
+            create=True,
+        ),
+    )
+
+    preview = preview_workspace_changes(workspace, arguments)
+
+    assert preview == {
+        "operation_count": 2,
+        "created_count": 1,
+        "updated_count": 1,
+        "total_old_size_bytes": 4,
+        "total_new_size_bytes": 16,
+        "total_changed_lines": 3,
+        "changes": [
+            {
+                "path": "a.py",
+                "operation": "create",
+                "old_size_bytes": 0,
+                "new_size_bytes": 8,
+                "changed_lines": 1,
+                "diff": "--- /dev/null\n+++ b/a.py\n@@ -0,0 +1 @@\n+created\n",
+            },
+            {
+                "path": "z.py",
+                "operation": "update",
+                "old_size_bytes": 4,
+                "new_size_bytes": 8,
+                "changed_lines": 2,
+                "diff": ("--- a/z.py\n+++ b/z.py\n@@ -1 +1 @@\n-old\n+updated\n"),
+            },
+        ],
+    }
+    assert (root / "z.py").read_text(encoding="utf-8") == "old\n"
+    assert not (root / "a.py").exists()
+    assert str(root) not in str(preview)
+    preview["changes"] = []
+    assert len(preview_workspace_changes(workspace, arguments)["changes"]) == 2
+
+
+def test_transaction_applies_mixed_changes_and_returns_bounded_metadata(
+    tmp_path: Path,
+) -> None:
+    """Commit updates and creations in one deterministic successful result."""
+
+    root, workspace = create_workspace(tmp_path)
+    target = root / "z.py"
+    target.write_text("old\n", encoding="utf-8")
+    target.chmod(0o640)
+    arguments = transaction_arguments(
+        patch_arguments(
+            path="z.py",
+            expected="old\n",
+            replacement="updated\n",
+        ),
+        patch_arguments(
+            path="a.py",
+            expected="",
+            replacement="created\n",
+            create=True,
+        ),
+    )
+
+    result = apply_workspace_changes(workspace, arguments)
+
+    assert result == {
+        "operation_count": 2,
+        "created_count": 1,
+        "updated_count": 1,
+        "total_old_size_bytes": 4,
+        "total_new_size_bytes": 16,
+        "total_changed_lines": 3,
+        "changes": [
+            {
+                "path": "a.py",
+                "operation": "create",
+                "old_size_bytes": 0,
+                "new_size_bytes": 8,
+                "changed_lines": 1,
+            },
+            {
+                "path": "z.py",
+                "operation": "update",
+                "old_size_bytes": 4,
+                "new_size_bytes": 8,
+                "changed_lines": 2,
+            },
+        ],
+    }
+    assert target.read_text(encoding="utf-8") == "updated\n"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o640
+    assert (root / "a.py").read_text(encoding="utf-8") == "created\n"
+    assert list(root.glob(".agent-workbench-transaction-*")) == []
+    result["changes"] = []
+    assert arguments["changes"][0]["replacement_content"] == "updated\n"
+
+
+@pytest.mark.parametrize("create", [False, True])
+def test_transaction_applies_two_updates_or_two_creations(
+    tmp_path: Path,
+    create: bool,
+) -> None:
+    """Support homogeneous multi-file plans as well as mixed transactions."""
+
+    root, workspace = create_workspace(tmp_path)
+    if not create:
+        (root / "a.py").write_text("a\n", encoding="utf-8")
+        (root / "b.py").write_text("b\n", encoding="utf-8")
+    arguments = transaction_arguments(
+        patch_arguments(
+            path="a.py",
+            expected="" if create else "a\n",
+            replacement="A\n",
+            create=create,
+        ),
+        patch_arguments(
+            path="b.py",
+            expected="" if create else "b\n",
+            replacement="B\n",
+            create=create,
+        ),
+    )
+
+    result = apply_workspace_changes(workspace, arguments)
+
+    assert result["created_count"] == (2 if create else 0)
+    assert result["updated_count"] == (0 if create else 2)
+    assert (root / "a.py").read_text(encoding="utf-8") == "A\n"
+    assert (root / "b.py").read_text(encoding="utf-8") == "B\n"
+
+
+def test_transaction_handles_empty_and_no_final_newline_content(
+    tmp_path: Path,
+) -> None:
+    """Preserve complete diff semantics for empty and unterminated files."""
+
+    root, workspace = create_workspace(tmp_path)
+    (root / "empty.py").write_text("", encoding="utf-8")
+    (root / "plain.py").write_text("old", encoding="utf-8")
+    arguments = transaction_arguments(
+        patch_arguments(path="empty.py", expected="", replacement=""),
+        patch_arguments(path="plain.py", expected="old", replacement="new"),
+        patch_arguments(
+            path="created.py",
+            expected="",
+            replacement="",
+            create=True,
+        ),
+    )
+
+    preview = preview_workspace_changes(workspace, arguments)
+    result = apply_workspace_changes(workspace, arguments)
+
+    plain_preview = next(
+        change for change in preview["changes"] if change["path"] == "plain.py"
+    )
+    assert plain_preview["diff"].count("\\ No newline at end of file") == 2
+    assert result["operation_count"] == 3
+    assert (root / "empty.py").read_text(encoding="utf-8") == ""
+    assert (root / "created.py").read_text(encoding="utf-8") == ""
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {},
+        {"changes": [], "extra": True},
+        {"changes": {}},
+        {"changes": []},
+        {"changes": [patch_arguments(), patch_arguments()]},
+        {"changes": [{"path": "module.py"}]},
+        {
+            "changes": [
+                {
+                    **patch_arguments(),
+                    "unexpected": True,
+                }
+            ]
+        },
+        {
+            "changes": [
+                patch_arguments(create="yes"),  # type: ignore[arg-type]
+            ]
+        },
+        {
+            "changes": [
+                patch_arguments(path="module.py"),
+                patch_arguments(path="./module.py"),
+            ]
+        },
+        {
+            "changes": [
+                patch_arguments(path=""),
+            ]
+        },
+    ],
+)
+def test_transaction_rejects_invalid_structure_and_duplicate_targets(
+    tmp_path: Path,
+    arguments: object,
+) -> None:
+    """Reject malformed closed input and duplicate canonical paths."""
+
+    root, workspace = create_workspace(tmp_path)
+    (root / "module.py").write_text("value = 1\n", encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        preview_workspace_changes(workspace, arguments)
+
+    assert (root / "module.py").read_text(encoding="utf-8") == "value = 1\n"
+
+
+def test_transaction_rejects_too_many_changes(tmp_path: Path) -> None:
+    """Bound the number of targets before planning."""
+
+    _, workspace = create_workspace(tmp_path)
+    changes = [
+        patch_arguments(
+            path=f"{index}.py",
+            expected="",
+            replacement="",
+            create=True,
+        )
+        for index in range(MAX_TRANSACTION_FILES + 1)
+    ]
+
+    with pytest.raises(ValueError, match="changes"):
+        preview_workspace_changes(workspace, transaction_arguments(*changes))
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/tmp/outside.py",
+        "../outside.py",
+        "nested/../../outside.py",
+        "../workspace-backup/outside.py",
+        ".git/config",
+        "nested/.git/config",
+        "missing/file.py",
+    ],
+)
+def test_transaction_applies_single_file_path_protections(
+    tmp_path: Path,
+    path: str,
+) -> None:
+    """Apply the strict existing write boundary independently to every target."""
+
+    root, workspace = create_workspace(tmp_path)
+    outside = tmp_path / "outside.py"
+    outside.write_text("outside\n", encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        preview_workspace_changes(
+            workspace,
+            transaction_arguments(
+                patch_arguments(
+                    path=path,
+                    expected="",
+                    replacement="bad\n",
+                    create=True,
+                )
+            ),
+        )
+
+    assert outside.read_text(encoding="utf-8") == "outside\n"
+    assert list(root.iterdir()) == []
+
+
+def test_transaction_rejects_symlinks_directories_special_files_and_binary(
+    tmp_path: Path,
+) -> None:
+    """Never follow a target or parent symlink or accept non-text files."""
+
+    root, workspace = create_workspace(tmp_path)
+    outside = tmp_path / "outside.py"
+    outside.write_text("outside\n", encoding="utf-8")
+    (root / "external.py").symlink_to(outside)
+    (root / "broken.py").symlink_to(root / "missing.py")
+    directory = root / "directory"
+    directory.mkdir()
+    (root / "linked").symlink_to(directory, target_is_directory=True)
+    (root / "binary.py").write_bytes(b"\xff")
+    os.mkfifo(root / "pipe")
+
+    for path in (
+        "external.py",
+        "broken.py",
+        "directory",
+        "linked/new.py",
+        "binary.py",
+        "pipe",
+    ):
+        with pytest.raises(ValueError):
+            preview_workspace_changes(
+                workspace,
+                transaction_arguments(
+                    patch_arguments(
+                        path=path,
+                        expected="",
+                        replacement="bad\n",
+                        create=path == "linked/new.py",
+                    )
+                ),
+            )
+
+    assert outside.read_text(encoding="utf-8") == "outside\n"
+
+
+def test_transaction_enforces_combined_content_and_changed_line_limits(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Reject aggregate limits and accept their exact boundaries."""
+
+    root, workspace = create_workspace(tmp_path)
+    (root / "first.py").write_text("a\n", encoding="utf-8")
+    (root / "second.py").write_text("b\n", encoding="utf-8")
+    arguments = transaction_arguments(
+        patch_arguments(path="first.py", expected="a\n", replacement="c\n"),
+        patch_arguments(path="second.py", expected="b\n", replacement="d\n"),
+    )
+
+    monkeypatch.setattr(
+        "agent_workbench.workspace_actions.MAX_TRANSACTION_EXPECTED_BYTES",
+        4,
+    )
+    monkeypatch.setattr(
+        "agent_workbench.workspace_actions.MAX_TRANSACTION_REPLACEMENT_BYTES",
+        4,
+    )
+    monkeypatch.setattr(
+        "agent_workbench.workspace_actions.MAX_TRANSACTION_CHANGED_LINES",
+        4,
+    )
+    assert preview_workspace_changes(workspace, arguments)["operation_count"] == 2
+
+    monkeypatch.setattr(
+        "agent_workbench.workspace_actions.MAX_TRANSACTION_EXPECTED_BYTES",
+        3,
+    )
+    with pytest.raises(ValueError, match="expected"):
+        preview_workspace_changes(workspace, arguments)
+    monkeypatch.setattr(
+        "agent_workbench.workspace_actions.MAX_TRANSACTION_EXPECTED_BYTES",
+        MAX_TRANSACTION_EXPECTED_BYTES,
+    )
+    monkeypatch.setattr(
+        "agent_workbench.workspace_actions.MAX_TRANSACTION_REPLACEMENT_BYTES",
+        3,
+    )
+    with pytest.raises(ValueError, match="replacement"):
+        preview_workspace_changes(workspace, arguments)
+    monkeypatch.setattr(
+        "agent_workbench.workspace_actions.MAX_TRANSACTION_REPLACEMENT_BYTES",
+        MAX_TRANSACTION_REPLACEMENT_BYTES,
+    )
+    monkeypatch.setattr(
+        "agent_workbench.workspace_actions.MAX_TRANSACTION_CHANGED_LINES",
+        3,
+    )
+    with pytest.raises(ValueError, match="changed"):
+        preview_workspace_changes(workspace, arguments)
+    assert MAX_TRANSACTION_CHANGED_LINES == 2_000
+
+
+def test_transaction_rejects_incomplete_combined_preview(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Reject the whole request instead of truncating any combined diff."""
+
+    root, workspace = create_workspace(tmp_path)
+    (root / "module.py").write_text("old\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "agent_workbench.workspace_actions.MAX_TRANSACTION_PREVIEW_BYTES",
+        8,
+    )
+
+    with pytest.raises(ValueError, match="preview"):
+        preview_workspace_changes(
+            workspace,
+            transaction_arguments(
+                patch_arguments(expected="old\n", replacement="new\n")
+            ),
+        )
+
+
+def test_transaction_stale_revalidation_writes_nothing(
+    tmp_path: Path,
+) -> None:
+    """Revalidate every target after approval before the first mutation."""
+
+    root, workspace = create_workspace(tmp_path)
+    first = root / "first.py"
+    second = root / "second.py"
+    first.write_text("one\n", encoding="utf-8")
+    second.write_text("two\n", encoding="utf-8")
+    registry = ToolRegistry()
+    register_workspace_action_tools(registry, workspace)
+    arguments = transaction_arguments(
+        patch_arguments(path="first.py", expected="one\n", replacement="ONE\n"),
+        patch_arguments(path="second.py", expected="two\n", replacement="TWO\n"),
+    )
+    provider = FakeProvider(
+        [
+            ChatResponse(
+                tool_invocations=(
+                    ToolInvocation(
+                        id="transaction",
+                        tool_name="apply_workspace_changes",
+                        arguments=arguments,
+                    ),
+                )
+            )
+        ]
+    )
+
+    def approve_after_change(request):
+        second.write_text("concurrent\n", encoding="utf-8")
+        return ToolApprovalDecision.APPROVE
+
+    with pytest.raises(WorkspaceTransactionError, match="stale"):
+        run_tool_calling_loop(
+            provider,
+            ChatRequest(messages=[]),
+            registry,
+            max_tool_rounds=1,
+            tool_approval_handler=approve_after_change,
+        )
+
+    assert first.read_text(encoding="utf-8") == "one\n"
+    assert second.read_text(encoding="utf-8") == "concurrent\n"
+    assert list(root.glob(".agent-workbench-transaction-*")) == []
+
+
+@pytest.mark.parametrize(
+    "race",
+    ["new_target", "target_symlink", "parent_symlink"],
+)
+def test_transaction_stale_target_mapping_writes_nothing(
+    tmp_path: Path,
+    race: str,
+) -> None:
+    """Reject appeared targets and unsafe target or parent mappings after preview."""
+
+    root, workspace = create_workspace(tmp_path)
+    stable = root / "a.py"
+    stable.write_text("stable\n", encoding="utf-8")
+    external = tmp_path / "external"
+    external.mkdir()
+    outside = external / "outside.py"
+    outside.write_text("outside\n", encoding="utf-8")
+    if race == "new_target":
+        requested_path = "b.py"
+        requested_expected = ""
+        requested_create = True
+    elif race == "target_symlink":
+        requested_path = "b.py"
+        requested_expected = "inside\n"
+        requested_create = False
+        (root / requested_path).write_text(requested_expected, encoding="utf-8")
+    else:
+        requested_path = "nested/b.py"
+        requested_expected = ""
+        requested_create = True
+        (root / "nested").mkdir()
+
+    arguments = transaction_arguments(
+        patch_arguments(
+            path="a.py",
+            expected="stable\n",
+            replacement="changed\n",
+        ),
+        patch_arguments(
+            path=requested_path,
+            expected=requested_expected,
+            replacement="requested\n",
+            create=requested_create,
+        ),
+    )
+    registry = ToolRegistry()
+    register_workspace_action_tools(registry, workspace)
+    provider = FakeProvider(
+        [
+            ChatResponse(
+                tool_invocations=(
+                    ToolInvocation(
+                        id="transaction",
+                        tool_name="apply_workspace_changes",
+                        arguments=arguments,
+                    ),
+                )
+            )
+        ]
+    )
+
+    def approve_after_race(request):
+        if race == "new_target":
+            (root / requested_path).write_text("concurrent\n", encoding="utf-8")
+        elif race == "target_symlink":
+            (root / requested_path).unlink()
+            (root / requested_path).symlink_to(outside)
+        else:
+            (root / "nested").rmdir()
+            (root / "nested").symlink_to(external, target_is_directory=True)
+        return ToolApprovalDecision.APPROVE
+
+    with pytest.raises(WorkspaceTransactionError, match="stale"):
+        run_tool_calling_loop(
+            provider,
+            ChatRequest(messages=[]),
+            registry,
+            max_tool_rounds=1,
+            tool_approval_handler=approve_after_race,
+        )
+
+    assert stable.read_text(encoding="utf-8") == "stable\n"
+    assert outside.read_text(encoding="utf-8") == "outside\n"
+    assert list(root.glob(".agent-workbench-transaction-*")) == []
+
+
+def test_transaction_failure_before_first_write_changes_nothing(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Clean prepared material when the first commit operation fails."""
+
+    root, workspace = create_workspace(tmp_path)
+    target = root / "a.py"
+    target.write_text("old\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "agent_workbench.workspace_actions._commit_prepared_change",
+        lambda prepared: (_ for _ in ()).throw(OSError("injected")),
+    )
+
+    with pytest.raises(WorkspaceTransactionError, match="before any files"):
+        apply_workspace_changes(
+            workspace,
+            transaction_arguments(
+                patch_arguments(
+                    path="a.py",
+                    expected="old\n",
+                    replacement="new\n",
+                )
+            ),
+        )
+
+    assert target.read_text(encoding="utf-8") == "old\n"
+    assert list(root.glob(".agent-workbench-transaction-*")) == []
+
+
+def test_transaction_rolls_back_mixed_changes_in_reverse_order(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Restore every applied update and remove transaction-created files."""
+
+    root, workspace = create_workspace(tmp_path)
+    first = root / "a.py"
+    third = root / "c.py"
+    first.write_text("one\n", encoding="utf-8")
+    first.chmod(0o640)
+    third.write_text("three\n", encoding="utf-8")
+    arguments = transaction_arguments(
+        patch_arguments(path="a.py", expected="one\n", replacement="ONE\n"),
+        patch_arguments(
+            path="b.py",
+            expected="",
+            replacement="TWO\n",
+            create=True,
+        ),
+        patch_arguments(path="c.py", expected="three\n", replacement="THREE\n"),
+    )
+    import agent_workbench.workspace_actions as actions
+
+    original_commit = actions._commit_prepared_change
+    original_rollback = actions._rollback_applied_change
+    commits = 0
+    rollbacks: list[str] = []
+
+    def fail_third(prepared):
+        nonlocal commits
+        commits += 1
+        if commits == 3:
+            raise OSError("injected")
+        original_commit(prepared)
+
+    def record_rollback(prepared):
+        rollbacks.append(prepared.patch.relative_path)
+        original_rollback(prepared)
+
+    monkeypatch.setattr(actions, "_commit_prepared_change", fail_third)
+    monkeypatch.setattr(actions, "_rollback_applied_change", record_rollback)
+
+    with pytest.raises(WorkspaceTransactionError, match="rolled back"):
+        apply_workspace_changes(workspace, arguments)
+
+    assert first.read_text(encoding="utf-8") == "one\n"
+    assert stat.S_IMODE(first.stat().st_mode) == 0o640
+    assert not (root / "b.py").exists()
+    assert third.read_text(encoding="utf-8") == "three\n"
+    assert rollbacks == ["b.py", "a.py"]
+    assert list(root.glob(".agent-workbench-transaction-*")) == []
+
+    monkeypatch.setattr(actions, "_commit_prepared_change", original_commit)
+    monkeypatch.setattr(actions, "_rollback_applied_change", original_rollback)
+    assert apply_workspace_changes(workspace, arguments)["operation_count"] == 3
+
+
+def test_transaction_reports_incomplete_rollback_with_only_relative_paths(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Warn safely when handled rollback cannot restore an applied target."""
+
+    root, workspace = create_workspace(tmp_path)
+    target = root / "a.py"
+    target.write_text("one\n", encoding="utf-8")
+    arguments = transaction_arguments(
+        patch_arguments(path="a.py", expected="one\n", replacement="ONE\n"),
+        patch_arguments(
+            path="b.py",
+            expected="",
+            replacement="TWO\n",
+            create=True,
+        ),
+    )
+    import agent_workbench.workspace_actions as actions
+
+    original_commit = actions._commit_prepared_change
+    commits = 0
+
+    def fail_second(prepared):
+        nonlocal commits
+        commits += 1
+        if commits == 2:
+            raise OSError("injected")
+        original_commit(prepared)
+
+    monkeypatch.setattr(actions, "_commit_prepared_change", fail_second)
+    monkeypatch.setattr(
+        actions,
+        "_rollback_applied_change",
+        lambda prepared: (_ for _ in ()).throw(OSError("rollback injected")),
+    )
+
+    with pytest.raises(WorkspaceTransactionError) as raised:
+        apply_workspace_changes(workspace, arguments)
+
+    message = str(raised.value)
+    assert "rollback was incomplete" in message
+    assert "a.py" in message
+    assert str(root) not in message
+    assert list(root.glob(".agent-workbench-transaction-*")) == []
+
+
+@pytest.mark.parametrize(
+    "decision",
+    [None, ToolApprovalDecision.DENY],
+)
+def test_transaction_missing_or_denied_approval_writes_nothing(
+    tmp_path: Path,
+    decision,
+) -> None:
+    """Keep every target unchanged until the exact transaction is approved."""
+
+    root, workspace = create_workspace(tmp_path)
+    target = root / "module.py"
+    target.write_text("old\n", encoding="utf-8")
+    registry = ToolRegistry()
+    register_workspace_action_tools(registry, workspace)
+    provider = FakeProvider(
+        [
+            ChatResponse(
+                tool_invocations=(
+                    ToolInvocation(
+                        id="transaction",
+                        tool_name="apply_workspace_changes",
+                        arguments=transaction_arguments(
+                            patch_arguments(expected="old\n", replacement="new\n")
+                        ),
+                    ),
+                )
+            )
+        ]
+    )
+
+    with pytest.raises(CompletionError):
+        run_tool_calling_loop(
+            provider,
+            ChatRequest(messages=[]),
+            registry,
+            max_tool_rounds=1,
+            tool_approval_handler=(
+                None if decision is None else lambda request: decision
+            ),
+        )
+
+    assert target.read_text(encoding="utf-8") == "old\n"
+
+
+def test_transaction_requires_fresh_approval_for_each_invocation(
+    tmp_path: Path,
+) -> None:
+    """Approve each exact transaction independently and execute it once."""
+
+    root, workspace = create_workspace(tmp_path)
+    target = root / "module.py"
+    target.write_text("zero\n", encoding="utf-8")
+    registry = ToolRegistry()
+    register_workspace_action_tools(registry, workspace)
+    provider = FakeProvider(
+        [
+            ChatResponse(
+                tool_invocations=(
+                    ToolInvocation(
+                        id="first",
+                        tool_name="apply_workspace_changes",
+                        arguments=transaction_arguments(
+                            patch_arguments(
+                                expected="zero\n",
+                                replacement="one\n",
+                            )
+                        ),
+                    ),
+                )
+            ),
+            ChatResponse(
+                tool_invocations=(
+                    ToolInvocation(
+                        id="second",
+                        tool_name="apply_workspace_changes",
+                        arguments=transaction_arguments(
+                            patch_arguments(
+                                expected="one\n",
+                                replacement="two\n",
+                            )
+                        ),
+                    ),
+                )
+            ),
+            ChatResponse(text="Done."),
+        ]
+    )
+    approvals: list[str] = []
+
+    result = run_tool_calling_loop(
+        provider,
+        ChatRequest(messages=[]),
+        registry,
+        max_tool_rounds=2,
+        tool_approval_handler=lambda request: (
+            approvals.append(request.invocation.id) or ToolApprovalDecision.APPROVE
+        ),
+    )
+
+    assert result.text == "Done."
+    assert approvals == ["first", "second"]
+    assert target.read_text(encoding="utf-8") == "two\n"
