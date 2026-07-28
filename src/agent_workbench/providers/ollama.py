@@ -13,6 +13,15 @@ from agent_workbench.structured_outputs import JSONSchema
 from agent_workbench.tools import ToolInvocation, ToolResult
 
 
+_MALFORMED_TOOL_CALL_RETRY_LIMIT = 2
+_MALFORMED_TOOL_CALL_ERROR_PREFIX = "error parsing tool call"
+_MALFORMED_TOOL_CALL_RETRY_INSTRUCTION = (
+    "The previous completion could not be parsed because a tool call contained "
+    "malformed JSON. Generate the completion again and ensure every tool call "
+    "uses exactly one valid JSON object matching the supplied tool schema."
+)
+
+
 class OllamaMessage(TypedDict):
     """Represent a message accepted by the Ollama chat API."""
 
@@ -100,6 +109,45 @@ def _serialize_tool_result(result: ToolResult) -> str:
         separators=(",", ":"),
         sort_keys=True,
     )
+
+
+def _is_malformed_tool_call_error(error: ResponseError) -> bool:
+    """Return whether Ollama rejected malformed tool-call JSON."""
+
+    return (
+        str(error.error).strip().lower().startswith(_MALFORMED_TOOL_CALL_ERROR_PREFIX)
+    )
+
+
+def _add_malformed_tool_call_retry_instruction(
+    arguments: OllamaChatArguments,
+) -> OllamaChatArguments:
+    """Add one temporary corrective instruction for a provider retry."""
+
+    retry_messages = list(arguments["messages"])
+
+    if retry_messages and retry_messages[0]["role"] == "system":
+        first_message = retry_messages[0]
+        retry_messages[0] = {
+            "role": "system",
+            "content": (
+                f"{first_message['content']}\n\n"
+                f"{_MALFORMED_TOOL_CALL_RETRY_INSTRUCTION}"
+            ),
+        }
+    else:
+        retry_messages.insert(
+            0,
+            {
+                "role": "system",
+                "content": _MALFORMED_TOOL_CALL_RETRY_INSTRUCTION,
+            },
+        )
+
+    return {
+        **arguments,
+        "messages": retry_messages,
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -211,20 +259,40 @@ class OllamaProvider:
                 for tool in request.tools
             ]
 
-        try:
-            response = chat(**chat_arguments)
-        except ConnectionError as exc:
-            raise CompletionError(
-                "Unable to connect to Ollama. "
-                "Confirm that the Ollama service is running."
-            ) from exc
-        except ResponseError as exc:
-            if exc.status_code == 404:
-                raise CompletionError(
-                    f"Model '{self.model_name}' is not available in Ollama."
-                ) from exc
+        initial_chat_arguments = chat_arguments
+        malformed_tool_call_retries = 0
 
-            raise CompletionError(f"Ollama request failed: {exc.error}") from exc
+        while True:
+            try:
+                response = chat(**chat_arguments)
+                break
+            except ConnectionError as exc:
+                raise CompletionError(
+                    "Unable to connect to Ollama. "
+                    "Confirm that the Ollama service is running."
+                ) from exc
+            except ResponseError as exc:
+                if exc.status_code == 404:
+                    raise CompletionError(
+                        f"Model '{self.model_name}' is not available in Ollama."
+                    ) from exc
+
+                if _is_malformed_tool_call_error(exc):
+                    if malformed_tool_call_retries < _MALFORMED_TOOL_CALL_RETRY_LIMIT:
+                        malformed_tool_call_retries += 1
+                        chat_arguments = _add_malformed_tool_call_retry_instruction(
+                            initial_chat_arguments
+                        )
+                        continue
+
+                    attempt_count = malformed_tool_call_retries + 1
+                    raise CompletionError(
+                        "Ollama request failed after "
+                        f"{attempt_count} attempts because the model repeatedly "
+                        "generated malformed tool-call JSON."
+                    ) from exc
+
+                raise CompletionError(f"Ollama request failed: {exc.error}") from exc
 
         tool_calls = getattr(response.message, "tool_calls", None) or ()
 

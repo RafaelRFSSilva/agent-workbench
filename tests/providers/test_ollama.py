@@ -106,6 +106,135 @@ def test_missing_model_error_is_translated(monkeypatch) -> None:
         provider.complete(ChatRequest(messages=[]))
 
 
+def test_malformed_tool_call_error_is_retried_with_corrective_instruction(
+    monkeypatch,
+) -> None:
+    """Retry one malformed tool call with bounded corrective guidance."""
+
+    calls = []
+
+    def fake_chat(**kwargs):
+        calls.append(kwargs)
+
+        if len(calls) == 1:
+            raise ResponseError(
+                'error parsing tool call: raw=\'{"path":"tests"}}\'',
+                500,
+            )
+
+        return SimpleNamespace(
+            message=SimpleNamespace(
+                content="Recovered response.",
+                tool_calls=None,
+            )
+        )
+
+    monkeypatch.setattr("agent_workbench.providers.ollama.chat", fake_chat)
+
+    provider = OllamaProvider(model_name="test-model")
+    request = ChatRequest(
+        system_prompt="Use tools carefully.",
+        messages=[
+            {
+                "role": "user",
+                "content": "Inspect the tests.",
+            }
+        ],
+    )
+
+    assert provider.complete(request) == ChatResponse(text="Recovered response.")
+    assert len(calls) == 2
+    assert calls[0]["messages"] == [
+        {
+            "role": "system",
+            "content": "Use tools carefully.",
+        },
+        {
+            "role": "user",
+            "content": "Inspect the tests.",
+        },
+    ]
+    assert calls[1]["messages"] == [
+        {
+            "role": "system",
+            "content": (
+                "Use tools carefully.\n\n"
+                "The previous completion could not be parsed because a tool "
+                "call contained malformed JSON. Generate the completion again "
+                "and ensure every tool call uses exactly one valid JSON object "
+                "matching the supplied tool schema."
+            ),
+        },
+        {
+            "role": "user",
+            "content": "Inspect the tests.",
+        },
+    ]
+
+
+def test_repeated_malformed_tool_call_errors_stop_after_retry_limit(
+    monkeypatch,
+) -> None:
+    """Stop safely after two retries of malformed tool-call JSON."""
+
+    calls = []
+
+    def fake_chat(**kwargs):
+        calls.append(kwargs)
+        raise ResponseError(
+            'error parsing tool call: raw=\'{"path":"tests"}}\'',
+            500,
+        )
+
+    monkeypatch.setattr("agent_workbench.providers.ollama.chat", fake_chat)
+
+    provider = OllamaProvider(model_name="test-model")
+
+    with pytest.raises(
+        CompletionError,
+        match=(
+            "after 3 attempts because the model repeatedly generated "
+            "malformed tool-call JSON"
+        ),
+    ) as error:
+        provider.complete(
+            ChatRequest(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": "Inspect the tests.",
+                    }
+                ],
+            )
+        )
+
+    assert len(calls) == 3
+    assert calls[1]["messages"] == calls[2]["messages"]
+    assert "raw=" not in str(error.value)
+
+
+def test_non_tool_call_response_error_is_not_retried(monkeypatch) -> None:
+    """Preserve immediate failure for unrelated Ollama response errors."""
+
+    calls = []
+
+    def fake_chat(**kwargs):
+        calls.append(kwargs)
+        raise ResponseError("internal server failure", 500)
+
+    monkeypatch.setattr("agent_workbench.providers.ollama.chat", fake_chat)
+
+    provider = OllamaProvider(model_name="test-model")
+
+    with pytest.raises(
+        CompletionError,
+        match="Ollama request failed: internal server failure",
+    ):
+        provider.complete(ChatRequest(messages=[]))
+
+    assert len(calls) == 1
+
+
 def test_context_documents_are_added_as_system_instructions(
     monkeypatch,
 ) -> None:
