@@ -17,5 +17,9 @@ class WorkspacePathError(RuntimeError):
     """Represent an unsafe or invalid requested workspace path."""
 
 
+class ToolArgumentError(ValueError):
+    """Represent a safe, model-visible, correctable tool input failure."""
+
+
 class WorkspaceTransactionError(CompletionError):
     """Represent a safe transactional workspace application failure."""
