@@ -37,6 +37,7 @@ class CLIArguments:
     model_name: str | None
     setup: bool = False
     task_prompt: str | None = None
+    commit_message: str | None = None
     system_prompt: str | None = None
     agent_name: str | None = None
     agent_file: Path | None = None
@@ -103,6 +104,15 @@ def _non_empty_task_prompt(value: str) -> str:
         raise ArgumentTypeError("task prompt must not be blank")
 
     return task_prompt
+
+
+def _non_empty_commit_message(value: str) -> str:
+    """Return one exact non-blank isolated commit message."""
+
+    if not value.strip():
+        raise ArgumentTypeError("commit message must not be blank")
+
+    return value
 
 
 def _agent_profile_path(value: str) -> Path:
@@ -234,6 +244,11 @@ def parse_cli_arguments(
         help="Run one supervised autonomous coding task and exit.",
     )
     parser.add_argument(
+        "--commit-message",
+        type=_non_empty_commit_message,
+        help="Exact local commit message for isolated autonomous coding.",
+    )
+    parser.add_argument(
         "--provider",
         choices=sorted(SUPPORTED_PROVIDERS),
         help="Language model provider to use.",
@@ -353,6 +368,7 @@ def parse_cli_arguments(
         or parsed_arguments.worktree_path is not None
         or parsed_arguments.worktree_branch is not None
         or parsed_arguments.task is not None
+        or parsed_arguments.commit_message is not None
     )
 
     if parsed_arguments.setup and setup_conflicts:
@@ -383,6 +399,7 @@ def parse_cli_arguments(
         worktree_path=parsed_arguments.worktree_path,
         worktree_branch=parsed_arguments.worktree_branch,
         task_prompt=parsed_arguments.task,
+        commit_message=parsed_arguments.commit_message,
     )
 
 
@@ -407,6 +424,17 @@ def resolve_runtime_configuration(
 
     if arguments.worktree_path is not None and arguments.workspace_root is None:
         raise ConfigurationError("Worktree isolation options require --workspace.")
+
+    if arguments.worktree_path is not None and arguments.task_prompt is None:
+        raise ConfigurationError("Worktree isolation options require --task.")
+
+    if arguments.worktree_path is not None and arguments.commit_message is None:
+        raise ConfigurationError("Worktree isolation options require --commit-message.")
+
+    if arguments.commit_message is not None and arguments.worktree_path is None:
+        raise ConfigurationError(
+            "--commit-message requires --worktree-path and --worktree-branch."
+        )
 
     if arguments.agent_name is not None and arguments.agent_file is not None:
         raise ConfigurationError("--agent cannot be combined with --agent-file.")
