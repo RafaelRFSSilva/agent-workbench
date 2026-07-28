@@ -12,6 +12,9 @@ MAX_DIRECTORY_ENTRIES = 128
 MAX_FILE_SIZE_BYTES = 100 * 1024
 """Maximum UTF-8 file size returned by read_file."""
 
+MAX_READ_LINES = 400
+"""Maximum number of lines returned by one partial read_file request."""
+
 MAX_SEARCH_QUERY_LENGTH = 256
 """Maximum number of characters accepted in a search query."""
 
@@ -38,6 +41,25 @@ _PATH_INPUT_SCHEMA: JSONObject = {
     "additionalProperties": False,
 }
 
+_READ_FILE_INPUT_SCHEMA: JSONObject = {
+    "type": "object",
+    "properties": {
+        "path": {
+            "type": "string",
+        },
+        "line_start": {
+            "type": "integer",
+            "minimum": 1,
+        },
+        "line_end": {
+            "type": "integer",
+            "minimum": 1,
+        },
+    },
+    "required": ["path"],
+    "additionalProperties": False,
+}
+
 LIST_FILES_DEFINITION = ToolDefinition(
     name="list_files",
     description="List the direct entries of a directory inside the authorized workspace.",
@@ -46,8 +68,11 @@ LIST_FILES_DEFINITION = ToolDefinition(
 
 READ_FILE_DEFINITION = ToolDefinition(
     name="read_file",
-    description="Read a UTF-8 text file inside the authorized workspace.",
-    input_schema=_PATH_INPUT_SCHEMA,
+    description=(
+        "Read all or an inclusive bounded line range from a UTF-8 text file "
+        "inside the authorized workspace."
+    ),
+    input_schema=_READ_FILE_INPUT_SCHEMA,
 )
 
 SEARCH_TEXT_DEFINITION = ToolDefinition(
@@ -131,9 +156,10 @@ def read_workspace_file(
     workspace: Workspace,
     arguments: object,
 ) -> JSONObject:
-    """Read a bounded UTF-8 file from the authorized workspace."""
+    """Read a bounded UTF-8 file or inclusive line range."""
 
-    file_path = workspace.resolve(_get_requested_path("read_file", arguments))
+    requested_path, line_start, line_end = _get_read_arguments(arguments)
+    file_path = workspace.resolve(requested_path)
 
     if not file_path.is_file():
         raise ValueError("read_file requires a regular file.")
@@ -164,11 +190,30 @@ def read_workspace_file(
     except UnicodeDecodeError:
         raise ValueError("read_file requires valid UTF-8.") from None
 
-    return {
+    result: JSONObject = {
         "path": _workspace_relative_path(workspace, file_path),
         "content": content,
         "size_bytes": len(content_bytes),
     }
+
+    if line_start is None and line_end is None:
+        return result
+
+    partial_content, returned_start, returned_end, total_lines = _slice_file_content(
+        content,
+        line_start=line_start,
+        line_end=line_end,
+    )
+    result.update(
+        {
+            "content": partial_content,
+            "line_start": returned_start,
+            "line_end": returned_end,
+            "total_lines": total_lines,
+            "truncated": returned_start > 1 or returned_end < total_lines,
+        }
+    )
+    return result
 
 
 def search_workspace_text(
@@ -247,6 +292,69 @@ def _get_requested_path(tool_name: str, arguments: object) -> Path:
         raise ValueError(f"{tool_name} requires a path string.")
 
     return Path(path)
+
+
+def _get_read_arguments(
+    arguments: object,
+) -> tuple[Path, int | None, int | None]:
+    """Validate and normalize one full or partial file read request."""
+
+    allowed_fields = {"path", "line_start", "line_end"}
+
+    if (
+        not isinstance(arguments, dict)
+        or "path" not in arguments
+        or set(arguments) - allowed_fields
+    ):
+        raise ValueError("read_file requires valid read arguments.")
+
+    path = arguments["path"]
+    line_start = arguments.get("line_start")
+    line_end = arguments.get("line_end")
+
+    if not isinstance(path, str):
+        raise ValueError("read_file requires a path string.")
+
+    for field_name, value in (
+        ("line_start", line_start),
+        ("line_end", line_end),
+    ):
+        if value is not None and (
+            not isinstance(value, int) or isinstance(value, bool) or value < 1
+        ):
+            raise ValueError(f"read_file {field_name} must be a positive integer.")
+
+    resolved_start = line_start or 1
+
+    if line_end is not None and line_end < resolved_start:
+        raise ValueError("read_file line_end must not be before line_start.")
+
+    if line_end is not None and line_end - resolved_start + 1 > MAX_READ_LINES:
+        raise ValueError(f"read_file ranges must not exceed {MAX_READ_LINES} lines.")
+
+    return Path(path), line_start, line_end
+
+
+def _slice_file_content(
+    content: str,
+    *,
+    line_start: int | None,
+    line_end: int | None,
+) -> tuple[str, int, int, int]:
+    """Return one inclusive bounded line range with deterministic metadata."""
+
+    lines = content.splitlines(keepends=True)
+    total_lines = len(lines)
+    resolved_start = line_start or 1
+    requested_end = line_end or resolved_start + MAX_READ_LINES - 1
+
+    if resolved_start > total_lines:
+        raise ValueError("read_file line_start exceeds the total file line count.")
+
+    selected_lines = lines[resolved_start - 1 : requested_end]
+    returned_end = resolved_start + len(selected_lines) - 1
+
+    return "".join(selected_lines), resolved_start, returned_end, total_lines
 
 
 def _get_search_arguments(arguments: object) -> tuple[str, Path, bool]:
