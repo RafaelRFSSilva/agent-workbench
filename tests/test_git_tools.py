@@ -85,7 +85,16 @@ def test_registers_git_tools_with_exact_schemas_and_order(tmp_path: Path) -> Non
     assert [definition.input_schema for definition in registry.definitions[1:]] == [
         {
             "type": "object",
-            "properties": {},
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "enum": ["", "."],
+                    "description": (
+                        "Optional workspace-root alias. Omit this property when "
+                        "possible."
+                    ),
+                }
+            },
             "additionalProperties": False,
         },
         {
@@ -93,6 +102,10 @@ def test_registers_git_tools_with_exact_schemas_and_order(tmp_path: Path) -> Non
             "properties": {
                 "path": {
                     "type": "string",
+                    "description": (
+                        "Optional workspace-relative path. Omit it, use an empty "
+                        "string, or use '.' to inspect the complete workspace diff."
+                    ),
                 }
             },
             "additionalProperties": False,
@@ -113,6 +126,48 @@ def test_inspects_clean_and_dirty_status_without_absolute_paths(tmp_path: Path) 
     assert clean_result["status"].startswith("## ")
     assert "README.md" in dirty_result["status"]
     assert str(root) not in dirty_result["status"]
+
+
+@pytest.mark.parametrize("root_alias", ["", "."])
+def test_accepts_explicit_root_aliases_for_status_and_full_diff(
+    tmp_path: Path,
+    root_alias: str,
+) -> None:
+    """Treat common model-generated root aliases as complete Git inspection."""
+
+    root, workspace = create_workspace(tmp_path)
+    initialize_repository(root)
+    (root / "README.md").write_text("changed\n", encoding="utf-8")
+
+    assert inspect_workspace_git_status(
+        workspace,
+        {"path": root_alias},
+    ) == inspect_workspace_git_status(workspace, {})
+    assert inspect_workspace_git_diff(
+        workspace,
+        {"path": root_alias},
+    ) == inspect_workspace_git_diff(workspace, {})
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"path": "README.md"},
+        {"path": None},
+        {"unexpected": ""},
+    ],
+)
+def test_rejects_non_root_status_arguments(
+    tmp_path: Path,
+    arguments: dict[str, object],
+) -> None:
+    """Keep status inspection fixed to the authorized workspace root."""
+
+    root, workspace = create_workspace(tmp_path)
+    initialize_repository(root)
+
+    with pytest.raises(ValueError, match="root path|empty or"):
+        inspect_workspace_git_status(workspace, arguments)
 
 
 def test_inspects_unstaged_staged_and_path_scoped_diffs(tmp_path: Path) -> None:

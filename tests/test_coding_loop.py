@@ -226,6 +226,8 @@ def test_runs_complete_inspect_edit_validate_and_diff_cycle(
     first_prompt = provider.requests[0].messages[0]["content"]
     assert "Correct the add function" in first_prompt
     assert "Run run_ruff_check and run_pytest" in first_prompt
+    assert "inspect_git_status with {}" in first_prompt
+    assert "inspect_git_diff with {}" in first_prompt
 
     assert run_git(repository, "status", "--short").stdout == " M module.py\n"
     assert "return left + right" in run_git(repository, "diff").stdout

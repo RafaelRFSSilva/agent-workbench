@@ -203,7 +203,8 @@ def _build_coding_prompt(task_spec: TaskSpec) -> str:
         "5. Run run_ruff_check and run_pytest after making changes.\n"
         "6. If validation fails, inspect the output, correct the implementation, "
         "and rerun validation within the available tool-round limit.\n"
-        "7. Inspect Git status and Git diff before the final response.\n"
+        "7. Call inspect_git_status with {} and inspect_git_diff with {} "
+        "before the final response.\n"
         "8. Summarize the changes, validation results, and unresolved issues.\n"
         "Do not claim success unless the observed validation results support it."
     )
