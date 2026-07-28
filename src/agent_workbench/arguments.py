@@ -28,6 +28,9 @@ from agent_workbench.structured_outputs import (
     load_response_format_file,
 )
 
+DEFAULT_AUTONOMOUS_MAX_TOOL_ROUNDS = 16
+"""Default maximum tool rounds for one autonomous CLI task."""
+
 
 @dataclass(frozen=True, slots=True)
 class CLIArguments:
@@ -37,6 +40,7 @@ class CLIArguments:
     model_name: str | None
     setup: bool = False
     task_prompt: str | None = None
+    max_tool_rounds: int | None = None
     commit_message: str | None = None
     system_prompt: str | None = None
     agent_name: str | None = None
@@ -69,6 +73,7 @@ class RuntimeConfiguration:
     workspace_root: Path | None = None
     enable_actions: bool = False
     show_tool_traces: bool = False
+    max_tool_rounds: int = DEFAULT_AUTONOMOUS_MAX_TOOL_ROUNDS
     worktree_path: Path | None = None
     worktree_branch: str | None = None
 
@@ -104,6 +109,20 @@ def _non_empty_task_prompt(value: str) -> str:
         raise ArgumentTypeError("task prompt must not be blank")
 
     return task_prompt
+
+
+def _positive_tool_round_limit(value: str) -> int:
+    """Parse a positive autonomous tool-round limit."""
+
+    try:
+        parsed_value = int(value)
+    except ValueError as exc:
+        raise ArgumentTypeError("max tool rounds must be a positive integer") from exc
+
+    if parsed_value <= 0:
+        raise ArgumentTypeError("max tool rounds must be a positive integer")
+
+    return parsed_value
 
 
 def _non_empty_commit_message(value: str) -> str:
@@ -244,6 +263,14 @@ def parse_cli_arguments(
         help="Run one supervised autonomous coding task and exit.",
     )
     parser.add_argument(
+        "--max-tool-rounds",
+        type=_positive_tool_round_limit,
+        help=(
+            "Maximum tool execution rounds for one autonomous task; "
+            f"defaults to {DEFAULT_AUTONOMOUS_MAX_TOOL_ROUNDS}."
+        ),
+    )
+    parser.add_argument(
         "--commit-message",
         type=_non_empty_commit_message,
         help="Exact local commit message for isolated autonomous coding.",
@@ -368,6 +395,7 @@ def parse_cli_arguments(
         or parsed_arguments.worktree_path is not None
         or parsed_arguments.worktree_branch is not None
         or parsed_arguments.task is not None
+        or parsed_arguments.max_tool_rounds is not None
         or parsed_arguments.commit_message is not None
     )
 
@@ -399,6 +427,7 @@ def parse_cli_arguments(
         worktree_path=parsed_arguments.worktree_path,
         worktree_branch=parsed_arguments.worktree_branch,
         task_prompt=parsed_arguments.task,
+        max_tool_rounds=parsed_arguments.max_tool_rounds,
         commit_message=parsed_arguments.commit_message,
     )
 
@@ -413,6 +442,9 @@ def resolve_runtime_configuration(
 
     if arguments.task_prompt is not None and not arguments.enable_actions:
         raise ConfigurationError("--task requires --enable-actions.")
+
+    if arguments.max_tool_rounds is not None and arguments.task_prompt is None:
+        raise ConfigurationError("--max-tool-rounds requires --task.")
 
     if arguments.enable_actions and arguments.workspace_root is None:
         raise ConfigurationError("--enable-actions requires --workspace.")
@@ -491,6 +523,11 @@ def resolve_runtime_configuration(
         workspace_root=arguments.workspace_root,
         enable_actions=arguments.enable_actions,
         show_tool_traces=arguments.show_tool_traces,
+        max_tool_rounds=(
+            arguments.max_tool_rounds
+            if arguments.max_tool_rounds is not None
+            else DEFAULT_AUTONOMOUS_MAX_TOOL_ROUNDS
+        ),
         worktree_path=arguments.worktree_path,
         worktree_branch=arguments.worktree_branch,
     )

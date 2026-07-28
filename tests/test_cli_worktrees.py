@@ -309,6 +309,54 @@ def test_main_delegates_complete_isolated_workflow_once(
     assert "No merge, push, worktree removal, or branch deletion" in output
 
 
+def test_main_forwards_custom_tool_round_limit_to_isolated_workflow(
+    monkeypatch,
+) -> None:
+    """Forward one resolved custom limit to isolated orchestration."""
+
+    runtime = configuration(
+        workspace_root=Path("/source"),
+        enable_actions=True,
+        max_tool_rounds=48,
+        worktree_path=Path("/isolated"),
+        worktree_branch="agent/task",
+    )
+    workflow = Mock(return_value=isolated_workflow_result())
+    monkeypatch.setattr("agent_workbench.cli.load_environment", Mock())
+    monkeypatch.setattr(
+        "agent_workbench.cli.resolve_runtime_configuration",
+        Mock(return_value=runtime),
+    )
+    monkeypatch.setattr(
+        "agent_workbench.cli.run_isolated_autonomous_workflow",
+        workflow,
+    )
+    monkeypatch.setattr(
+        "agent_workbench.cli.create_agent_session",
+        Mock(side_effect=AssertionError("source session must not be created")),
+    )
+
+    main(
+        [
+            "--workspace",
+            "/source",
+            "--enable-actions",
+            "--task",
+            "Correct the implementation.",
+            "--max-tool-rounds",
+            "48",
+            "--worktree-path",
+            "/isolated",
+            "--worktree-branch",
+            "agent/task",
+            "--commit-message",
+            "fix: exact",
+        ]
+    )
+
+    assert workflow.call_args.kwargs["max_tool_rounds"] == 48
+
+
 def test_main_reports_isolated_workflow_failure_without_fallback(
     monkeypatch,
     capsys,
