@@ -5,6 +5,7 @@ from collections.abc import Sequence
 
 from agent_workbench.agents import AgentProfile
 from agent_workbench.arguments import (
+    RuntimeConfiguration,
     parse_cli_arguments,
     resolve_runtime_configuration,
 )
@@ -16,7 +17,10 @@ from agent_workbench.errors import (
     WorkspacePathError,
 )
 from agent_workbench.interactive_setup import run_interactive_setup
-from agent_workbench.isolated_sessions import create_isolated_agent_session
+from agent_workbench.isolated_coding import (
+    IsolatedAutonomousWorkflowResult,
+    run_isolated_autonomous_workflow,
+)
 from agent_workbench.messages import ToolInteractionRound
 from agent_workbench.session import AgentSession, SessionId
 from agent_workbench.session_factory import create_agent_session
@@ -28,11 +32,6 @@ from agent_workbench.tools import (
 from agent_workbench.worktrees import (
     WorktreeAction,
     WorktreeApprovalRequest,
-    create_git_worktree,
-    inspect_git_worktree,
-    plan_git_worktree,
-    plan_git_worktree_removal,
-    remove_git_worktree,
 )
 
 EXIT_COMMANDS = {"/exit", "/quit"}
@@ -117,6 +116,7 @@ def main(
     load_environment()
     arguments = parse_cli_arguments(argv)
     task_prompt = getattr(arguments, "task_prompt", None)
+    commit_message = getattr(arguments, "commit_message", None)
 
     try:
         if arguments.setup:
@@ -128,9 +128,10 @@ def main(
         return
 
     if runtime_configuration.worktree_path is not None:
-        _run_isolated_cli(
+        _run_isolated_autonomous_task(
             runtime_configuration,
             task_prompt=task_prompt,
+            commit_message=commit_message,
         )
         return
 
@@ -159,7 +160,7 @@ def main(
 
 def _run_configured_cli(
     session: AgentSession,
-    runtime_configuration,
+    runtime_configuration: RuntimeConfiguration,
     *,
     task_prompt: str | None = None,
 ) -> None:
@@ -237,159 +238,87 @@ def _run_autonomous_task(
             )
 
 
-def _run_isolated_cli(
-    runtime_configuration,
+def _run_isolated_autonomous_task(
+    runtime_configuration: RuntimeConfiguration,
     *,
-    task_prompt: str | None = None,
+    task_prompt: str | None,
+    commit_message: str | None,
 ) -> None:
-    """Create, run, and conservatively finish one supervised worktree session."""
+    """Run one complete approved autonomous task in an isolated worktree."""
 
-    source = runtime_configuration.workspace_root
     target = runtime_configuration.worktree_path
     branch = runtime_configuration.worktree_branch
-    if source is None or target is None or branch is None:
-        print("Configuration error: Worktree isolation configuration is incomplete.")
-        return
-
-    try:
-        plan = plan_git_worktree(source, branch, target)
-        handle = create_git_worktree(plan, _prompt_for_worktree_approval)
-    except (ConfigurationError, CompletionError) as exc:
-        print(f"Worktree error: {exc}")
-        return
-
-    try:
-        if task_prompt is None:
-            isolated = create_isolated_agent_session(
-                SessionId("cli-session"),
-                runtime_configuration,
-                handle,
-            )
-        else:
-            isolated = create_isolated_agent_session(
-                SessionId("cli-session"),
-                runtime_configuration,
-                handle,
-                max_tool_rounds=AUTONOMOUS_MAX_TOOL_ROUNDS,
-            )
-    except ConfigurationError as exc:
-        print(f"Configuration error: {exc}")
-        return
-
-    _run_configured_cli(
-        isolated.session,
-        runtime_configuration,
-        task_prompt=task_prompt,
-    )
-
-    try:
-        state = inspect_git_worktree(handle)
-    except (ConfigurationError, CompletionError) as exc:
+    if (
+        target is None
+        or branch is None
+        or task_prompt is None
+        or commit_message is None
+    ):
         print(
-            "Worktree recovery required: "
-            f"{exc} The worktree was preserved for manual recovery."
+            "Configuration error: Isolated autonomous workflow "
+            "configuration is incomplete."
         )
         return
 
-    if not state.clean:
-        print(
-            "Isolated worktree preserved for manual review: "
-            f"{state.target_display} on branch {state.branch_name}. "
-            f"Changed entries: {state.changed_entry_count}. "
-            "Please inspect, commit, or clean it manually."
-        )
-        if not _offer_isolated_commit(handle):
-            return
-        try:
-            state = inspect_git_worktree(handle)
-        except (ConfigurationError, CompletionError) as exc:
-            print(
-                "Worktree recovery required after isolated commit: "
-                f"{exc} The worktree was preserved for manual recovery."
-            )
-            return
-        if not state.clean:
-            print(
-                "Isolated commit recovery required: the worktree is not clean. "
-                "The worktree and local branch were preserved for manual recovery."
-            )
-            return
-
-    _offer_clean_worktree_removal(handle, state)
-
-
-def _offer_clean_worktree_removal(handle, state) -> None:
-    """Offer the existing separately approved clean-worktree removal."""
-
+    observer = _display_tool_round if runtime_configuration.show_tool_traces else None
     try:
-        removal_plan = plan_git_worktree_removal(handle)
-        remove_git_worktree(
-            removal_plan,
-            _prompt_for_worktree_approval,
+        result = run_isolated_autonomous_workflow(
+            SessionId("cli-session"),
+            runtime_configuration,
+            branch,
+            target,
+            task_prompt,
+            commit_message,
+            worktree_approval_handler=_prompt_for_worktree_approval,
+            tool_approval_handler=_prompt_for_tool_approval,
+            commit_approval_handler=_prompt_for_isolated_commit_approval,
+            tool_round_observer=observer,
+            max_tool_rounds=AUTONOMOUS_MAX_TOOL_ROUNDS,
         )
-    except (ConfigurationError, CompletionError) as exc:
-        print(
-            f"Worktree cleanup: {exc} The clean worktree was preserved; "
-            f"local branch {state.branch_name} remains."
-        )
+    except (
+        CompletionError,
+        ConfigurationError,
+        ValueError,
+        WorkspacePathError,
+    ) as exc:
+        print(f"Isolated autonomous workflow error: {exc}")
         return
 
-    print(f"Clean isolated worktree removed; local branch {state.branch_name} remains.")
+    _display_isolated_autonomous_result(result)
 
 
-def _offer_isolated_commit(handle) -> bool:
-    """Offer one operator-approved local commit for an eligible dirty worktree."""
+def _display_isolated_autonomous_result(
+    result: IsolatedAutonomousWorkflowResult,
+) -> None:
+    """Display the verified isolated commit and preserved recovery state."""
 
-    try:
-        commit_message = input("Commit message (blank to preserve worktree): ")
-    except (EOFError, KeyboardInterrupt):
-        print()
-        _print_isolated_commit_preserved()
-        return False
-    if not commit_message:
-        _print_isolated_commit_preserved()
-        return False
-
-    from agent_workbench.worktree_commits import (
-        create_isolated_commit,
-        plan_isolated_commit,
-    )
-
-    try:
-        plan = plan_isolated_commit(handle, commit_message)
-    except (ConfigurationError, CompletionError) as exc:
-        print(f"Isolated commit planning: {exc}")
-        _print_isolated_commit_preserved()
-        return False
-
-    try:
-        result = create_isolated_commit(
-            plan,
-            _prompt_for_isolated_commit_approval,
-        )
-    except (ConfigurationError, CompletionError) as exc:
-        print(f"Isolated commit: {exc}")
-        _print_isolated_commit_preserved()
-        return False
-
+    coding_result = result.coding_result
+    commit_result = result.commit_result
+    print(f"\nAssistant: {coding_result.assistant_summary}\n")
+    print("Isolated autonomous workflow result:")
+    print(f"  Worktree: {result.worktree.target_display}")
+    print(f"  Branch: {commit_result.branch_name}")
+    print(f"  New isolated HEAD: {commit_result.new_head}")
+    print(f"  Committed paths: {commit_result.operation_count}")
+    print(f"  Tool rounds: {coding_result.tool_round_count}")
     print(
-        "Isolated commit created on local branch "
-        f"{result.branch_name}. Operations: {result.operation_count} "
-        f"(added: {result.added_count}, modified: {result.modified_count})."
+        "  Validation succeeded: "
+        f"{'yes' if coding_result.validation_succeeded else 'no'}"
     )
-    print(f"New isolated HEAD: {result.new_head}")
-    print("Primary working tree unchanged.")
-    return True
-
-
-def _print_isolated_commit_preserved() -> None:
-    """Print bounded operator-side recovery guidance without cleanup."""
-
     print(
-        "The isolated worktree and local branch were preserved for manual recovery. "
-        "Inspect the isolated index, HEAD, and working tree before continuing. "
-        "No destructive automatic cleanup was attempted."
+        "  Git status inspected: "
+        f"{'yes' if coding_result.inspected_git_status else 'no'}"
     )
+    print(
+        f"  Git diff inspected: {'yes' if coding_result.inspected_git_diff else 'no'}"
+    )
+    print(
+        "  Final worktree clean: "
+        f"{'yes' if result.final_worktree_state.clean else 'no'}"
+    )
+    print("  Primary working tree unchanged.")
+    print("  Worktree and local branch preserved.")
+    print("  No merge, push, worktree removal, or branch deletion was performed.")
 
 
 def _prompt_for_isolated_commit_approval(request) -> ToolApprovalDecision:

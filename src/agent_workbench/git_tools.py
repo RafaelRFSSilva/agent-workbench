@@ -18,7 +18,15 @@ INSPECT_GIT_STATUS_DEFINITION = ToolDefinition(
     description="Inspect the Git working-tree status inside the authorized workspace.",
     input_schema={
         "type": "object",
-        "properties": {},
+        "properties": {
+            "path": {
+                "type": "string",
+                "enum": ["", "."],
+                "description": (
+                    "Optional workspace-root alias. Omit this property when possible."
+                ),
+            }
+        },
         "additionalProperties": False,
     },
 )
@@ -34,6 +42,10 @@ INSPECT_GIT_DIFF_DEFINITION = ToolDefinition(
         "properties": {
             "path": {
                 "type": "string",
+                "description": (
+                    "Optional workspace-relative path. Omit it, use an empty string, "
+                    "or use '.' to inspect the complete workspace diff."
+                ),
             }
         },
         "additionalProperties": False,
@@ -63,7 +75,7 @@ def inspect_workspace_git_status(
 ) -> JSONObject:
     """Return fixed Git status output for the authorized workspace root."""
 
-    _require_empty_arguments("inspect_git_status", arguments)
+    _require_root_arguments("inspect_git_status", arguments)
     output = _run_git(
         workspace,
         [
@@ -126,11 +138,19 @@ def inspect_workspace_git_diff(
     }
 
 
-def _require_empty_arguments(tool_name: str, arguments: object) -> None:
-    """Require the exact empty JSON object accepted by a fixed tool."""
+def _require_root_arguments(tool_name: str, arguments: object) -> None:
+    """Accept only an omitted or explicit workspace-root path alias."""
 
-    if not isinstance(arguments, dict) or arguments:
-        raise ValueError(f"{tool_name} requires an empty JSON object.")
+    if not isinstance(arguments, dict) or set(arguments) - {"path"}:
+        raise ValueError(f"{tool_name} requires an optional root path.")
+
+    if "path" not in arguments:
+        return
+
+    path = arguments["path"]
+
+    if not isinstance(path, str) or path not in {"", "."}:
+        raise ValueError(f"{tool_name} path must be empty or '.'.")
 
 
 def _get_diff_pathspec(
@@ -149,6 +169,9 @@ def _get_diff_pathspec(
 
     if not isinstance(path, str):
         raise ValueError("inspect_git_diff requires an optional path string.")
+
+    if path in {"", "."}:
+        return []
 
     canonical_path = workspace.resolve(Path(path))
 

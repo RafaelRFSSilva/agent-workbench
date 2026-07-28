@@ -38,8 +38,9 @@ Implemented capabilities:
   inspection, and an optional completed-tool trace.
 - Reusable `AgentSession` construction from resolved runtime configuration,
   including providers and deterministic optional tool registries.
-- Supervised local Git worktree isolation with separately approved creation,
-  exact local commits, and clean-only removal.
+- End-to-end isolated autonomous coding with approved worktree creation,
+  controlled actions, required Ruff and pytest validation, final Git inspection,
+  an approved exact local commit, and preserved worktree and branch state.
 - Automated tests, Ruff checks, and GitHub Actions.
 
 Arbitrary shell and network tools, RAG, MCP, asynchronous execution,
@@ -598,10 +599,10 @@ files, install dependencies, run arbitrary shell commands, or access the public
 network. Model quality and adherence to instructions depend on the selected
 provider and model.
 
-## Run in an Isolated Git Worktree
+## Run One Autonomous Task in an Isolated Git Worktree
 
-Keep a clean primary repository untouched while the agent works on a new local
-branch in a sibling worktree:
+Keep a clean primary repository untouched while one supervised autonomous task
+runs on a new local branch in a sibling worktree:
 
 ```bash
 uv run agent-workbench \
@@ -609,34 +610,44 @@ uv run agent-workbench \
   --model gpt-oss:20b \
   --agent developer \
   --workspace . \
+  --enable-actions \
+  --task "Fix the defect and validate the project." \
   --worktree-path ../agent-workbench-task \
   --worktree-branch agent/task \
-  --enable-actions \
+  --commit-message "fix: correct the defect" \
   --show-tool-traces
 ```
 
-`--worktree-path` and `--worktree-branch` must be supplied together and require
-`--workspace`, which must identify the clean primary non-bare repository root.
-Agent Workbench validates and pins its current HEAD, branch name, absent target,
-registered worktrees, and checkout-sensitive local Git configuration before
-showing an exact creation preview. Only `y` or `yes` approves the fixed local
-worktree command.
+`--worktree-path` and `--worktree-branch` must be supplied together. Isolated
+execution also requires `--workspace`, `--enable-actions`, `--task`, and
+`--commit-message`. The former interactive worktree session is not available
+through these options.
 
-The isolated `AgentSession` receives workspace tools for the new worktree only.
-Source-relative context files are reloaded from the corresponding isolated
-paths. At dirty exit, enter a commit message or leave it blank to preserve the
-worktree. Agent Workbench validates every change, requires a clean index, and
-shows the exact message, ordered paths, and complete diffs before a separate
-default-deny commit approval. A verified successful commit advances only the
-isolated local branch. Clean removal has another independent approval and
-preserves that branch and commit.
+Before any Git mutation, Agent Workbench validates the complete workflow input.
+It then validates and pins the clean primary repository, current HEAD, branch,
+absent target, registered worktrees, and checkout-sensitive local Git
+configuration before showing an exact default-deny worktree creation preview.
+Only `y` or `yes` approves the fixed local worktree command.
+
+The isolated `AgentSession` receives workspace tools for the new worktree only,
+and source-relative context files are reloaded from the corresponding isolated
+paths. Every file change and validation command remains separately approved.
+The workflow requires successful Ruff and pytest evidence plus final Git status
+and diff inspection before commit planning can begin.
+
+The exact `--commit-message`, ordered path set, and every complete diff are shown
+before a separate default-deny commit approval. A verified successful commit
+advances only the isolated local branch and leaves its worktree clean. The
+worktree and branch are preserved after success; the CLI does not merge, push,
+remove the worktree, or delete the branch.
 
 The commit boundary supports modified tracked and new untracked UTF-8 regular
 files. It does not support deletion, rename, mode changes, symlinks, submodules,
-binaries, conflicts, or pre-staged content. Failures after staging begins may
-leave a partial or complete isolated index for manual recovery; there is no
-automatic reset, restore, clean, stash, retry, force removal, merge, push, or
-branch deletion. See the [self-hosting guide](docs/self-hosting.md).
+binaries, conflicts, or pre-staged content. Any validation, planning, approval,
+staging, commit, or verification failure preserves available isolated state for
+manual recovery. There is no automatic reset, restore, clean, stash, retry,
+force removal, merge, push, or branch deletion. See the
+[self-hosting guide](docs/self-hosting.md).
 
 ## Configuration Precedence
 
@@ -691,6 +702,9 @@ Completed foundations:
   inspect the workspace, perform approved bounded changes, run Ruff and pytest,
   inspect the final Git status and diff, report structured validation evidence,
   and exit.
+- [x] End-to-end isolated autonomous workflow: create an approved worktree,
+  run controlled coding, require validation and Git inspection, create an
+  approved exact local commit, and preserve the worktree and branch.
 
 Next milestones:
 

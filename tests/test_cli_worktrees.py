@@ -1,22 +1,26 @@
 """Tests for supervised Git worktree isolation in the CLI."""
 
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
 from agent_workbench.arguments import RuntimeConfiguration
 from agent_workbench.cli import (
+    AUTONOMOUS_MAX_TOOL_ROUNDS,
+    _display_tool_round,
+    _prompt_for_isolated_commit_approval,
+    _prompt_for_tool_approval,
     _prompt_for_worktree_approval,
     main,
 )
-from agent_workbench.errors import CompletionError, ConfigurationError
+from agent_workbench.errors import CompletionError
 from agent_workbench.session import SessionId
 from agent_workbench.tools import ToolApprovalDecision
 from agent_workbench.worktrees import (
     WorktreeAction,
     WorktreeApprovalRequest,
-    WorktreeState,
 )
 
 
@@ -172,253 +176,190 @@ def test_worktree_approval_input_interruption_denies(
     )
 
 
-def configure_isolated_main(
-    monkeypatch,
-    *,
-    state: WorktreeState,
-    enable_actions: bool = False,
-    show_tool_traces: bool = False,
-):
-    """Install deterministic isolation collaborators around main()."""
+def isolated_workflow_result() -> SimpleNamespace:
+    """Create one successful result for CLI presentation tests."""
 
-    runtime = configuration(
-        workspace_root=Path("/source"),
-        worktree_path=Path("/isolated"),
-        worktree_branch="agent/task",
-        enable_actions=enable_actions,
-        show_tool_traces=show_tool_traces,
-    )
-    plan = Mock()
-    plan.preview = creation_request().preview
-    plan.source_head = "a" * 40
-    plan.branch_name = "agent/task"
-    plan.target_display = "../isolated"
-    handle = Mock()
-    handle.branch_name = "agent/task"
-    handle.target_display = "../isolated"
-    handle.worktree_path = Path("/isolated")
-    session = Mock()
-    session.tool_registry = Mock()
-    isolated = Mock()
-    isolated.worktree = handle
-    isolated.session = session
-    removal = Mock()
-    removal.preview = removal_request().preview
-
-    monkeypatch.setattr(
-        "agent_workbench.cli.resolve_runtime_configuration",
-        Mock(return_value=runtime),
-    )
-    monkeypatch.setattr(
-        "agent_workbench.cli.plan_git_worktree",
-        Mock(return_value=plan),
-    )
-    monkeypatch.setattr(
-        "agent_workbench.cli.create_isolated_agent_session",
-        Mock(return_value=isolated),
-    )
-    monkeypatch.setattr(
-        "agent_workbench.cli.inspect_git_worktree",
-        Mock(return_value=state),
-    )
-    monkeypatch.setattr(
-        "agent_workbench.cli.plan_git_worktree_removal",
-        Mock(return_value=removal),
-    )
-    monkeypatch.setattr("agent_workbench.cli.run_cli", Mock())
-    monkeypatch.setattr(
-        "agent_workbench.cli.create_agent_session",
-        Mock(side_effect=AssertionError("source session must not be created")),
+    return SimpleNamespace(
+        worktree=SimpleNamespace(target_display="../isolated"),
+        coding_result=SimpleNamespace(
+            assistant_summary="Corrected and validated the implementation.",
+            tool_round_count=6,
+            validation_succeeded=True,
+            inspected_git_status=True,
+            inspected_git_diff=True,
+        ),
+        commit_result=SimpleNamespace(
+            branch_name="agent/task",
+            new_head="b" * 40,
+            operation_count=2,
+        ),
+        final_worktree_state=SimpleNamespace(clean=True),
     )
 
-    return runtime, plan, handle, session, isolated, removal
 
-
-def test_main_default_path_never_runs_worktree_code(monkeypatch) -> None:
-    """Preserve the exact existing source-session path without isolation options."""
+def test_main_default_path_never_runs_isolated_workflow(monkeypatch) -> None:
+    """Preserve the existing source-session path without isolation options."""
 
     runtime = configuration()
-    session = Mock()
-    session.tool_registry = None
+    session = Mock(tool_registry=None)
     create_session = Mock(return_value=session)
     run_cli = Mock()
-    plan = Mock(side_effect=AssertionError("worktree planning must not run"))
+    isolated_workflow = Mock(
+        side_effect=AssertionError("isolated workflow must not run")
+    )
+    monkeypatch.setattr("agent_workbench.cli.load_environment", Mock())
     monkeypatch.setattr(
         "agent_workbench.cli.resolve_runtime_configuration",
         Mock(return_value=runtime),
     )
     monkeypatch.setattr("agent_workbench.cli.create_agent_session", create_session)
-    monkeypatch.setattr("agent_workbench.cli.plan_git_worktree", plan)
     monkeypatch.setattr("agent_workbench.cli.run_cli", run_cli)
+    monkeypatch.setattr(
+        "agent_workbench.cli.run_isolated_autonomous_workflow",
+        isolated_workflow,
+    )
 
     main([])
 
-    create_session.assert_called_once()
+    create_session.assert_called_once_with(SessionId("cli-session"), runtime)
     run_cli.assert_called_once_with(session, agent_profile=None)
-    plan.assert_not_called()
+    isolated_workflow.assert_not_called()
 
 
-def test_main_creates_one_isolated_session_and_preserves_dirty_worktree(
+@pytest.mark.parametrize(
+    ("show_tool_traces", "expected_observer"),
+    [
+        (False, None),
+        (True, _display_tool_round),
+    ],
+)
+def test_main_delegates_complete_isolated_workflow_once(
     monkeypatch,
     capsys,
+    show_tool_traces,
+    expected_observer,
 ) -> None:
-    """Run the prebuilt session once and preserve dirty output for manual review."""
+    """Forward exact CLI inputs and approval handlers to one orchestrator."""
 
-    state = WorktreeState(
-        registered=True,
-        branch_name="agent/task",
-        head="a" * 40,
-        clean=False,
-        changed_entry_count=2,
-        target_display="../isolated",
-    )
-    runtime, plan, handle, session, isolated, _ = configure_isolated_main(
-        monkeypatch,
-        state=state,
+    runtime = configuration(
+        workspace_root=Path("/source"),
         enable_actions=True,
-        show_tool_traces=True,
+        show_tool_traces=show_tool_traces,
+        worktree_path=Path("/isolated"),
+        worktree_branch="agent/task",
     )
-    create_calls = []
-
-    def create_worktree(supplied_plan, approval_handler):
-        create_calls.append(supplied_plan)
-        assert approval_handler(creation_request()) is ToolApprovalDecision.APPROVE
-        return handle
-
+    workflow = Mock(return_value=isolated_workflow_result())
+    create_session = Mock(
+        side_effect=AssertionError("source session must not be created")
+    )
+    monkeypatch.setattr("agent_workbench.cli.load_environment", Mock())
     monkeypatch.setattr(
-        "agent_workbench.cli.create_git_worktree",
-        create_worktree,
+        "agent_workbench.cli.resolve_runtime_configuration",
+        Mock(return_value=runtime),
     )
-    monkeypatch.setattr("builtins.input", lambda _prompt: "yes")
+    monkeypatch.setattr(
+        "agent_workbench.cli.run_isolated_autonomous_workflow",
+        workflow,
+    )
+    monkeypatch.setattr("agent_workbench.cli.create_agent_session", create_session)
+    arguments = [
+        "--workspace",
+        "/source",
+        "--enable-actions",
+        "--task",
+        "Correct the implementation.",
+        "--worktree-path",
+        "/isolated",
+        "--worktree-branch",
+        "agent/task",
+        "--commit-message",
+        "fix: exact message  ",
+    ]
+    if show_tool_traces:
+        arguments.append("--show-tool-traces")
 
-    main([])
+    main(arguments)
 
-    assert create_calls == [plan]
-    create_isolated = pytest.importorskip(
-        "agent_workbench.cli"
-    ).create_isolated_agent_session
-    create_isolated.assert_called_once_with(
+    workflow.assert_called_once_with(
         SessionId("cli-session"),
         runtime,
-        handle,
+        "agent/task",
+        Path("/isolated"),
+        "Correct the implementation.",
+        "fix: exact message  ",
+        worktree_approval_handler=_prompt_for_worktree_approval,
+        tool_approval_handler=_prompt_for_tool_approval,
+        commit_approval_handler=_prompt_for_isolated_commit_approval,
+        tool_round_observer=expected_observer,
+        max_tool_rounds=AUTONOMOUS_MAX_TOOL_ROUNDS,
     )
-    run_cli = pytest.importorskip("agent_workbench.cli").run_cli
-    run_cli.assert_called_once_with(
-        session,
-        agent_profile=None,
-        show_tool_traces=True,
+    create_session.assert_not_called()
+    output = capsys.readouterr().out
+    assert "Assistant: Corrected and validated the implementation." in output
+    assert "Isolated autonomous workflow result:" in output
+    assert "Worktree: ../isolated" in output
+    assert "Branch: agent/task" in output
+    assert "New isolated HEAD: " + "b" * 40 in output
+    assert "Validation succeeded: yes" in output
+    assert "Git status inspected: yes" in output
+    assert "Git diff inspected: yes" in output
+    assert "Final worktree clean: yes" in output
+    assert "Primary working tree unchanged" in output
+    assert "Worktree and local branch preserved" in output
+    assert "No merge, push, worktree removal, or branch deletion" in output
+
+
+def test_main_reports_isolated_workflow_failure_without_fallback(
+    monkeypatch,
+    capsys,
+) -> None:
+    """Render one safe workflow error without starting a source session."""
+
+    runtime = configuration(
+        workspace_root=Path("/source"),
         enable_actions=True,
+        worktree_path=Path("/isolated"),
+        worktree_branch="agent/task",
     )
-    output = capsys.readouterr().out
-    assert "preserved for manual review" in output
-    assert "../isolated" in output
-    assert "agent/task" in output
-    assert "Changed entries: 2" in output
-    assert "inspect, commit, or clean it manually" in output
-    assert "Remove clean isolated worktree?" not in output
-
-
-@pytest.mark.parametrize("remove_answer", ["yes", "no"])
-def test_main_offers_separate_clean_removal_and_preserves_branch(
-    monkeypatch,
-    capsys,
-    remove_answer,
-) -> None:
-    """Approve or deny clean removal independently after the CLI exits."""
-
-    state = WorktreeState(
-        registered=True,
-        branch_name="agent/task",
-        head="a" * 40,
-        clean=True,
-        changed_entry_count=0,
-        target_display="../isolated",
-    )
-    _, plan, handle, _, _, removal = configure_isolated_main(
-        monkeypatch,
-        state=state,
-    )
-    decisions = []
-
-    def create_worktree(_plan, approval_handler):
-        assert approval_handler(creation_request()) is ToolApprovalDecision.APPROVE
-        return handle
-
-    def remove_worktree(supplied_plan, approval_handler):
-        assert supplied_plan is removal
-        decision = approval_handler(removal_request())
-        decisions.append(decision)
-        if decision is ToolApprovalDecision.DENY:
-            raise CompletionError("Worktree removal approval was denied.")
-
-    monkeypatch.setattr("agent_workbench.cli.create_git_worktree", create_worktree)
-    monkeypatch.setattr("agent_workbench.cli.remove_git_worktree", remove_worktree)
-    answers = iter(["yes", remove_answer])
-    monkeypatch.setattr("builtins.input", lambda _prompt: next(answers))
-
-    main([])
-
-    assert decisions == [
-        (
-            ToolApprovalDecision.APPROVE
-            if remove_answer == "yes"
-            else ToolApprovalDecision.DENY
+    workflow = Mock(
+        side_effect=CompletionError(
+            "Autonomous coding failed. The worktree and local branch were "
+            "preserved for manual recovery."
         )
-    ]
-    output = capsys.readouterr().out
-    if remove_answer == "yes":
-        assert "Clean isolated worktree removed" in output
-        assert "local branch agent/task remains" in output
-    else:
-        assert "approval was denied" in output
-        assert "preserved" in output
-
-
-@pytest.mark.parametrize("failure_point", ["creation", "session", "inspection"])
-def test_main_reports_isolation_failures_without_destructive_recovery(
-    monkeypatch,
-    capsys,
-    failure_point,
-) -> None:
-    """Render safe lifecycle failures and preserve partial or created state."""
-
-    state = WorktreeState(
-        registered=True,
-        branch_name="agent/task",
-        head="a" * 40,
-        clean=True,
-        changed_entry_count=0,
-        target_display="../isolated",
     )
-    _, _, handle, _, _, _ = configure_isolated_main(monkeypatch, state=state)
+    create_session = Mock(
+        side_effect=AssertionError("source session must not be created")
+    )
+    monkeypatch.setattr("agent_workbench.cli.load_environment", Mock())
+    monkeypatch.setattr(
+        "agent_workbench.cli.resolve_runtime_configuration",
+        Mock(return_value=runtime),
+    )
+    monkeypatch.setattr(
+        "agent_workbench.cli.run_isolated_autonomous_workflow",
+        workflow,
+    )
+    monkeypatch.setattr("agent_workbench.cli.create_agent_session", create_session)
 
-    def create_worktree(_plan, approval_handler):
-        assert approval_handler(creation_request()) is ToolApprovalDecision.APPROVE
-        if failure_point == "creation":
-            raise CompletionError("partial state was preserved for manual recovery.")
-        return handle
+    main(
+        [
+            "--workspace",
+            "/source",
+            "--enable-actions",
+            "--task",
+            "Correct the implementation.",
+            "--worktree-path",
+            "/isolated",
+            "--worktree-branch",
+            "agent/task",
+            "--commit-message",
+            "fix: exact",
+        ]
+    )
 
-    monkeypatch.setattr("agent_workbench.cli.create_git_worktree", create_worktree)
-    if failure_point == "session":
-        monkeypatch.setattr(
-            "agent_workbench.cli.create_isolated_agent_session",
-            Mock(
-                side_effect=ConfigurationError(
-                    "worktree ../isolated was preserved for manual recovery."
-                )
-            ),
-        )
-    elif failure_point == "inspection":
-        monkeypatch.setattr(
-            "agent_workbench.cli.inspect_git_worktree",
-            Mock(side_effect=CompletionError("worktree state is ambiguous.")),
-        )
-    monkeypatch.setattr("builtins.input", lambda _prompt: "yes")
-
-    main([])
-
+    create_session.assert_not_called()
     output = capsys.readouterr().out
-    assert "preserved" in output or "ambiguous" in output
+    assert "Isolated autonomous workflow error:" in output
+    assert "preserved for manual recovery" in output
     assert "Traceback" not in output
-    assert "/source" not in output
-    assert "Target: /isolated" not in output
+    assert "Isolated autonomous workflow result:" not in output

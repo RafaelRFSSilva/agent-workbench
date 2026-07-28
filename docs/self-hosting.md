@@ -1,10 +1,11 @@
 # Self-Hosting Agent Workbench Development
 
-This playbook uses the local `gpt-oss:20b` model for one bounded coding task
-inside a separately approved Git worktree. The model may inspect, edit, format,
-lint, test, and review the isolated workspace. Worktree creation, the final
-local commit, and optional clean removal remain operator-side lifecycle
-actions. Pushes and Pull Requests remain manual.
+This playbook uses the local `gpt-oss:20b` model for one bounded autonomous
+coding task inside a separately approved Git worktree. The model may inspect,
+edit, format, lint, test, and review the isolated workspace. Worktree creation,
+controlled actions, and the final local commit remain explicitly approved. The
+workflow preserves the worktree and local branch after success. Pushes and Pull
+Requests remain manual.
 
 The primary repository must be completely clean before launch. Do not use this
 workflow as a substitute for external review of security-sensitive or
@@ -15,23 +16,22 @@ repository-lifecycle changes.
 1. Sync `main` manually.
 2. When changing Agent Workbench itself, create the Agent Workbench feature
    branch manually.
-3. Launch Agent Workbench with a separate absent sibling worktree and new local
-   isolated branch.
-4. Give `gpt-oss:20b` one bounded atomic task.
+3. Choose one bounded atomic task, one exact commit message, one absent sibling
+   worktree path, and one new local isolated branch.
+4. Launch the complete isolated autonomous workflow.
 5. Require repository and named-file inspection before editing.
 6. Require one `apply_workspace_changes` invocation containing every planned
    file.
 7. Review the complete transaction preview and diffs.
 8. Approve Ruff format, Ruff check, and pytest separately.
-9. Require Git status and complete diff inspection.
-10. Exit the session.
-11. Enter the exact commit message at the operator prompt.
-12. Review the immutable commit preview, exact path set, and every complete
-    diff.
-13. Approve the isolated local commit once.
-14. Preserve the local branch and commit; optionally approve clean worktree
-    removal separately.
-15. Push and create a Pull Request manually only after external review.
+9. Require successful Ruff and pytest evidence plus Git status and complete diff
+   inspection.
+10. Review the immutable commit preview, exact CLI-supplied message, exact path
+    set, and every complete diff.
+11. Approve the isolated local commit once.
+12. Require the workflow to verify the new commit and a clean isolated worktree.
+13. Preserve the worktree, local branch, and commit for external review.
+14. Push and create a Pull Request manually only after external review.
 
 ## Recommended launch command
 
@@ -43,16 +43,19 @@ uv run agent-workbench \
   --model gpt-oss:20b \
   --agent developer \
   --workspace . \
+  --enable-actions \
+  --task "<BOUNDED_TASK>" \
   --worktree-path ../agent-workbench-task \
   --worktree-branch agent/task-name \
-  --enable-actions \
+  --commit-message "<COMMIT_MESSAGE>" \
   --show-tool-traces
 ```
 
 The worktree target must be absent, its parent must already exist, and the
-branch must be a new local branch. Worktree isolation does not enable actions
-implicitly. Keep `--enable-actions` only when the task genuinely requires
-writes or validation commands.
+branch must be a new local branch. Isolated execution requires `--workspace`,
+`--enable-actions`, `--task`, both worktree options, and `--commit-message`.
+The task and commit message are supplied before worktree creation; they are not
+requested interactively after the coding session.
 
 ## Reusable local-agent prompt template
 
@@ -103,13 +106,13 @@ Stop and report:
 - Ruff results;
 - exact changed files;
 - complete diff review findings;
-- remaining risks;
-- proposed commit message: <COMMIT_MESSAGE>.
+- remaining risks.
 ```
 
-The operator, not the model, enters `<COMMIT_MESSAGE>` after the session exits.
-Do not place secrets, credentials, private paths, or `.env` values in the task
-prompt.
+The operator supplies `<COMMIT_MESSAGE>` through `--commit-message` before the
+workflow starts. The model must not create, amend, merge, push, remove a
+worktree, or delete a branch independently. Do not place secrets, credentials,
+private paths, or `.env` values in the task prompt or commit message.
 
 ## What the operator must verify at approvals
 
@@ -155,7 +158,7 @@ Provide this compact evidence bundle without secrets:
 - Ruff format and check results.
 - Transaction preview path/count summary.
 - Final `git diff --stat` and complete diff review findings.
-- Proposed exact commit message.
+- Approved exact commit message and new isolated HEAD.
 - Local-agent final response.
 - Every denied or failed action and the preserved recovery state.
 

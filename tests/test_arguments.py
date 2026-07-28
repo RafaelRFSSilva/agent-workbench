@@ -652,6 +652,7 @@ def test_worktree_isolation_options_are_absent_by_default() -> None:
 
     assert arguments.worktree_path is None
     assert arguments.worktree_branch is None
+    assert arguments.commit_message is None
     assert configuration.worktree_path is None
     assert configuration.worktree_branch is None
 
@@ -705,7 +706,12 @@ def test_parse_worktree_branch_rejects_blank_values() -> None:
     [
         (Path("../target"), None, Path("."), "supplied together"),
         (None, "agent/task", Path("."), "supplied together"),
-        (Path("../target"), "agent/task", None, "require --workspace"),
+        (
+            Path("../target"),
+            "agent/task",
+            None,
+            "--enable-actions requires --workspace",
+        ),
     ],
 )
 def test_runtime_configuration_rejects_incomplete_worktree_isolation(
@@ -721,7 +727,10 @@ def test_runtime_configuration_rejects_incomplete_worktree_isolation(
             CLIArguments(
                 provider_name="ollama",
                 model_name="test-model",
+                task_prompt="Correct the implementation.",
+                commit_message="fix: correct implementation",
                 workspace_root=workspace_root,
+                enable_actions=True,
                 worktree_path=worktree_path,
                 worktree_branch=worktree_branch,
             )
@@ -736,6 +745,8 @@ def test_runtime_configuration_preserves_complete_worktree_isolation() -> None:
         CLIArguments(
             provider_name="ollama",
             model_name="test-model",
+            task_prompt="Correct the implementation.",
+            commit_message="fix: correct implementation",
             workspace_root=Path("."),
             worktree_path=target,
             worktree_branch="agent/task",
@@ -816,6 +827,10 @@ def test_runtime_configuration_disables_tools_by_default() -> None:
         ],
         [
             "--show-tool-traces",
+        ],
+        [
+            "--commit-message",
+            "fix: exact",
         ],
     ],
 )
@@ -899,6 +914,28 @@ def test_parse_cli_arguments_rejects_blank_autonomous_task() -> None:
     assert exc_info.value.code == 2
 
 
+def test_parse_cli_arguments_preserves_exact_commit_message() -> None:
+    """Preserve the exact non-blank isolated commit message."""
+
+    arguments = parse_cli_arguments(
+        [
+            "--commit-message",
+            "  fix: preserve exact spacing  ",
+        ]
+    )
+
+    assert arguments.commit_message == "  fix: preserve exact spacing  "
+
+
+def test_parse_cli_arguments_rejects_blank_commit_message() -> None:
+    """Reject isolated commit messages containing only whitespace."""
+
+    with pytest.raises(SystemExit) as exc_info:
+        parse_cli_arguments(["--commit-message", "   "])
+
+    assert exc_info.value.code == 2
+
+
 def test_autonomous_task_requires_actions() -> None:
     """Require explicit action enablement for autonomous coding."""
 
@@ -928,6 +965,65 @@ def test_autonomous_task_actions_require_workspace() -> None:
                 provider_name="ollama",
                 model_name="gpt-oss:20b",
                 task_prompt="Correct the implementation.",
+                enable_actions=True,
+            )
+        )
+
+
+def test_worktree_isolation_requires_autonomous_task() -> None:
+    """Reject the removed interactive worktree mode."""
+
+    with pytest.raises(
+        ConfigurationError,
+        match="Worktree isolation options require --task",
+    ):
+        resolve_runtime_configuration(
+            CLIArguments(
+                provider_name="ollama",
+                model_name="gpt-oss:20b",
+                commit_message="fix: exact",
+                workspace_root=Path("."),
+                enable_actions=True,
+                worktree_path=Path("../task-worktree"),
+                worktree_branch="agent/task",
+            )
+        )
+
+
+def test_worktree_isolation_requires_commit_message() -> None:
+    """Require the final exact commit message before isolated execution."""
+
+    with pytest.raises(
+        ConfigurationError,
+        match="Worktree isolation options require --commit-message",
+    ):
+        resolve_runtime_configuration(
+            CLIArguments(
+                provider_name="ollama",
+                model_name="gpt-oss:20b",
+                task_prompt="Correct the implementation.",
+                workspace_root=Path("."),
+                enable_actions=True,
+                worktree_path=Path("../task-worktree"),
+                worktree_branch="agent/task",
+            )
+        )
+
+
+def test_commit_message_requires_worktree_isolation() -> None:
+    """Reject a commit message outside the isolated autonomous workflow."""
+
+    with pytest.raises(
+        ConfigurationError,
+        match="--commit-message requires --worktree-path and --worktree-branch",
+    ):
+        resolve_runtime_configuration(
+            CLIArguments(
+                provider_name="ollama",
+                model_name="gpt-oss:20b",
+                task_prompt="Correct the implementation.",
+                commit_message="fix: exact",
+                workspace_root=Path("."),
                 enable_actions=True,
             )
         )
