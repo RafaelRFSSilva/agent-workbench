@@ -577,6 +577,7 @@ uv run agent-workbench \
   --agent developer \
   --workspace /path/to/project \
   --enable-actions \
+  --max-tool-rounds 32 \
   --show-tool-traces \
   --task "Inspect the project, fix the defect with the smallest necessary change, run Ruff and pytest, inspect the final Git status and diff, and report the result."
 ```
@@ -584,8 +585,10 @@ uv run agent-workbench \
 `--task` requires both `--workspace` and `--enable-actions`. It cannot be
 combined with `--setup`.
 
-The coding loop is bounded by a fixed maximum number of tool rounds. The model
-may use the available read-only workspace tools, request structured file
+The coding loop is bounded to 16 tool rounds by default. Use the optional
+positive integer `--max-tool-rounds` value with `--task` to choose a different
+limit for either normal or isolated autonomous execution. The model may use the
+available read-only workspace tools, request structured file
 changes, run the fixed Ruff and pytest commands, and inspect Git status and
 diff. Every file change and validation command remains default-deny and
 requires approval for that exact invocation.

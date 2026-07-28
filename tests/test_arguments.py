@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from agent_workbench.arguments import (
+    DEFAULT_AUTONOMOUS_MAX_TOOL_ROUNDS,
     CLIArguments,
     parse_cli_arguments,
     resolve_runtime_configuration,
@@ -527,6 +528,7 @@ def test_tools_are_disabled_by_default() -> None:
     assert arguments.enable_actions is False
     assert arguments.workspace_root is None
     assert arguments.show_tool_traces is False
+    assert arguments.max_tool_rounds is None
 
 
 def test_parse_cli_arguments_accepts_workspace_paths() -> None:
@@ -832,6 +834,10 @@ def test_runtime_configuration_disables_tools_by_default() -> None:
             "--commit-message",
             "fix: exact",
         ],
+        [
+            "--max-tool-rounds",
+            "32",
+        ],
     ],
 )
 def test_interactive_setup_rejects_configuration_arguments(
@@ -890,6 +896,81 @@ def test_runtime_configuration_loads_response_format_file(
     assert configuration.response_format is not None
     assert configuration.response_format.name == "software_review"
     assert configuration.response_format.schema == schema
+
+
+def test_autonomous_tool_rounds_use_the_default_when_omitted() -> None:
+    """Resolve the established autonomous limit without changing parse defaults."""
+
+    arguments = parse_cli_arguments([])
+    configuration = resolve_runtime_configuration(
+        CLIArguments(
+            provider_name="ollama",
+            model_name="gpt-oss:20b",
+        )
+    )
+
+    assert arguments.max_tool_rounds is None
+    assert configuration.max_tool_rounds == DEFAULT_AUTONOMOUS_MAX_TOOL_ROUNDS == 16
+
+
+def test_parse_and_resolve_custom_autonomous_tool_round_limit() -> None:
+    """Parse and preserve one explicit positive autonomous round limit."""
+
+    arguments = parse_cli_arguments(
+        [
+            "--provider",
+            "ollama",
+            "--model",
+            "gpt-oss:20b",
+            "--workspace",
+            ".",
+            "--enable-actions",
+            "--task",
+            "Correct the implementation.",
+            "--max-tool-rounds",
+            "32",
+        ]
+    )
+    configuration = resolve_runtime_configuration(arguments)
+
+    assert arguments.max_tool_rounds == 32
+    assert configuration.max_tool_rounds == 32
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "0",
+        "-1",
+        "1.5",
+        "invalid",
+    ],
+)
+def test_parse_cli_arguments_rejects_invalid_tool_round_limits(
+    value: str,
+) -> None:
+    """Reject non-positive and non-integer autonomous round limits."""
+
+    with pytest.raises(SystemExit) as exc_info:
+        parse_cli_arguments(["--max-tool-rounds", value])
+
+    assert exc_info.value.code == 2
+
+
+def test_max_tool_rounds_requires_autonomous_task() -> None:
+    """Reject explicit autonomous limits outside task mode."""
+
+    with pytest.raises(
+        ConfigurationError,
+        match="--max-tool-rounds requires --task",
+    ):
+        resolve_runtime_configuration(
+            CLIArguments(
+                provider_name="ollama",
+                model_name="gpt-oss:20b",
+                max_tool_rounds=32,
+            )
+        )
 
 
 def test_parse_cli_arguments_accepts_autonomous_task() -> None:

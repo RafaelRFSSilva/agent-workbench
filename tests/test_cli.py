@@ -4,7 +4,11 @@ from pathlib import Path
 from unittest.mock import call, Mock
 
 from agent_workbench.built_in_tools import create_built_in_tool_registry
-from agent_workbench.cli import main, run_cli as run_session_cli
+from agent_workbench.cli import (
+    AUTONOMOUS_MAX_TOOL_ROUNDS,
+    main,
+    run_cli as run_session_cli,
+)
 from agent_workbench.arguments import RuntimeConfiguration
 from agent_workbench.context import ContextDocument
 from agent_workbench.errors import CompletionError, ConfigurationError
@@ -1234,6 +1238,7 @@ def test_main_forwards_tool_traces_to_autonomous_task(
     )
     runner_mock = Mock(return_value=result)
     trace_mock = Mock()
+    create_session_mock = Mock(return_value=session)
 
     monkeypatch.setattr("agent_workbench.cli.load_environment", Mock())
     monkeypatch.setattr(
@@ -1242,7 +1247,7 @@ def test_main_forwards_tool_traces_to_autonomous_task(
     )
     monkeypatch.setattr(
         "agent_workbench.cli.create_agent_session",
-        Mock(return_value=session),
+        create_session_mock,
     )
     monkeypatch.setattr(
         "agent_workbench.cli.run_autonomous_coding_task",
@@ -1264,12 +1269,72 @@ def test_main_forwards_tool_traces_to_autonomous_task(
         ]
     )
 
+    create_session_mock.assert_called_once_with(
+        SessionId("cli-session"),
+        configuration,
+        max_tool_rounds=AUTONOMOUS_MAX_TOOL_ROUNDS,
+    )
     assert runner_mock.call_args.args == (
         session,
         "Fix the defect.",
     )
     assert callable(runner_mock.call_args.kwargs["tool_approval_handler"])
     assert runner_mock.call_args.kwargs["tool_round_observer"] is trace_mock
+
+
+def test_main_forwards_custom_tool_round_limit_to_autonomous_session(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """Forward one resolved custom limit only to an autonomous session."""
+
+    configuration = RuntimeConfiguration(
+        provider_name="ollama",
+        model_name="test-model",
+        workspace_root=tmp_path,
+        enable_actions=True,
+        max_tool_rounds=32,
+    )
+    session = Mock()
+    create_session_mock = Mock(return_value=session)
+    run_configured_mock = Mock()
+
+    monkeypatch.setattr("agent_workbench.cli.load_environment", Mock())
+    monkeypatch.setattr(
+        "agent_workbench.cli.resolve_runtime_configuration",
+        Mock(return_value=configuration),
+    )
+    monkeypatch.setattr(
+        "agent_workbench.cli.create_agent_session",
+        create_session_mock,
+    )
+    monkeypatch.setattr(
+        "agent_workbench.cli._run_configured_cli",
+        run_configured_mock,
+    )
+
+    main(
+        [
+            "--workspace",
+            str(tmp_path),
+            "--enable-actions",
+            "--task",
+            "Fix the defect.",
+            "--max-tool-rounds",
+            "32",
+        ]
+    )
+
+    create_session_mock.assert_called_once_with(
+        SessionId("cli-session"),
+        configuration,
+        max_tool_rounds=32,
+    )
+    run_configured_mock.assert_called_once_with(
+        session,
+        configuration,
+        task_prompt="Fix the defect.",
+    )
 
 
 def test_main_reports_invalid_workspace_configuration(

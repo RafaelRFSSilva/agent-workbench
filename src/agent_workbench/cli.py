@@ -5,6 +5,7 @@ from collections.abc import Sequence
 
 from agent_workbench.agents import AgentProfile
 from agent_workbench.arguments import (
+    DEFAULT_AUTONOMOUS_MAX_TOOL_ROUNDS,
     RuntimeConfiguration,
     parse_cli_arguments,
     resolve_runtime_configuration,
@@ -35,7 +36,7 @@ from agent_workbench.worktrees import (
 )
 
 EXIT_COMMANDS = {"/exit", "/quit"}
-AUTONOMOUS_MAX_TOOL_ROUNDS = 16
+AUTONOMOUS_MAX_TOOL_ROUNDS = DEFAULT_AUTONOMOUS_MAX_TOOL_ROUNDS
 
 
 def run_cli(
@@ -145,7 +146,7 @@ def main(
             session = create_agent_session(
                 SessionId("cli-session"),
                 runtime_configuration,
-                max_tool_rounds=AUTONOMOUS_MAX_TOOL_ROUNDS,
+                max_tool_rounds=runtime_configuration.max_tool_rounds,
             )
     except ConfigurationError as exc:
         print(f"Configuration error: {exc}")
@@ -273,7 +274,7 @@ def _run_isolated_autonomous_task(
             tool_approval_handler=_prompt_for_tool_approval,
             commit_approval_handler=_prompt_for_isolated_commit_approval,
             tool_round_observer=observer,
-            max_tool_rounds=AUTONOMOUS_MAX_TOOL_ROUNDS,
+            max_tool_rounds=runtime_configuration.max_tool_rounds,
         )
     except (
         CompletionError,
