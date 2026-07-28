@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from agent_workbench.errors import (
     CompletionError,
     ConfigurationError,
+    ToolArgumentError,
     WorkspacePathError,
 )
 from agent_workbench.tools import (
@@ -126,6 +127,21 @@ class ToolRegistry:
                 invocation_id=invocation.id,
                 status="success",
                 output=output,
+            )
+        except ToolArgumentError as exc:
+            return ToolResult(
+                invocation_id=invocation.id,
+                status="error",
+                error=f"Invalid tool arguments: {exc}",
+            )
+        except WorkspacePathError:
+            return ToolResult(
+                invocation_id=invocation.id,
+                status="error",
+                error=(
+                    "Invalid tool arguments: workspace path is unavailable "
+                    "or outside the authorized workspace."
+                ),
             )
         except CompletionError:
             if registration.propagates_completion_errors:

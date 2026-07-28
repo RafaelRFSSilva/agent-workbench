@@ -2,7 +2,11 @@
 
 import pytest
 
-from agent_workbench.errors import ConfigurationError
+from agent_workbench.errors import (
+    ConfigurationError,
+    ToolArgumentError,
+    WorkspacePathError,
+)
 from agent_workbench.tool_registry import ToolRegistry
 from agent_workbench.tools import ToolDefinition, ToolInvocation, ToolResult
 
@@ -141,11 +145,20 @@ def test_execute_returns_error_result_for_unknown_tool() -> None:
     )
 
 
-def test_execute_returns_safe_error_result_for_handler_exception() -> None:
-    """Do not expose handler exception details through tool results."""
+@pytest.mark.parametrize(
+    "exception",
+    [
+        RuntimeError("sensitive internal detail"),
+        ValueError("sensitive validation detail"),
+    ],
+)
+def test_execute_returns_safe_error_result_for_handler_exception(
+    exception: Exception,
+) -> None:
+    """Do not expose untrusted handler exception details through tool results."""
 
     def fail(arguments: dict[str, object]) -> None:
-        raise RuntimeError("sensitive internal detail")
+        raise exception
 
     registry = ToolRegistry()
     registry.register(
@@ -166,6 +179,66 @@ def test_execute_returns_safe_error_result_for_handler_exception() -> None:
         status="error",
         error="Tool execution failed.",
     )
+
+
+def test_execute_returns_explicit_safe_tool_argument_error() -> None:
+    """Return only deliberately classified recoverable argument details."""
+
+    def fail(arguments: dict[str, object]) -> None:
+        raise ToolArgumentError("calculator expression must be valid.")
+
+    registry = ToolRegistry()
+    registry.register(
+        create_calculator_definition(),
+        fail,
+    )
+
+    result = registry.execute(
+        ToolInvocation(
+            id="call-123",
+            tool_name="calculator",
+            arguments={},
+        )
+    )
+
+    assert result == ToolResult(
+        invocation_id="call-123",
+        status="error",
+        error=("Invalid tool arguments: calculator expression must be valid."),
+    )
+
+
+def test_execute_returns_static_workspace_path_error() -> None:
+    """Hide workspace resolution details behind one recoverable message."""
+
+    def fail(arguments: dict[str, object]) -> None:
+        raise WorkspacePathError(
+            "sensitive path /home/example/private.txt resolves outside workspace"
+        )
+
+    registry = ToolRegistry()
+    registry.register(
+        create_calculator_definition(),
+        fail,
+    )
+
+    result = registry.execute(
+        ToolInvocation(
+            id="call-123",
+            tool_name="calculator",
+            arguments={},
+        )
+    )
+
+    assert result == ToolResult(
+        invocation_id="call-123",
+        status="error",
+        error=(
+            "Invalid tool arguments: workspace path is unavailable "
+            "or outside the authorized workspace."
+        ),
+    )
+    assert "/home/example/private.txt" not in str(result)
 
 
 @pytest.mark.parametrize(

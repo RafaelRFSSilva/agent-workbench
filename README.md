@@ -409,7 +409,11 @@ paths, traversal, prefix-confusion paths, and symlinks escaping the root are
 rejected; symlinks that resolve within the root remain available. `list_files`
 returns sorted direct children, including hidden entries, with a 128-entry
 limit. `read_file` returns UTF-8 files up to 100 KiB using canonical relative
-paths.
+paths. Deliberately classified input failures return concise
+`Invalid tool arguments: ...` diagnostics so a model can correct its next
+invocation. Workspace resolution failures use one static diagnostic that does
+not expose filesystem details, while unexpected handler failures remain the
+generic `Tool execution failed.` error.
 
 `search_text` performs literal recursive search in deterministic
 workspace-relative order, including hidden entries but never following

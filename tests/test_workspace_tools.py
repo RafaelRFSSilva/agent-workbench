@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_workbench.errors import WorkspacePathError
+from agent_workbench.errors import ToolArgumentError, WorkspacePathError
 from agent_workbench.tool_registry import ToolRegistry
 from agent_workbench.tools import ToolDefinition, ToolInvocation
 from agent_workbench.workspace import Workspace
@@ -242,7 +242,7 @@ def test_rejects_listing_a_file(tmp_path: Path) -> None:
     root, workspace = create_workspace(tmp_path)
     (root / "notes.txt").write_text("notes", encoding="utf-8")
 
-    with pytest.raises(ValueError, match="list_files requires a directory"):
+    with pytest.raises(ValueError, match="list_files path must reference a directory"):
         list_workspace_files(workspace, {"path": "notes.txt"})
 
 
@@ -357,7 +357,10 @@ def test_rejects_partial_read_start_past_the_file_end(
 @pytest.mark.parametrize(
     "arguments, message",
     [
-        ({"path": "notes.txt", "unknown": 1}, "valid read arguments"),
+        (
+            {"path": "notes.txt", "unknown": 1},
+            "accepts only path, line_start, and line_end",
+        ),
         ({"path": "notes.txt", "line_start": 0}, "line_start"),
         ({"path": "notes.txt", "line_start": -1}, "line_start"),
         ({"path": "notes.txt", "line_start": True}, "line_start"),
@@ -426,7 +429,9 @@ def test_rejects_reading_a_directory(tmp_path: Path) -> None:
     root, workspace = create_workspace(tmp_path)
     (root / "docs").mkdir()
 
-    with pytest.raises(ValueError, match="read_file requires a regular file"):
+    with pytest.raises(
+        ValueError, match="read_file path must reference a regular file"
+    ):
         read_workspace_file(workspace, {"path": "docs"})
 
 
@@ -563,6 +568,101 @@ def test_registry_handler_returns_partial_read_metadata(tmp_path: Path) -> None:
         "total_lines": 3,
         "truncated": True,
     }
+
+
+def test_registry_returns_recoverable_list_files_argument_error(
+    tmp_path: Path,
+) -> None:
+    """Return a safe correctable error for invalid list_files arguments."""
+
+    _, workspace = create_workspace(tmp_path)
+    registry = ToolRegistry()
+    register_workspace_tools(registry, workspace)
+
+    result = registry.execute(
+        ToolInvocation(
+            id="list-invalid-1",
+            tool_name="list_files",
+            arguments={"path": ".", "depth": 1},
+        )
+    )
+
+    assert result.status == "error"
+    assert result.error == (
+        "Invalid tool arguments: list_files accepts only one path string argument."
+    )
+
+
+def test_registry_returns_recoverable_read_file_range_error(
+    tmp_path: Path,
+) -> None:
+    """Explain an excessive inclusive line range without internal details."""
+
+    root, workspace = create_workspace(tmp_path)
+    (root / "notes.txt").write_text("notes\n", encoding="utf-8")
+    registry = ToolRegistry()
+    register_workspace_tools(registry, workspace)
+
+    result = registry.execute(
+        ToolInvocation(
+            id="read-invalid-1",
+            tool_name="read_file",
+            arguments={
+                "path": "notes.txt",
+                "line_start": 1,
+                "line_end": MAX_READ_LINES + 1,
+            },
+        )
+    )
+
+    assert result.status == "error"
+    assert result.error == (
+        "Invalid tool arguments: "
+        f"read_file ranges must not exceed {MAX_READ_LINES} lines."
+    )
+
+
+def test_registry_returns_static_workspace_resolution_error(
+    tmp_path: Path,
+) -> None:
+    """Do not expose traversal targets through recoverable workspace errors."""
+
+    _, workspace = create_workspace(tmp_path)
+    registry = ToolRegistry()
+    register_workspace_tools(registry, workspace)
+
+    result = registry.execute(
+        ToolInvocation(
+            id="read-outside-1",
+            tool_name="read_file",
+            arguments={"path": "../private.txt"},
+        )
+    )
+
+    assert result.status == "error"
+    assert result.error == (
+        "Invalid tool arguments: workspace path is unavailable "
+        "or outside the authorized workspace."
+    )
+    assert "../private.txt" not in str(result)
+
+
+def test_workspace_validation_uses_explicit_tool_argument_error(
+    tmp_path: Path,
+) -> None:
+    """Classify only intentionally safe workspace validation failures."""
+
+    root, workspace = create_workspace(tmp_path)
+    (root / "notes.txt").write_text("notes\n", encoding="utf-8")
+
+    with pytest.raises(
+        ToolArgumentError,
+        match="line_start must be a positive integer",
+    ):
+        read_workspace_file(
+            workspace,
+            {"path": "notes.txt", "line_start": 0},
+        )
 
 
 def test_handlers_do_not_mutate_arguments_or_returned_data(tmp_path: Path) -> None:
@@ -714,7 +814,7 @@ def test_search_rejects_blank_queries_and_invalid_arguments(tmp_path: Path) -> N
     with pytest.raises(ValueError, match="requires a non-blank query"):
         search_workspace_text(workspace, {"query": "   "})
 
-    with pytest.raises(ValueError, match="requires search arguments"):
+    with pytest.raises(ValueError, match="requires valid search arguments"):
         search_workspace_text(workspace, {"query": "needle", "unknown": True})
 
 

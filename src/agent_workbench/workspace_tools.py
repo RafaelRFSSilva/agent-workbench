@@ -2,6 +2,7 @@
 
 from pathlib import Path
 
+from agent_workbench.errors import ToolArgumentError
 from agent_workbench.tool_registry import ToolRegistry
 from agent_workbench.tools import JSONObject, ToolDefinition
 from agent_workbench.workspace import Workspace
@@ -126,7 +127,7 @@ def list_workspace_files(
     directory_path = workspace.resolve(_get_requested_path("list_files", arguments))
 
     if not directory_path.is_dir():
-        raise ValueError("list_files requires a directory.")
+        raise ToolArgumentError("list_files path must reference a directory.")
 
     try:
         children = sorted(
@@ -137,7 +138,7 @@ def list_workspace_files(
         raise ValueError("Unable to list workspace directory.") from None
 
     if len(children) > MAX_DIRECTORY_ENTRIES:
-        raise ValueError("workspace directory contains too many entries.")
+        raise ToolArgumentError("workspace directory contains too many entries.")
 
     return {
         "path": _workspace_relative_path(workspace, directory_path),
@@ -162,7 +163,7 @@ def read_workspace_file(
     file_path = workspace.resolve(requested_path)
 
     if not file_path.is_file():
-        raise ValueError("read_file requires a regular file.")
+        raise ToolArgumentError("read_file path must reference a regular file.")
 
     try:
         size_bytes = file_path.stat().st_size
@@ -170,7 +171,7 @@ def read_workspace_file(
         raise ValueError("Unable to inspect workspace file.") from None
 
     if size_bytes > MAX_FILE_SIZE_BYTES:
-        raise ValueError(
+        raise ToolArgumentError(
             f"workspace file exceeds the {MAX_FILE_SIZE_BYTES}-byte limit."
         )
 
@@ -181,14 +182,14 @@ def read_workspace_file(
         raise ValueError("Unable to read workspace file.") from None
 
     if len(content_bytes) > MAX_FILE_SIZE_BYTES:
-        raise ValueError(
+        raise ToolArgumentError(
             f"workspace file exceeds the {MAX_FILE_SIZE_BYTES}-byte limit."
         )
 
     try:
         content = content_bytes.decode("utf-8")
     except UnicodeDecodeError:
-        raise ValueError("read_file requires valid UTF-8.") from None
+        raise ToolArgumentError("read_file requires valid UTF-8.") from None
 
     result: JSONObject = {
         "path": _workspace_relative_path(workspace, file_path),
@@ -284,12 +285,12 @@ def _get_requested_path(tool_name: str, arguments: object) -> Path:
     """Validate and convert a tool path argument."""
 
     if not isinstance(arguments, dict) or set(arguments) != {"path"}:
-        raise ValueError(f"{tool_name} requires a path string.")
+        raise ToolArgumentError(f"{tool_name} accepts only one path string argument.")
 
     path = arguments["path"]
 
     if not isinstance(path, str):
-        raise ValueError(f"{tool_name} requires a path string.")
+        raise ToolArgumentError(f"{tool_name} accepts only one path string argument.")
 
     return Path(path)
 
@@ -306,14 +307,16 @@ def _get_read_arguments(
         or "path" not in arguments
         or set(arguments) - allowed_fields
     ):
-        raise ValueError("read_file requires valid read arguments.")
+        raise ToolArgumentError(
+            "read_file accepts only path, line_start, and line_end, with path required."
+        )
 
     path = arguments["path"]
     line_start = arguments.get("line_start")
     line_end = arguments.get("line_end")
 
     if not isinstance(path, str):
-        raise ValueError("read_file requires a path string.")
+        raise ToolArgumentError("read_file path must be a string.")
 
     for field_name, value in (
         ("line_start", line_start),
@@ -322,15 +325,19 @@ def _get_read_arguments(
         if value is not None and (
             not isinstance(value, int) or isinstance(value, bool) or value < 1
         ):
-            raise ValueError(f"read_file {field_name} must be a positive integer.")
+            raise ToolArgumentError(
+                f"read_file {field_name} must be a positive integer."
+            )
 
     resolved_start = line_start or 1
 
     if line_end is not None and line_end < resolved_start:
-        raise ValueError("read_file line_end must not be before line_start.")
+        raise ToolArgumentError("read_file line_end must not be before line_start.")
 
     if line_end is not None and line_end - resolved_start + 1 > MAX_READ_LINES:
-        raise ValueError(f"read_file ranges must not exceed {MAX_READ_LINES} lines.")
+        raise ToolArgumentError(
+            f"read_file ranges must not exceed {MAX_READ_LINES} lines."
+        )
 
     return Path(path), line_start, line_end
 
@@ -349,7 +356,9 @@ def _slice_file_content(
     requested_end = line_end or resolved_start + MAX_READ_LINES - 1
 
     if resolved_start > total_lines:
-        raise ValueError("read_file line_start exceeds the total file line count.")
+        raise ToolArgumentError(
+            "read_file line_start exceeds the total file line count."
+        )
 
     selected_lines = lines[resolved_start - 1 : requested_end]
     returned_end = resolved_start + len(selected_lines) - 1
@@ -361,18 +370,18 @@ def _get_search_arguments(arguments: object) -> tuple[str, Path, bool]:
     """Validate and normalize portable search arguments."""
 
     if not isinstance(arguments, dict) or not {"query"} <= set(arguments):
-        raise ValueError("search_text requires search arguments.")
+        raise ToolArgumentError("search_text requires valid search arguments.")
 
     if set(arguments) - {"query", "path", "case_sensitive"}:
-        raise ValueError("search_text requires search arguments.")
+        raise ToolArgumentError("search_text requires valid search arguments.")
 
     query = arguments["query"]
 
     if not isinstance(query, str) or not query.strip():
-        raise ValueError("search_text requires a non-blank query.")
+        raise ToolArgumentError("search_text requires a non-blank query.")
 
     if len(query) > MAX_SEARCH_QUERY_LENGTH:
-        raise ValueError(
+        raise ToolArgumentError(
             f"search query exceeds the {MAX_SEARCH_QUERY_LENGTH}-character limit."
         )
 
@@ -380,7 +389,7 @@ def _get_search_arguments(arguments: object) -> tuple[str, Path, bool]:
     case_sensitive = arguments.get("case_sensitive", False)
 
     if not isinstance(path, str) or not isinstance(case_sensitive, bool):
-        raise ValueError("search_text requires search arguments.")
+        raise ToolArgumentError("search_text requires valid search arguments.")
 
     return query, Path(path), case_sensitive
 
@@ -393,7 +402,9 @@ def _iter_search_files(search_path: Path):
         return
 
     if not search_path.is_dir():
-        raise ValueError("search_text requires a regular file or directory.")
+        raise ToolArgumentError(
+            "search_text path must reference a regular file or directory."
+        )
 
     try:
         children = sorted(search_path.iterdir(), key=lambda child: child.name)
