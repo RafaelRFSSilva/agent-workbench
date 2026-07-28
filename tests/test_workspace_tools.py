@@ -12,6 +12,7 @@ from agent_workbench.workspace import Workspace
 from agent_workbench.workspace_tools import (
     MAX_DIRECTORY_ENTRIES,
     MAX_FILE_SIZE_BYTES,
+    MAX_READ_LINES,
     MAX_SEARCH_FILE_BYTES,
     MAX_SEARCH_FILES,
     MAX_SEARCH_LINE_LENGTH,
@@ -64,7 +65,10 @@ def test_registers_workspace_tools_in_order_with_exact_schemas(
     )
     assert tuple(definition.description for definition in registry.definitions) == (
         "List the direct entries of a directory inside the authorized workspace.",
-        "Read a UTF-8 text file inside the authorized workspace.",
+        (
+            "Read all or an inclusive bounded line range from a UTF-8 text file "
+            "inside the authorized workspace."
+        ),
         "Search UTF-8 text files inside the authorized workspace.",
     )
     assert tuple(definition.input_schema for definition in registry.definitions) == (
@@ -83,6 +87,14 @@ def test_registers_workspace_tools_in_order_with_exact_schemas(
             "properties": {
                 "path": {
                     "type": "string",
+                },
+                "line_start": {
+                    "type": "integer",
+                    "minimum": 1,
+                },
+                "line_end": {
+                    "type": "integer",
+                    "minimum": 1,
                 },
             },
             "required": ["path"],
@@ -263,6 +275,133 @@ def test_reads_valid_utf8_with_canonical_relative_path(tmp_path: Path) -> None:
     }
 
 
+def test_reads_an_inclusive_line_range_with_metadata(tmp_path: Path) -> None:
+    """Return exactly the requested inclusive lines and bounded metadata."""
+
+    root, workspace = create_workspace(tmp_path)
+    content = "alpha\nbeta\ngamma\ndelta\n"
+    (root / "notes.txt").write_text(content, encoding="utf-8")
+
+    result = read_workspace_file(
+        workspace,
+        {"path": "notes.txt", "line_start": 2, "line_end": 3},
+    )
+
+    assert result == {
+        "path": "notes.txt",
+        "content": "beta\ngamma\n",
+        "size_bytes": len(content.encode("utf-8")),
+        "line_start": 2,
+        "line_end": 3,
+        "total_lines": 4,
+        "truncated": True,
+    }
+
+
+def test_partial_read_defaults_to_first_line_and_requested_end(
+    tmp_path: Path,
+) -> None:
+    """Start at line one when only an inclusive end line is supplied."""
+
+    root, workspace = create_workspace(tmp_path)
+    content = "alpha\nbeta\ngamma\n"
+    (root / "notes.txt").write_text(content, encoding="utf-8")
+
+    result = read_workspace_file(
+        workspace,
+        {"path": "notes.txt", "line_end": 2},
+    )
+
+    assert result["content"] == "alpha\nbeta\n"
+    assert result["line_start"] == 1
+    assert result["line_end"] == 2
+    assert result["total_lines"] == 3
+    assert result["truncated"] is True
+
+
+def test_partial_read_caps_an_open_ended_range(tmp_path: Path) -> None:
+    """Return at most MAX_READ_LINES when no explicit end line is supplied."""
+
+    root, workspace = create_workspace(tmp_path)
+    lines = [f"line-{index}\n" for index in range(1, MAX_READ_LINES + 3)]
+    content = "".join(lines)
+    (root / "notes.txt").write_text(content, encoding="utf-8")
+
+    result = read_workspace_file(
+        workspace,
+        {"path": "notes.txt", "line_start": 2},
+    )
+
+    assert result["content"] == "".join(lines[1 : MAX_READ_LINES + 1])
+    assert result["line_start"] == 2
+    assert result["line_end"] == MAX_READ_LINES + 1
+    assert result["total_lines"] == MAX_READ_LINES + 2
+    assert result["truncated"] is True
+
+
+def test_rejects_partial_read_start_past_the_file_end(
+    tmp_path: Path,
+) -> None:
+    """Reject a partial range whose first line is beyond the file."""
+
+    root, workspace = create_workspace(tmp_path)
+    (root / "notes.txt").write_text("alpha\nbeta\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="exceeds the total file line count"):
+        read_workspace_file(
+            workspace,
+            {"path": "notes.txt", "line_start": 5, "line_end": 6},
+        )
+
+
+@pytest.mark.parametrize(
+    "arguments, message",
+    [
+        ({"path": "notes.txt", "unknown": 1}, "valid read arguments"),
+        ({"path": "notes.txt", "line_start": 0}, "line_start"),
+        ({"path": "notes.txt", "line_start": -1}, "line_start"),
+        ({"path": "notes.txt", "line_start": True}, "line_start"),
+        ({"path": "notes.txt", "line_start": "1"}, "line_start"),
+        ({"path": "notes.txt", "line_end": 0}, "line_end"),
+        (
+            {"path": "notes.txt", "line_start": 3, "line_end": 2},
+            "must not be before",
+        ),
+    ],
+)
+def test_rejects_invalid_partial_read_arguments(
+    tmp_path: Path,
+    arguments: dict[str, object],
+    message: str,
+) -> None:
+    """Reject unknown, non-integer, non-positive, and reversed ranges."""
+
+    root, workspace = create_workspace(tmp_path)
+    (root / "notes.txt").write_text("notes\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        read_workspace_file(workspace, arguments)
+
+
+def test_rejects_partial_read_ranges_above_the_line_limit(
+    tmp_path: Path,
+) -> None:
+    """Reject explicit ranges whose inclusive span exceeds the limit."""
+
+    root, workspace = create_workspace(tmp_path)
+    (root / "notes.txt").write_text("notes\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="ranges must not exceed"):
+        read_workspace_file(
+            workspace,
+            {
+                "path": "notes.txt",
+                "line_start": 1,
+                "line_end": MAX_READ_LINES + 1,
+            },
+        )
+
+
 def test_reads_through_an_allowed_internal_symlink(tmp_path: Path) -> None:
     """Read an internal symlink through its canonical target path."""
 
@@ -391,6 +530,38 @@ def test_registry_handler_returns_strict_workspace_tool_output(tmp_path: Path) -
         "path": "notes.txt",
         "content": "notes",
         "size_bytes": 5,
+    }
+
+
+def test_registry_handler_returns_partial_read_metadata(tmp_path: Path) -> None:
+    """Execute a partial read_file request through ToolRegistry."""
+
+    root, workspace = create_workspace(tmp_path)
+    (root / "notes.txt").write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
+    registry = ToolRegistry()
+    register_workspace_tools(registry, workspace)
+
+    result = registry.execute(
+        ToolInvocation(
+            id="read-partial-1",
+            tool_name="read_file",
+            arguments={
+                "path": "notes.txt",
+                "line_start": 2,
+                "line_end": 2,
+            },
+        )
+    )
+
+    assert result.status == "success"
+    assert result.output == {
+        "path": "notes.txt",
+        "content": "beta\n",
+        "size_bytes": len("alpha\nbeta\ngamma\n".encode("utf-8")),
+        "line_start": 2,
+        "line_end": 2,
+        "total_lines": 3,
+        "truncated": True,
     }
 
 
