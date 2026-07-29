@@ -1,5 +1,6 @@
 """Tests for safe read-only workspace tools."""
 
+import hashlib
 import os
 from pathlib import Path
 
@@ -67,7 +68,7 @@ def test_registers_workspace_tools_in_order_with_exact_schemas(
         "List the direct entries of a directory inside the authorized workspace.",
         (
             "Read all or an inclusive bounded line range from a UTF-8 text file "
-            "inside the authorized workspace."
+            "inside the authorized workspace and return the complete file SHA-256."
         ),
         "Search UTF-8 text files inside the authorized workspace.",
     )
@@ -272,6 +273,7 @@ def test_reads_valid_utf8_with_canonical_relative_path(tmp_path: Path) -> None:
         "path": "docs/notes.txt",
         "content": "Olá\n",
         "size_bytes": len("Olá\n".encode("utf-8")),
+        "sha256": hashlib.sha256("Olá\n".encode("utf-8")).hexdigest(),
     }
 
 
@@ -291,6 +293,7 @@ def test_reads_an_inclusive_line_range_with_metadata(tmp_path: Path) -> None:
         "path": "notes.txt",
         "content": "beta\ngamma\n",
         "size_bytes": len(content.encode("utf-8")),
+        "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
         "line_start": 2,
         "line_end": 3,
         "total_lines": 4,
@@ -420,6 +423,7 @@ def test_reads_through_an_allowed_internal_symlink(tmp_path: Path) -> None:
         "path": "data/notes.txt",
         "content": "notes",
         "size_bytes": 5,
+        "sha256": hashlib.sha256(b"notes").hexdigest(),
     }
 
 
@@ -502,6 +506,7 @@ def test_reads_a_file_at_the_size_limit(tmp_path: Path) -> None:
 
     assert result["size_bytes"] == MAX_FILE_SIZE_BYTES
     assert result["content"] == "a" * MAX_FILE_SIZE_BYTES
+    assert result["sha256"] == hashlib.sha256(b"a" * MAX_FILE_SIZE_BYTES).hexdigest()
 
 
 def test_rejects_a_file_larger_than_the_size_limit(tmp_path: Path) -> None:
@@ -535,6 +540,7 @@ def test_registry_handler_returns_strict_workspace_tool_output(tmp_path: Path) -
         "path": "notes.txt",
         "content": "notes",
         "size_bytes": 5,
+        "sha256": hashlib.sha256(b"notes").hexdigest(),
     }
 
 
@@ -563,6 +569,7 @@ def test_registry_handler_returns_partial_read_metadata(tmp_path: Path) -> None:
         "path": "notes.txt",
         "content": "beta\n",
         "size_bytes": len("alpha\nbeta\ngamma\n".encode("utf-8")),
+        "sha256": hashlib.sha256("alpha\nbeta\ngamma\n".encode("utf-8")).hexdigest(),
         "line_start": 2,
         "line_end": 2,
         "total_lines": 3,

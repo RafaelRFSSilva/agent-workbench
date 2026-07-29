@@ -1,5 +1,6 @@
 """Tests for approved optimistic single-file workspace patches."""
 
+import hashlib
 import os
 import stat
 from pathlib import Path
@@ -18,16 +19,21 @@ from agent_workbench.tools import (
 from agent_workbench.workspace import Workspace
 from agent_workbench.workspace_actions import (
     APPLY_FILE_PATCH_DEFINITION,
+    APPLY_TEXT_REPLACEMENT_DEFINITION,
     APPLY_WORKSPACE_CHANGES_DEFINITION,
     MAX_CHANGED_LINES,
     MAX_PATCH_CONTENT_BYTES,
+    MAX_TEXT_REPLACEMENT_BYTES,
+    MAX_TEXT_REPLACEMENT_OCCURRENCES,
     MAX_TRANSACTION_CHANGED_LINES,
     MAX_TRANSACTION_EXPECTED_BYTES,
     MAX_TRANSACTION_FILES,
     MAX_TRANSACTION_REPLACEMENT_BYTES,
     apply_file_patch,
+    apply_text_replacement,
     apply_workspace_changes,
     preview_file_patch,
+    preview_text_replacement,
     preview_workspace_changes,
     register_workspace_action_tools,
 )
@@ -73,6 +79,32 @@ def patch_arguments(
     }
 
 
+def text_replacement_arguments(
+    *,
+    path: str = "module.py",
+    expected: str = "value = 1",
+    replacement: str = "value = 2",
+    file_content: str = "value = 1\n",
+    expected_sha256: str | None = None,
+    occurrences: int | None = None,
+) -> dict[str, object]:
+    """Create one valid literal text-replacement argument mapping."""
+
+    arguments: dict[str, object] = {
+        "path": path,
+        "expected_text": expected,
+        "replacement_text": replacement,
+        "expected_file_sha256": (
+            expected_sha256
+            if expected_sha256 is not None
+            else hashlib.sha256(file_content.encode("utf-8")).hexdigest()
+        ),
+    }
+    if occurrences is not None:
+        arguments["expected_occurrences"] = occurrences
+    return arguments
+
+
 def transaction_arguments(
     *changes: dict[str, object],
 ) -> dict[str, object]:
@@ -114,6 +146,46 @@ def invoke_patch(
     )
 
 
+def invoke_text_replacement(
+    registry: ToolRegistry,
+    arguments: dict[str, object],
+    *,
+    decision: ToolApprovalDecision | None,
+    before_approval=None,
+) -> None:
+    """Run one literal replacement through the provider-independent loop."""
+
+    provider = FakeProvider(
+        [
+            ChatResponse(
+                text="",
+                tool_invocations=(
+                    ToolInvocation(
+                        id="replacement-1",
+                        tool_name="apply_text_replacement",
+                        arguments=arguments,
+                    ),
+                ),
+            ),
+            ChatResponse(text="Done."),
+        ]
+    )
+
+    def decide(request):
+        if before_approval is not None:
+            before_approval()
+        assert decision is not None
+        return decision
+
+    run_tool_calling_loop(
+        provider,
+        ChatRequest(messages=[]),
+        registry,
+        max_tool_rounds=1,
+        tool_approval_handler=None if decision is None else decide,
+    )
+
+
 def test_registration_preserves_existing_tools_and_exact_definition(
     tmp_path: Path,
 ) -> None:
@@ -137,6 +209,7 @@ def test_registration_preserves_existing_tools_and_exact_definition(
     assert registry.definitions == (
         existing,
         APPLY_FILE_PATCH_DEFINITION,
+        APPLY_TEXT_REPLACEMENT_DEFINITION,
         APPLY_WORKSPACE_CHANGES_DEFINITION,
     )
     assert APPLY_FILE_PATCH_DEFINITION.name == "apply_file_patch"
@@ -160,6 +233,43 @@ def test_registration_preserves_existing_tools_and_exact_definition(
             id="patch",
             tool_name="apply_file_patch",
             arguments=patch_arguments(),
+        )
+    )
+    assert APPLY_TEXT_REPLACEMENT_DEFINITION.name == "apply_text_replacement"
+    assert APPLY_TEXT_REPLACEMENT_DEFINITION.description == (
+        "Replace a bounded exact literal text fragment in one existing UTF-8 "
+        "file using the SHA-256 digest from read_file."
+    )
+    assert APPLY_TEXT_REPLACEMENT_DEFINITION.input_schema == {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string"},
+            "expected_text": {"type": "string"},
+            "replacement_text": {"type": "string"},
+            "expected_file_sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$",
+            },
+            "expected_occurrences": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": MAX_TEXT_REPLACEMENT_OCCURRENCES,
+                "default": 1,
+            },
+        },
+        "required": [
+            "path",
+            "expected_text",
+            "replacement_text",
+            "expected_file_sha256",
+        ],
+        "additionalProperties": False,
+    }
+    assert registry.requires_approval(
+        ToolInvocation(
+            id="replacement",
+            tool_name="apply_text_replacement",
+            arguments=text_replacement_arguments(),
         )
     )
 
@@ -618,10 +728,380 @@ def test_calls_preserve_cwd_arguments_results_and_registry_isolation(
     assert Path.cwd() == original_cwd
 
 
+def test_text_replacement_preview_is_complete_and_non_mutating(
+    tmp_path: Path,
+) -> None:
+    """Build one complete diff from a small exact literal fragment."""
+
+    root, workspace = create_workspace(tmp_path)
+    target = root / "src" / "module.py"
+    target.parent.mkdir()
+    target.write_text(
+        "def add(left: int, right: int) -> int:\n    return left - right\n",
+        encoding="utf-8",
+    )
+
+    preview = preview_text_replacement(
+        workspace,
+        text_replacement_arguments(
+            path="src/./module.py",
+            expected="return left - right",
+            replacement="return left + right",
+            file_content=(
+                "def add(left: int, right: int) -> int:\n    return left - right\n"
+            ),
+        ),
+    )
+
+    assert preview == {
+        "path": "src/module.py",
+        "operation": "update",
+        "old_size_bytes": 63,
+        "new_size_bytes": 63,
+        "changed_lines": 2,
+        "occurrences_replaced": 1,
+        "diff": (
+            "--- a/src/module.py\n"
+            "+++ b/src/module.py\n"
+            "@@ -1,2 +1,2 @@\n"
+            " def add(left: int, right: int) -> int:\n"
+            "-    return left - right\n"
+            "+    return left + right\n"
+        ),
+    }
+    assert target.read_text(encoding="utf-8").endswith("return left - right\n")
+
+
+def test_text_replacement_applies_exact_multiple_occurrences_and_preserves_mode(
+    tmp_path: Path,
+) -> None:
+    """Replace exactly the declared non-overlapping occurrences atomically."""
+
+    root, workspace = create_workspace(tmp_path)
+    target = root / "module.py"
+    target.write_text("old\nold\nkeep\n", encoding="utf-8")
+    target.chmod(0o640)
+
+    result = apply_text_replacement(
+        workspace,
+        text_replacement_arguments(
+            expected="old",
+            replacement="new",
+            file_content="old\nold\nkeep\n",
+            occurrences=2,
+        ),
+    )
+
+    assert result == {
+        "path": "module.py",
+        "operation": "update",
+        "old_size_bytes": 13,
+        "new_size_bytes": 13,
+        "changed_lines": 4,
+        "occurrences_replaced": 2,
+    }
+    assert target.read_text(encoding="utf-8") == "new\nnew\nkeep\n"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o640
+    assert list(root.glob(".agent-workbench-patch-*")) == []
+
+
+def test_text_replacement_defaults_to_one_occurrence(tmp_path: Path) -> None:
+    """Use one required literal occurrence when the optional count is omitted."""
+
+    root, workspace = create_workspace(tmp_path)
+    target = root / "module.py"
+    target.write_text("before TOKEN after\n", encoding="utf-8")
+
+    result = apply_text_replacement(
+        workspace,
+        text_replacement_arguments(
+            expected="TOKEN",
+            replacement="VALUE",
+            file_content="before TOKEN after\n",
+        ),
+    )
+
+    assert result["occurrences_replaced"] == 1
+    assert target.read_text(encoding="utf-8") == "before VALUE after\n"
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        (
+            {"path": "module.py", "expected_text": "old"},
+            "requires path, expected_text, replacement_text",
+        ),
+        (
+            {
+                "path": "module.py",
+                "expected_text": "old",
+                "replacement_text": "new",
+                "unknown": True,
+            },
+            "requires path, expected_text, replacement_text",
+        ),
+        (
+            text_replacement_arguments(expected="", replacement="new"),
+            "must not be empty",
+        ),
+        (
+            text_replacement_arguments(expected="same", replacement="same"),
+            "must differ",
+        ),
+        (
+            {
+                **text_replacement_arguments(),
+                "expected_file_sha256": "INVALID",
+            },
+            "64 lowercase hexadecimal",
+        ),
+        (
+            {
+                **text_replacement_arguments(),
+                "expected_occurrences": True,
+            },
+            "between 1 and",
+        ),
+        (
+            {
+                **text_replacement_arguments(),
+                "expected_occurrences": 0,
+            },
+            "between 1 and",
+        ),
+        (
+            {
+                **text_replacement_arguments(),
+                "expected_occurrences": MAX_TEXT_REPLACEMENT_OCCURRENCES + 1,
+            },
+            "between 1 and",
+        ),
+    ],
+)
+def test_text_replacement_rejects_invalid_arguments(
+    tmp_path: Path,
+    arguments: dict[str, object],
+    message: str,
+) -> None:
+    """Reject incomplete, ambiguous, no-op, and invalid-count requests."""
+
+    root, workspace = create_workspace(tmp_path)
+    target = root / "module.py"
+    target.write_text("value = 1\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        preview_text_replacement(workspace, arguments)
+
+    assert target.read_text(encoding="utf-8") == "value = 1\n"
+
+
+def test_text_replacement_shared_errors_name_the_current_action(
+    tmp_path: Path,
+) -> None:
+    "Keep reused path and content diagnostics specific to this action."
+
+    root, workspace = create_workspace(tmp_path)
+
+    with pytest.raises(
+        ValueError,
+        match="apply_text_replacement path must not contain traversal",
+    ):
+        preview_text_replacement(
+            workspace,
+            text_replacement_arguments(
+                path="../outside.py",
+                expected="old",
+                replacement="new",
+            ),
+        )
+
+    boundary = "old" + "x" * (MAX_PATCH_CONTENT_BYTES - len("old"))
+    (root / "module.py").write_text(boundary, encoding="utf-8")
+
+    with pytest.raises(
+        ValueError,
+        match="apply_text_replacement replacement_content exceeds",
+    ):
+        preview_text_replacement(
+            workspace,
+            text_replacement_arguments(
+                expected="old",
+                replacement="y" * MAX_TEXT_REPLACEMENT_BYTES,
+                file_content=boundary,
+            ),
+        )
+
+
+def test_text_replacement_rejects_occurrence_mismatch_without_writing(
+    tmp_path: Path,
+) -> None:
+    """Require the exact current occurrence count before preview or execution."""
+
+    root, workspace = create_workspace(tmp_path)
+    target = root / "module.py"
+    target.write_text("TOKEN\nTOKEN\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="expected 1 occurrence.*found 2"):
+        preview_text_replacement(
+            workspace,
+            text_replacement_arguments(
+                expected="TOKEN",
+                replacement="VALUE",
+                file_content="TOKEN\nTOKEN\n",
+            ),
+        )
+
+    assert target.read_text(encoding="utf-8") == "TOKEN\nTOKEN\n"
+
+
+def test_text_replacement_enforces_fragment_changed_line_and_preview_limits(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Bound literal fragments, resulting changes, and complete approval diffs."""
+
+    root, workspace = create_workspace(tmp_path)
+    target = root / "module.py"
+    target.write_text("old\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="expected_text exceeds"):
+        preview_text_replacement(
+            workspace,
+            text_replacement_arguments(
+                expected="x" * (MAX_TEXT_REPLACEMENT_BYTES + 1),
+                replacement="new",
+            ),
+        )
+
+    monkeypatch.setattr(
+        "agent_workbench.workspace_actions.MAX_CHANGED_LINES",
+        1,
+    )
+    with pytest.raises(ValueError, match="changed-line"):
+        preview_text_replacement(
+            workspace,
+            text_replacement_arguments(
+                expected="old",
+                replacement="new",
+                file_content="old\n",
+            ),
+        )
+
+    monkeypatch.setattr(
+        "agent_workbench.workspace_actions.MAX_CHANGED_LINES",
+        MAX_CHANGED_LINES,
+    )
+    monkeypatch.setattr(
+        "agent_workbench.workspace_actions.MAX_PATCH_PREVIEW_BYTES",
+        8,
+    )
+    with pytest.raises(ValueError, match="preview"):
+        preview_text_replacement(
+            workspace,
+            text_replacement_arguments(
+                expected="old",
+                replacement="new",
+                file_content="old\n",
+            ),
+        )
+
+
+def test_text_replacement_reuses_safe_existing_file_boundary(
+    tmp_path: Path,
+) -> None:
+    """Reject missing, unsafe, symlink, directory, and invalid UTF-8 targets."""
+
+    root, workspace = create_workspace(tmp_path)
+    outside = tmp_path / "outside.py"
+    outside.write_text("old\n", encoding="utf-8")
+    (root / "external.py").symlink_to(outside)
+    (root / "directory").mkdir()
+    (root / "binary.py").write_bytes(b"\xff")
+
+    for path in (
+        "missing.py",
+        "../outside.py",
+        ".git/config",
+        "external.py",
+        "directory",
+        "binary.py",
+    ):
+        with pytest.raises(ValueError):
+            preview_text_replacement(
+                workspace,
+                text_replacement_arguments(
+                    path=path,
+                    expected="old",
+                    replacement="new",
+                ),
+            )
+
+    assert outside.read_text(encoding="utf-8") == "old\n"
+
+
+@pytest.mark.parametrize(
+    "decision",
+    [None, ToolApprovalDecision.DENY],
+)
+def test_text_replacement_missing_or_denied_approval_never_writes(
+    tmp_path: Path,
+    decision: ToolApprovalDecision | None,
+) -> None:
+    """Keep the target unchanged without approval for the exact invocation."""
+
+    root, workspace = create_workspace(tmp_path)
+    target = root / "module.py"
+    target.write_text("old\n", encoding="utf-8")
+    registry = ToolRegistry()
+    register_workspace_action_tools(registry, workspace)
+
+    with pytest.raises(CompletionError):
+        invoke_text_replacement(
+            registry,
+            text_replacement_arguments(
+                expected="old",
+                replacement="new",
+                file_content="old\n",
+            ),
+            decision=decision,
+        )
+
+    assert target.read_text(encoding="utf-8") == "old\n"
+
+
+def test_text_replacement_rechecks_complete_content_after_approval(
+    tmp_path: Path,
+) -> None:
+    """Reject a stale approved replacement without overwriting concurrent work."""
+
+    root, workspace = create_workspace(tmp_path)
+    target = root / "module.py"
+    target.write_text("old\n", encoding="utf-8")
+    registry = ToolRegistry()
+    register_workspace_action_tools(registry, workspace)
+
+    invoke_text_replacement(
+        registry,
+        text_replacement_arguments(
+            expected="old",
+            replacement="new",
+            file_content="old\n",
+        ),
+        decision=ToolApprovalDecision.APPROVE,
+        before_approval=lambda: target.write_text(
+            "concurrent\n",
+            encoding="utf-8",
+        ),
+    )
+
+    assert target.read_text(encoding="utf-8") == "concurrent\n"
+
+
 def test_transaction_registration_uses_exact_closed_nested_schema(
     tmp_path: Path,
 ) -> None:
-    """Append the transaction after the compatible single-file action."""
+    """Append the transaction after the compatible single-file actions."""
 
     _, workspace = create_workspace(tmp_path)
     registry = ToolRegistry()
@@ -630,6 +1110,7 @@ def test_transaction_registration_uses_exact_closed_nested_schema(
 
     assert registry.definitions == (
         APPLY_FILE_PATCH_DEFINITION,
+        APPLY_TEXT_REPLACEMENT_DEFINITION,
         APPLY_WORKSPACE_CHANGES_DEFINITION,
     )
     assert APPLY_WORKSPACE_CHANGES_DEFINITION.name == "apply_workspace_changes"

@@ -1,5 +1,6 @@
 """Vertical tests for the supervised autonomous coding loop."""
 
+import hashlib
 from collections.abc import Iterable
 from pathlib import Path
 import subprocess
@@ -111,9 +112,6 @@ def test_runs_complete_inspect_edit_validate_and_diff_cycle(
     workspace = Workspace(repository)
     registry = create_coding_registry(workspace)
 
-    original_content = (
-        "def add(left: int, right: int) -> int:\n    return left - right\n"
-    )
     corrected_content = (
         "def add(left: int, right: int) -> int:\n    return left + right\n"
     )
@@ -131,13 +129,18 @@ def test_runs_complete_inspect_edit_validate_and_diff_cycle(
                 {"path": "module.py"},
             ),
             tool_response(
-                "patch",
-                "apply_file_patch",
+                "replacement",
+                "apply_text_replacement",
                 {
                     "path": "module.py",
-                    "expected_content": original_content,
-                    "replacement_content": corrected_content,
-                    "create_if_missing": False,
+                    "expected_text": "return left - right",
+                    "replacement_text": "return left + right",
+                    "expected_file_sha256": hashlib.sha256(
+                        (
+                            "def add(left: int, right: int) -> int:\n"
+                            "    return left - right\n"
+                        ).encode("utf-8")
+                    ).hexdigest(),
                 },
             ),
             tool_response(
@@ -198,14 +201,14 @@ def test_runs_complete_inspect_edit_validate_and_diff_cycle(
     assert result.executed_tool_names == (
         "list_files",
         "read_file",
-        "apply_file_patch",
+        "apply_text_replacement",
         "run_ruff_check",
         "run_pytest",
         "inspect_git_status",
         "inspect_git_diff",
     )
     assert result.approved_action_names == (
-        "apply_file_patch",
+        "apply_text_replacement",
         "run_ruff_check",
         "run_pytest",
     )
@@ -226,6 +229,7 @@ def test_runs_complete_inspect_edit_validate_and_diff_cycle(
     first_prompt = provider.requests[0].messages[0]["content"]
     assert "Correct the add function" in first_prompt
     assert "Run run_ruff_check and run_pytest" in first_prompt
+    assert "Prefer apply_text_replacement for small exact edits" in first_prompt
     assert "inspect_git_status with {}" in first_prompt
     assert "inspect_git_diff with {}" in first_prompt
 

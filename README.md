@@ -409,7 +409,8 @@ paths, traversal, prefix-confusion paths, and symlinks escaping the root are
 rejected; symlinks that resolve within the root remain available. `list_files`
 returns sorted direct children, including hidden entries, with a 128-entry
 limit. `read_file` returns UTF-8 files up to 100 KiB using canonical relative
-paths. Deliberately classified input failures return concise
+paths and includes the SHA-256 digest of the complete file, including for
+partial line-range reads. Deliberately classified input failures return concise
 `Invalid tool arguments: ...` diagnostics so a model can correct its next
 invocation. Workspace resolution failures use one static diagnostic that does
 not expose filesystem details, while unexpected handler failures remain the
@@ -474,7 +475,8 @@ access the network, or use MCP.
 
 Controlled actions are disabled by default. `--enable-actions` requires an
 explicit `--workspace PATH` and adds `apply_file_patch`,
-`apply_workspace_changes`, `run_ruff_format`, `run_ruff_check`, and
+`apply_text_replacement`, `apply_workspace_changes`, `run_ruff_format`,
+`run_ruff_check`, and
 `run_pytest` after the read-only tools:
 
 ```bash
@@ -498,6 +500,32 @@ It compares the complete expected content, shows the complete unified diff,
 and revalidates after approval. Existing files are replaced atomically while
 preserving portable permission bits; new files use exclusive creation in an
 existing directory.
+
+`apply_text_replacement` performs one approved exact literal replacement in an
+existing UTF-8 file without requiring the model to resend the complete file:
+
+```json
+{
+  "path": "relative/path.py",
+  "expected_text": "exact current fragment",
+  "replacement_text": "exact replacement fragment",
+  "expected_file_sha256": "sha256 from the latest read_file result",
+  "expected_occurrences": 1
+}
+```
+
+`expected_file_sha256` is required and must match the complete current file
+digest returned by the latest `read_file` call. The action rejects any file
+change between the read, preview, and execution, including changes outside the
+literal fragment. `expected_occurrences` is optional and defaults to one. The
+current file must contain exactly that number of non-overlapping literal
+occurrences, with a
+maximum of 16. Regular expressions, empty expected text, no-op replacements,
+new-file creation, and ambiguous occurrence counts are rejected. Each literal
+fragment is limited to 16 KiB. Agent Workbench constructs the complete
+replacement internally, shows the complete unified diff, revalidates after
+approval, and uses the same atomic replacement and permission-preservation
+boundary as `apply_file_patch`.
 
 `apply_workspace_changes` applies one approved transaction using this exact
 closed shape:
@@ -550,16 +578,19 @@ approval.
 
 With `--workspace` and `--enable-actions`, tool order is `list_files`,
 `read_file`, `search_text`, `search_symbols`, `inspect_git_status`,
-`inspect_git_diff`, `apply_file_patch`, `apply_workspace_changes`,
-`run_ruff_format`, `run_ruff_check`, then `run_pytest`. With
+`inspect_git_diff`, `apply_file_patch`, `apply_text_replacement`,
+`apply_workspace_changes`, `run_ruff_format`, `run_ruff_check`, then
+`run_pytest`. With
 `--enable-tools`, `calculator` comes first and the remaining order is
 unchanged.
 
 Example request:
 
 ```text
-Inspect the relevant files. For changes that must succeed together, request
-one apply_workspace_changes transaction with complete expected and replacement
+Inspect the relevant files. Prefer apply_text_replacement for small exact
+edits to existing files, using the SHA-256 returned by read_file. For changes
+that must succeed together, request one apply_workspace_changes transaction
+with complete expected and replacement
 content for every file. Request approval before every write or validation
 action, run Ruff and pytest, inspect the final Git status and diff, and
 summarize the result. Do not commit or push.

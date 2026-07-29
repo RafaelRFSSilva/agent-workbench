@@ -818,8 +818,9 @@ The CLI keeps tools opt-in. `--enable-tools` registers the safe synchronous
 calculator, while `--workspace PATH` authorizes the read-only `list_files`,
 `read_file`, `search_text`, `search_symbols`, `inspect_git_status`, and
 `inspect_git_diff` tools for one root. `--enable-actions` requires that
-workspace and appends `apply_file_patch`, `apply_workspace_changes`,
-`run_ruff_format`, `run_ruff_check`, and `run_pytest`. The calculator, when
+workspace and appends `apply_file_patch`, `apply_text_replacement`,
+`apply_workspace_changes`, `run_ruff_format`, `run_ruff_check`, and
+`run_pytest`. The calculator, when
 enabled, remains first. Without a tool option or workspace, no registry is
 created.
 `--show-tool-traces` adds an optional callback for completed provider-independent
@@ -883,6 +884,17 @@ The preview contains the complete deterministic unified diff and bounded
 metadata. Execution validates again after approval; existing files use a
 same-directory temporary file and atomic replacement with portable permission
 preservation, while new files use exclusive creation.
+
+`apply_text_replacement` performs a smaller optimistic update for existing
+UTF-8 files. It requires an exact non-empty literal fragment, replacement
+text, the expected number of non-overlapping occurrences, and the SHA-256
+returned by the latest `read_file` result. The complete file is hashed even
+when `read_file` returns only a bounded line range. Preview and execution
+reconstruct the complete replacement internally, enforce the existing patch
+limits, and reuse the same complete diff, post-approval revalidation,
+permission preservation, and atomic replacement boundary as
+`apply_file_patch`. It does not support regular expressions, creation,
+deletion, rename, or ambiguous occurrence counts.
 
 `apply_workspace_changes` adds an immutable multi-file plan without weakening
 that per-file boundary. Its provider-independent schema is one closed object

@@ -602,13 +602,14 @@ uv run agent-workbench \
 six read-only workspace tools:
 
 1. `apply_file_patch`
-2. `apply_workspace_changes`
-3. `run_ruff_format`
-4. `run_ruff_check`
-5. `run_pytest`
+2. `apply_text_replacement`
+3. `apply_workspace_changes`
+4. `run_ruff_format`
+5. `run_ruff_check`
+6. `run_pytest`
 
 When the calculator is also enabled it remains first, followed by the six
-read-only tools and these five actions.
+read-only tools and these six actions.
 
 Every action displays an informed preview and asks:
 
@@ -632,6 +633,30 @@ symlinks and never target `.git`.
 Patch content and existing files are limited to 100 KiB, one patch may change
 at most 500 removed/added lines, and the complete preview must fit within
 64 KiB without truncation.
+
+Use `apply_text_replacement` for a small exact edit to an existing file after
+reading that file. Its closed input shape is:
+
+```json
+{
+  "path": "relative/path.py",
+  "expected_text": "exact existing literal text",
+  "replacement_text": "literal replacement text",
+  "expected_file_sha256": "sha256 from the latest read_file result",
+  "expected_occurrences": 1
+}
+```
+
+`expected_text` must be non-empty. `expected_occurrences` must match the
+current number of non-overlapping literal occurrences exactly. The file's
+complete current SHA-256 must match `expected_file_sha256`, including when the
+preceding `read_file` call returned only a bounded line range. The action does
+not use regular expressions and cannot create files.
+
+Agent Workbench constructs the complete replacement internally and shows the
+complete unified diff before approval. Execution then rereads and revalidates
+the file before reusing the same atomic update and permission-preservation
+boundary as `apply_file_patch`.
 
 Use `apply_workspace_changes` when several creations or updates must succeed
 together. Its exact closed input shape is:
@@ -682,10 +707,12 @@ preview carefully.
 Suggested request:
 
 ```text
-Inspect the relevant files. For changes that must succeed together, request
-one apply_workspace_changes transaction with complete expected and replacement
-content for every file. Request approval before every write or validation
-action, run Ruff and pytest, inspect the final Git status and diff, and
+Inspect the relevant files. Prefer apply_text_replacement for small exact
+edits to existing files, using the SHA-256 returned by read_file. For changes
+that must succeed together, request one apply_workspace_changes transaction
+with complete expected and replacement content for every file. Request
+approval before every write or validation action, run Ruff and pytest, inspect
+the final Git status and diff, and
 summarize the result. Do not commit or push.
 ```
 
