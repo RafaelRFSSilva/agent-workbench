@@ -19,6 +19,7 @@ DEFAULT_CODING_ACCEPTANCE_CRITERIA = (
 )
 
 DEFAULT_AUTONOMOUS_MAX_TOOL_ROUNDS = 16
+MAX_AUTONOMOUS_COMPLETION_CONTINUATIONS = 1
 
 _REQUIRED_CODING_TOOLS = frozenset(
     {
@@ -149,10 +150,46 @@ def run_autonomous_coding_task(
         recover_approval_preview_errors=True,
     )
 
+    for _ in range(MAX_AUTONOMOUS_COMPLETION_CONTINUATIONS):
+        result = _build_autonomous_coding_result(
+            task_spec=task_spec,
+            assistant_summary=response.text,
+            observed_rounds=observed_rounds,
+            approved_action_names=approved_action_names,
+        )
+        missing_gates = _missing_completion_gates(result)
+        if not missing_gates:
+            return result
+
+        response = session.send(
+            _build_completion_continuation_prompt(missing_gates),
+            tool_round_observer=observe_tool_round,
+            tool_approval_handler=handle_tool_approval,
+            recover_approval_preview_errors=True,
+        )
+
+    return _build_autonomous_coding_result(
+        task_spec=task_spec,
+        assistant_summary=response.text,
+        observed_rounds=observed_rounds,
+        approved_action_names=approved_action_names,
+    )
+
+
+def _build_autonomous_coding_result(
+    *,
+    task_spec: TaskSpec,
+    assistant_summary: str,
+    observed_rounds: Iterable[ToolInteractionRound],
+    approved_action_names: Iterable[str],
+) -> AutonomousCodingResult:
+    """Build one aggregate result from every observed coding tool round."""
+
+    rounds = tuple(observed_rounds)
     executed_tool_names: list[str] = []
     validation_runs: list[ValidationRun] = []
 
-    for round_ in observed_rounds:
+    for round_ in rounds:
         for invocation, result in zip(
             round_.response.tool_invocations,
             round_.results,
@@ -171,13 +208,63 @@ def run_autonomous_coding_task(
 
     return AutonomousCodingResult(
         task_spec=task_spec,
-        assistant_summary=response.text,
-        tool_round_count=len(observed_rounds),
+        assistant_summary=assistant_summary,
+        tool_round_count=len(rounds),
         executed_tool_names=tuple(executed_tool_names),
         approved_action_names=tuple(approved_action_names),
         validation_runs=tuple(validation_runs),
         inspected_git_status="inspect_git_status" in executed_tool_names,
         inspected_git_diff="inspect_git_diff" in executed_tool_names,
+    )
+
+
+def _missing_completion_gates(
+    result: AutonomousCodingResult,
+) -> tuple[str, ...]:
+    """Return incomplete mandatory gates in deterministic order."""
+
+    latest_runs = {
+        validation.tool_name: validation for validation in result.validation_runs
+    }
+    missing: list[str] = []
+
+    for tool_name, gate_name in (
+        ("run_ruff_check", "successful run_ruff_check"),
+        ("run_pytest", "successful run_pytest"),
+    ):
+        validation = latest_runs.get(tool_name)
+        if (
+            validation is None
+            or validation.result_status != "success"
+            or validation.exit_code != 0
+        ):
+            missing.append(gate_name)
+
+    if not result.inspected_git_status:
+        missing.append("inspect_git_status")
+    if not result.inspected_git_diff:
+        missing.append("inspect_git_diff")
+
+    return tuple(missing)
+
+
+def _build_completion_continuation_prompt(
+    missing_gates: Iterable[str],
+) -> str:
+    """Build one deterministic bounded completion-continuation prompt."""
+
+    gates = tuple(missing_gates)
+    formatted_gates = "\n".join(
+        f"{index}. {gate}" for index, gate in enumerate(gates, start=1)
+    )
+    return (
+        "Continue the same supervised autonomous coding task.\n"
+        "The previous response ended before mandatory completion evidence "
+        "was gathered.\n"
+        f"Missing completion gates:\n{formatted_gates}\n"
+        "Use the available tools now. Do not repeat already completed work "
+        "unnecessarily. Do not provide a final response until the missing "
+        "gates have been attempted."
     )
 
 
