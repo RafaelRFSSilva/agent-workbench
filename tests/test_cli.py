@@ -961,6 +961,7 @@ def test_cli_executes_workspace_list_and_read_tools(
         "path": "README.md",
         "content": "WORKSPACE-731",
         "size_bytes": 13,
+        "sha256": ("288f952d38f1323582a4296251db4c2714ea7923e0c627c56a9cb9f27fcf0f77"),
     }
     assert "Assistant: The code word is WORKSPACE-731." in captured.out
 

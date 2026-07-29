@@ -100,6 +100,42 @@ def test_cli_approval_is_explicit_one_prompt_and_default_deny(
     assert "+new" in output
 
 
+def test_text_replacement_approval_renders_occurrence_count_and_complete_diff(
+    monkeypatch,
+    capsys,
+) -> None:
+    """Show exact literal replacement metadata before one explicit approval."""
+
+    prompts: list[str] = []
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda prompt: prompts.append(prompt) or "y",
+    )
+
+    decision = _prompt_for_tool_approval(
+        approval_request(
+            "apply_text_replacement",
+            {
+                "path": "module.py",
+                "operation": "update",
+                "old_size_bytes": 10,
+                "new_size_bytes": 10,
+                "changed_lines": 2,
+                "occurrences_replaced": 1,
+                "diff": "--- a/module.py\n+++ b/module.py\n-old\n+new\n",
+            },
+        )
+    )
+
+    output = capsys.readouterr().out
+    assert decision is ToolApprovalDecision.APPROVE
+    assert prompts == ["Approve action? [y/N]: "]
+    assert "Action approval required: apply_text_replacement" in output
+    assert "Literal occurrences: 1" in output
+    assert "--- a/module.py" in output
+    assert "+new" in output
+
+
 @pytest.mark.parametrize("failure", [EOFError(), KeyboardInterrupt()])
 def test_cli_approval_input_interruption_denies(
     monkeypatch,
@@ -605,6 +641,54 @@ def test_patch_trace_redacts_contents_but_keeps_safe_metadata(capsys) -> None:
     assert '"path":"module.py"' in output
     assert '"expected_content_bytes":10' in output
     assert '"replacement_content_bytes":10' in output
+
+
+def test_text_replacement_trace_redacts_fragments_but_keeps_safe_metadata(
+    capsys,
+) -> None:
+    """Never expose literal replacement fragments in normal tool traces."""
+
+    invocation = ToolInvocation(
+        id="replacement",
+        tool_name="apply_text_replacement",
+        arguments={
+            "path": "module.py",
+            "expected_text": "SECRET-OLD",
+            "replacement_text": "SECRET-NEW",
+            "expected_file_sha256": "0" * 64,
+            "expected_occurrences": 1,
+        },
+    )
+    round_ = ToolInteractionRound(
+        response=ChatResponse(tool_invocations=(invocation,)),
+        results=(
+            ToolResult(
+                invocation_id="replacement",
+                status="success",
+                output={
+                    "path": "module.py",
+                    "operation": "update",
+                    "old_size_bytes": 10,
+                    "new_size_bytes": 10,
+                    "changed_lines": 2,
+                    "occurrences_replaced": 1,
+                },
+            ),
+        ),
+    )
+
+    _display_tool_round(round_)
+
+    output = capsys.readouterr().out
+    assert "SECRET-OLD" not in output
+    assert "SECRET-NEW" not in output
+    assert '"path":"module.py"' in output
+    assert '"expected_occurrences":1' in output
+    assert '"expected_text_bytes":10' in output
+    assert '"replacement_text_bytes":10' in output
+    assert '"expected_file_sha256_present":true' in output
+    assert '"occurrences_replaced":1' in output
+    assert "0000000000000000" not in output
 
 
 def test_main_forwards_action_mode_only_when_enabled(

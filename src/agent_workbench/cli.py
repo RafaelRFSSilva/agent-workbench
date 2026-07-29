@@ -437,7 +437,10 @@ def _prompt_for_tool_approval(
     preview = request.preview
     print(f"\nAction approval required: {tool_name}")
 
-    if tool_name == "apply_file_patch" and isinstance(preview, dict):
+    if tool_name in {
+        "apply_file_patch",
+        "apply_text_replacement",
+    } and isinstance(preview, dict):
         print(f"  Path: {preview.get('path', '[unavailable]')}")
         print(f"  Operation: {preview.get('operation', '[unavailable]')}")
         print(
@@ -446,6 +449,11 @@ def _prompt_for_tool_approval(
             f"{preview.get('new_size_bytes', '[unavailable]')}"
         )
         print(f"  Changed lines: {preview.get('changed_lines', '[unavailable]')}")
+        if tool_name == "apply_text_replacement":
+            print(
+                "  Literal occurrences: "
+                f"{preview.get('occurrences_replaced', '[unavailable]')}"
+            )
         print("  Complete diff:")
         diff = preview.get("diff")
         print(diff if isinstance(diff, str) else "[unavailable]")
@@ -571,6 +579,21 @@ def _trace_arguments(invocation) -> object:
     """Return safe trace arguments with patch contents replaced by byte counts."""
 
     arguments = invocation.arguments
+    if invocation.tool_name == "apply_text_replacement":
+        return {
+            "path": arguments.get("path"),
+            "expected_occurrences": arguments.get("expected_occurrences", 1),
+            "expected_text_bytes": _utf8_byte_count(
+                arguments.get("expected_text"),
+            ),
+            "replacement_text_bytes": _utf8_byte_count(
+                arguments.get("replacement_text"),
+            ),
+            "expected_file_sha256_present": isinstance(
+                arguments.get("expected_file_sha256"),
+                str,
+            ),
+        }
     if invocation.tool_name == "apply_workspace_changes":
         changes = arguments.get("changes")
         safe_changes = []
@@ -641,8 +664,10 @@ def _redact_trace_data(value: object, *, key: str | None = None) -> object:
         "content",
         "diff",
         "expected_content",
+        "expected_text",
         "password",
         "replacement_content",
+        "replacement_text",
         "secret",
         "token",
         "api_key",

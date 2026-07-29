@@ -1,6 +1,7 @@
-"""Approved optimistic single-file actions inside an authorized workspace."""
+"""Approved bounded file actions inside an authorized workspace."""
 
 import difflib
+import hashlib
 import json
 import os
 import secrets
@@ -23,6 +24,12 @@ MAX_CHANGED_LINES = 500
 
 MAX_PATCH_PREVIEW_BYTES = 64 * 1024
 """Maximum byte size of the complete approval diff."""
+
+MAX_TEXT_REPLACEMENT_BYTES = 16 * 1024
+"""Maximum UTF-8 byte size accepted for one literal replacement fragment."""
+
+MAX_TEXT_REPLACEMENT_OCCURRENCES = 16
+"""Maximum exact literal occurrences replaced by one approved action."""
 
 MAX_TRANSACTION_FILES = 16
 """Maximum number of files in one approved workspace transaction."""
@@ -54,6 +61,39 @@ APPLY_FILE_PATCH_DEFINITION = ToolDefinition(
             "create_if_missing": {"type": "boolean", "default": False},
         },
         "required": ["path", "expected_content", "replacement_content"],
+        "additionalProperties": False,
+    },
+)
+
+APPLY_TEXT_REPLACEMENT_DEFINITION = ToolDefinition(
+    name="apply_text_replacement",
+    description=(
+        "Replace a bounded exact literal text fragment in one existing UTF-8 "
+        "file using the SHA-256 digest from read_file."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "path": {"type": "string"},
+            "expected_text": {"type": "string"},
+            "replacement_text": {"type": "string"},
+            "expected_file_sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$",
+            },
+            "expected_occurrences": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": MAX_TEXT_REPLACEMENT_OCCURRENCES,
+                "default": 1,
+            },
+        },
+        "required": [
+            "path",
+            "expected_text",
+            "replacement_text",
+            "expected_file_sha256",
+        ],
         "additionalProperties": False,
     },
 )
@@ -122,6 +162,25 @@ class _PreparedPatch:
 
 
 @dataclass(frozen=True, slots=True)
+class _PreparedTextReplacement:
+    """Store one validated literal replacement and its complete file patch."""
+
+    patch: _PreparedPatch
+    occurrences_replaced: int
+
+    def metadata(self, *, include_diff: bool) -> JSONObject:
+        """Return bounded result or complete approval metadata."""
+
+        metadata = {
+            **self.patch.metadata(),
+            "occurrences_replaced": self.occurrences_replaced,
+        }
+        if include_diff:
+            metadata["diff"] = self.patch.diff
+        return metadata
+
+
+@dataclass(frozen=True, slots=True)
 class _WorkspaceChangePlan:
     """Store one immutable validated deterministic transaction plan."""
 
@@ -174,6 +233,15 @@ def register_workspace_action_tools(
         approval_preview=lambda arguments: preview_file_patch(workspace, arguments),
     )
     registry.register(
+        APPLY_TEXT_REPLACEMENT_DEFINITION,
+        lambda arguments: apply_text_replacement(workspace, arguments),
+        requires_approval=True,
+        approval_preview=lambda arguments: preview_text_replacement(
+            workspace,
+            arguments,
+        ),
+    )
+    registry.register(
         APPLY_WORKSPACE_CHANGES_DEFINITION,
         lambda arguments: apply_workspace_changes(workspace, arguments),
         requires_approval=True,
@@ -222,6 +290,28 @@ def apply_file_patch(
         _replace_file_atomically(workspace, patch)
 
     return patch.metadata()
+
+
+def preview_text_replacement(
+    workspace: Workspace,
+    arguments: object,
+) -> JSONObject:
+    """Validate one literal replacement and return its complete approval preview."""
+
+    return _prepare_text_replacement(workspace, arguments).metadata(
+        include_diff=True,
+    )
+
+
+def apply_text_replacement(
+    workspace: Workspace,
+    arguments: object,
+) -> JSONObject:
+    """Revalidate and atomically apply one exact literal text replacement."""
+
+    prepared = _prepare_text_replacement(workspace, arguments)
+    _replace_file_atomically(workspace, prepared.patch)
+    return prepared.metadata(include_diff=False)
 
 
 def preview_workspace_changes(
@@ -369,6 +459,95 @@ def _prepare_patch(
     )
 
 
+def _prepare_text_replacement(
+    workspace: Workspace,
+    arguments: object,
+) -> _PreparedTextReplacement:
+    """Validate one literal replacement and build its complete file patch."""
+
+    (
+        path,
+        expected_text,
+        replacement_text,
+        expected_file_sha256,
+        expected_occurrences,
+    ) = _get_text_replacement_arguments(arguments)
+    _encode_text_replacement_fragment("expected_text", expected_text)
+    _encode_text_replacement_fragment("replacement_text", replacement_text)
+
+    try:
+        target, relative_path, target_status = _resolve_write_target(workspace, path)
+    except ValueError as exc:
+        raise _as_text_replacement_error(exc) from None
+    if target_status is None:
+        raise ValueError("apply_text_replacement target does not exist.")
+
+    try:
+        old_bytes = _read_existing_file(target, target_status)
+    except ValueError as exc:
+        raise _as_text_replacement_error(exc) from None
+    if hashlib.sha256(old_bytes).hexdigest() != expected_file_sha256:
+        raise ValueError(
+            "apply_text_replacement expected_file_sha256 does not match "
+            "the current file."
+        )
+
+    try:
+        old_content = old_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError("apply_text_replacement requires valid UTF-8.") from None
+
+    actual_occurrences = old_content.count(expected_text)
+    if actual_occurrences != expected_occurrences:
+        raise ValueError(
+            "apply_text_replacement expected "
+            f"{expected_occurrences} occurrence(s) but found "
+            f"{actual_occurrences}."
+        )
+
+    replacement_content = old_content.replace(expected_text, replacement_text)
+    try:
+        replacement_bytes = _encode_patch_content(
+            "replacement_content",
+            replacement_content,
+        )
+    except ValueError as exc:
+        raise _as_text_replacement_error(exc) from None
+    changed_lines = _count_changed_lines(old_content, replacement_content)
+    if changed_lines > MAX_CHANGED_LINES:
+        raise ValueError(
+            f"text replacement exceeds the {MAX_CHANGED_LINES}-changed-line limit."
+        )
+
+    diff = _create_unified_diff(
+        relative_path,
+        old_content,
+        replacement_content,
+        operation="update",
+    )
+    if len(diff.encode("utf-8")) > MAX_PATCH_PREVIEW_BYTES:
+        raise ValueError(
+            "complete text replacement preview exceeds the "
+            f"{MAX_PATCH_PREVIEW_BYTES}-byte limit."
+        )
+
+    return _PreparedTextReplacement(
+        patch=_PreparedPatch(
+            target=target,
+            relative_path=relative_path,
+            operation="update",
+            expected_content=old_content,
+            replacement_content=replacement_content,
+            old_size_bytes=len(old_bytes),
+            new_size_bytes=len(replacement_bytes),
+            changed_lines=changed_lines,
+            diff=diff,
+            existing_mode=stat.S_IMODE(target_status.st_mode),
+        ),
+        occurrences_replaced=actual_occurrences,
+    )
+
+
 def _prepare_workspace_change_plan(
     workspace: Workspace,
     arguments: object,
@@ -454,6 +633,80 @@ def _get_workspace_change_arguments(
     return tuple(change.copy() for change in changes)
 
 
+def _get_text_replacement_arguments(
+    arguments: object,
+) -> tuple[str, str, str, str, int]:
+    """Validate one closed literal text-replacement argument object."""
+
+    required = {
+        "path",
+        "expected_text",
+        "replacement_text",
+        "expected_file_sha256",
+    }
+    allowed = {
+        *required,
+        "expected_occurrences",
+    }
+    if (
+        not isinstance(arguments, dict)
+        or not required <= set(arguments)
+        or set(arguments) - allowed
+    ):
+        raise ValueError(
+            "apply_text_replacement requires path, expected_text, "
+            "replacement_text, expected_file_sha256, and optional "
+            "expected_occurrences."
+        )
+
+    path = arguments["path"]
+    expected_text = arguments["expected_text"]
+    replacement_text = arguments["replacement_text"]
+    expected_file_sha256 = arguments["expected_file_sha256"]
+    expected_occurrences = arguments.get("expected_occurrences", 1)
+
+    if not isinstance(path, str):
+        raise ValueError("apply_text_replacement path must be a string.")
+    if not isinstance(expected_text, str):
+        raise ValueError("apply_text_replacement expected_text must be a string.")
+    if not isinstance(replacement_text, str):
+        raise ValueError("apply_text_replacement replacement_text must be a string.")
+    if (
+        not isinstance(expected_file_sha256, str)
+        or len(expected_file_sha256) != 64
+        or any(
+            character not in "0123456789abcdef" for character in expected_file_sha256
+        )
+    ):
+        raise ValueError(
+            "apply_text_replacement expected_file_sha256 must contain "
+            "64 lowercase hexadecimal characters."
+        )
+    if (
+        not isinstance(expected_occurrences, int)
+        or isinstance(expected_occurrences, bool)
+        or not 1 <= expected_occurrences <= MAX_TEXT_REPLACEMENT_OCCURRENCES
+    ):
+        raise ValueError(
+            "apply_text_replacement expected_occurrences must be an integer "
+            f"between 1 and {MAX_TEXT_REPLACEMENT_OCCURRENCES}."
+        )
+    if not expected_text:
+        raise ValueError("apply_text_replacement expected_text must not be empty.")
+    if expected_text == replacement_text:
+        raise ValueError(
+            "apply_text_replacement replacement_text must differ from expected_text."
+        )
+
+    return (
+        path,
+        expected_text,
+        replacement_text,
+        expected_file_sha256,
+        expected_occurrences,
+    )
+
+
 def _get_patch_arguments(
     arguments: object,
     *,
@@ -511,6 +764,42 @@ def _get_patch_arguments(
         raise ValueError(f"{validation_name} create_if_missing must be a boolean.")
 
     return path, expected_content, replacement_content, create_if_missing
+
+
+def _as_text_replacement_error(error: ValueError) -> ValueError:
+    "Rewrite shared patch diagnostics for the literal replacement action."
+
+    message = str(error)
+    patch_prefix = "apply_file_patch"
+    if message.startswith(patch_prefix):
+        message = "apply_text_replacement" + message[len(patch_prefix) :]
+    return ValueError(message)
+
+
+def _encode_text_replacement_fragment(
+    field_name: str,
+    content: str,
+) -> bytes:
+    """Validate one bounded NUL-free UTF-8 literal replacement fragment."""
+
+    if "\0" in content:
+        raise ValueError(
+            f"apply_text_replacement {field_name} must not contain NUL bytes."
+        )
+
+    try:
+        content_bytes = content.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError(
+            "apply_text_replacement requires valid UTF-8 fragments."
+        ) from None
+    if len(content_bytes) > MAX_TEXT_REPLACEMENT_BYTES:
+        raise ValueError(
+            f"apply_text_replacement {field_name} exceeds the "
+            f"{MAX_TEXT_REPLACEMENT_BYTES}-byte limit."
+        )
+
+    return content_bytes
 
 
 def _encode_patch_content(field_name: str, content: str) -> bytes:

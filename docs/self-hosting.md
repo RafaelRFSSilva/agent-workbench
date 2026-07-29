@@ -20,9 +20,11 @@ repository-lifecycle changes.
    worktree path, and one new local isolated branch.
 4. Launch the complete isolated autonomous workflow.
 5. Require repository and named-file inspection before editing.
-6. Require one `apply_workspace_changes` invocation containing every planned
-   file.
-7. Review the complete transaction preview and diffs.
+6. Prefer `apply_text_replacement` for each small exact edit to an existing
+   file, using the SHA-256 returned by `read_file`. Use one
+   `apply_workspace_changes` transaction when several file changes must succeed
+   together or when creation or complete-content replacement is required.
+7. Review every complete action preview and diff.
 8. Approve Ruff format, Ruff check, and pytest separately.
 9. Require successful Ruff and pytest evidence plus Git status and complete diff
    inspection.
@@ -80,9 +82,11 @@ unrelated files, or request arbitrary commands.
 Use test-driven development:
 1. Add or update focused tests first.
 2. Run <FOCUSED_TESTS> and explicitly confirm RED.
-3. Prepare exactly one apply_workspace_changes transaction containing every
-   planned file with complete expected and replacement content.
-4. Wait for operator approval before that transaction.
+3. Prefer apply_text_replacement for small exact edits to existing files,
+   using the SHA-256 returned by read_file. Use one apply_workspace_changes
+   transaction when several changes must succeed together or complete-content
+   replacement is necessary.
+4. Wait for operator approval before every write action.
 5. Implement only the smallest correct change.
 6. Run <FOCUSED_TESTS> and explicitly confirm GREEN.
 
@@ -116,9 +120,13 @@ private paths, or `.env` values in the task prompt or commit message.
 
 ## What the operator must verify at approvals
 
-### Transaction approval
+### Workspace change approval
 
-- The path list exactly matches the allowed files.
+- For `apply_text_replacement`, the path is allowed, the expected literal
+  fragment is sufficiently specific, the expected occurrence count is correct,
+  and the complete diff contains only the intended edit.
+- For `apply_workspace_changes`, the complete path list exactly matches the
+  allowed files.
 - Every complete diff implements the requested behavior.
 - Tests are not weakened or removed.
 - Dependencies and configuration are unchanged unless explicitly authorized.

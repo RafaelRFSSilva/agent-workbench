@@ -171,6 +171,7 @@ def test_isolated_factory_preserves_exact_registry_order_and_freshness(
         expected.extend(
             [
                 "apply_file_patch",
+                "apply_text_replacement",
                 "apply_workspace_changes",
                 "run_ruff_format",
                 "run_ruff_check",

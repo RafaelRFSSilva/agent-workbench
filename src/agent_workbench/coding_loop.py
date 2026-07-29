@@ -26,6 +26,7 @@ _REQUIRED_CODING_TOOLS = frozenset(
         "read_file",
         "inspect_git_status",
         "inspect_git_diff",
+        "apply_text_replacement",
         "apply_workspace_changes",
         "run_ruff_check",
         "run_pytest",
@@ -198,7 +199,10 @@ def _build_coding_prompt(task_spec: TaskSpec) -> str:
         "Execution protocol:\n"
         "1. Inspect the workspace and relevant files before editing.\n"
         "2. Use the available read-only tools to understand existing behavior.\n"
-        "3. Apply only bounded changes required by the objective.\n"
+        "3. Apply only bounded changes required by the objective. Prefer "
+        "apply_text_replacement for small exact edits to existing files, using "
+        "the sha256 value from the most recent read_file result; use "
+        "complete-content actions only when necessary.\n"
         "4. Request each approval-required action separately.\n"
         "5. Run run_ruff_check and run_pytest after making changes.\n"
         "6. If validation fails, inspect the output, correct the implementation, "

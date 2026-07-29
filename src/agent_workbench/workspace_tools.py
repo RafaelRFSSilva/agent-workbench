@@ -1,5 +1,6 @@
 """Provider-independent read-only workspace tools."""
 
+import hashlib
 from pathlib import Path
 
 from agent_workbench.errors import ToolArgumentError
@@ -71,7 +72,7 @@ READ_FILE_DEFINITION = ToolDefinition(
     name="read_file",
     description=(
         "Read all or an inclusive bounded line range from a UTF-8 text file "
-        "inside the authorized workspace."
+        "inside the authorized workspace and return the complete file SHA-256."
     ),
     input_schema=_READ_FILE_INPUT_SCHEMA,
 )
@@ -195,6 +196,7 @@ def read_workspace_file(
         "path": _workspace_relative_path(workspace, file_path),
         "content": content,
         "size_bytes": len(content_bytes),
+        "sha256": hashlib.sha256(content_bytes).hexdigest(),
     }
 
     if line_start is None and line_end is None:
