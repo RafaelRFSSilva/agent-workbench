@@ -224,9 +224,12 @@ def test_runs_complete_inspect_edit_validate_and_diff_cycle(
     )
     assert all(run.result_status == "success" for run in result.validation_runs)
     assert all(run.exit_code == 0 for run in result.validation_runs)
+    assert result.workspace_change_applied is True
     assert result.validation_succeeded is True
     assert result.inspected_git_status is True
     assert result.inspected_git_diff is True
+    assert result.inspected_git_status_after_change is True
+    assert result.inspected_git_diff_after_change is True
     assert "Corrected the add implementation" in result.assistant_summary
 
     assert len(approval_requests) == 3
@@ -235,6 +238,7 @@ def test_runs_complete_inspect_edit_validate_and_diff_cycle(
     first_prompt = provider.requests[0].messages[0]["content"]
     assert "Correct the add function" in first_prompt
     assert "Run run_ruff_check and run_pytest" in first_prompt
+    assert "Complete at least one approved workspace change" in first_prompt
     assert "Prefer apply_text_replacement for small exact edits" in first_prompt
     assert "inspect_git_status with {}" in first_prompt
     assert "inspect_git_diff with {}" in first_prompt
@@ -249,16 +253,26 @@ def test_recovers_from_invalid_validation_preview_and_retries(
     """Return an invalid approval preview to the model and accept its retry."""
 
     repository = create_coding_repository(tmp_path / "project")
-    (repository / "module.py").write_text(
-        "def add(left: int, right: int) -> int:\n    return left + right\n",
-        encoding="utf-8",
+    original_content = (
+        "def add(left: int, right: int) -> int:\n    return left - right\n"
     )
-
     workspace = Workspace(repository)
     registry = create_coding_registry(workspace)
 
     provider = ScriptedProvider(
         [
+            tool_response(
+                "replacement",
+                "apply_text_replacement",
+                {
+                    "path": "module.py",
+                    "expected_text": "return left - right",
+                    "replacement_text": "return left + right",
+                    "expected_file_sha256": hashlib.sha256(
+                        original_content.encode("utf-8")
+                    ).hexdigest(),
+                },
+            ),
             tool_response(
                 "invalid-pytest",
                 "run_pytest",
@@ -293,7 +307,7 @@ def test_recovers_from_invalid_validation_preview_and_retries(
         id=SessionId("preview-recovery-test"),
         provider=provider,
         tool_registry=registry,
-        max_tool_rounds=3,
+        max_tool_rounds=4,
     )
 
     approval_requests = []
@@ -304,18 +318,20 @@ def test_recovers_from_invalid_validation_preview_and_retries(
 
     result = run_autonomous_coding_task(
         session,
-        "Run the project tests.",
+        "Correct the add implementation and run the project tests.",
         tool_approval_handler=approve,
     )
 
-    assert len(approval_requests) == 2
+    assert len(approval_requests) == 3
     assert tuple(request.invocation.id for request in approval_requests) == (
+        "replacement",
         "valid-pytest",
         "ruff",
     )
 
-    assert result.tool_round_count == 5
+    assert result.tool_round_count == 6
     assert result.executed_tool_names == (
+        "apply_text_replacement",
         "run_pytest",
         "run_pytest",
         "run_ruff_check",
@@ -323,6 +339,7 @@ def test_recovers_from_invalid_validation_preview_and_retries(
         "inspect_git_diff",
     )
     assert result.approved_action_names == (
+        "apply_text_replacement",
         "run_pytest",
         "run_ruff_check",
     )
@@ -337,24 +354,31 @@ def test_recovers_from_invalid_validation_preview_and_retries(
         0,
         0,
     )
+    assert result.workspace_change_applied is True
     assert result.validation_succeeded is True
-    assert result.inspected_git_status is True
-    assert result.inspected_git_diff is True
+    assert result.inspected_git_status_after_change is True
+    assert result.inspected_git_diff_after_change is True
 
-    continuation_prompt = provider.requests[3].messages[-1]["content"]
-    assert "successful run_ruff_check" in continuation_prompt
-    assert "successful run_pytest" not in continuation_prompt
-    assert "inspect_git_status" in continuation_prompt
-    assert "inspect_git_diff" in continuation_prompt
+    continuation_prompt = provider.requests[4].messages[-1]["content"]
+    assert (
+        "successful run_ruff_check after the latest workspace change"
+        in continuation_prompt
+    )
+    assert (
+        "successful run_pytest after the latest workspace change"
+        not in continuation_prompt
+    )
+    assert "inspect_git_status after the latest workspace change" in continuation_prompt
+    assert "inspect_git_diff after the latest workspace change" in continuation_prompt
 
-    invalid_result = provider.requests[1].tool_interactions[0].results[0]
+    invalid_result = provider.requests[2].tool_interactions[1].results[0]
     assert invalid_result.status == "error"
     assert invalid_result.error == (
         "Approval preview failed for run_pytest: "
         "Workspace path does not exist: tests/test_module.py"
     )
 
-    valid_result = provider.requests[2].tool_interactions[1].results[0]
+    valid_result = provider.requests[3].tool_interactions[2].results[0]
     assert valid_result.status == "success"
     assert valid_result.output["exit_code"] == 0
 
@@ -428,18 +452,21 @@ def test_continues_once_after_an_early_final_response(
         "run_ruff_check",
         "run_pytest",
     )
+    assert result.workspace_change_applied is True
     assert result.validation_succeeded is True
     assert result.inspected_git_status is True
     assert result.inspected_git_diff is True
+    assert result.inspected_git_status_after_change is True
+    assert result.inspected_git_diff_after_change is True
     assert len(observed_rounds) == 5
     assert len(provider.requests) == 7
 
     continuation_prompt = provider.requests[2].messages[-1]["content"]
     expected_order = (
-        "1. successful run_ruff_check\n"
-        "2. successful run_pytest\n"
-        "3. inspect_git_status\n"
-        "4. inspect_git_diff"
+        "1. successful run_ruff_check after the latest workspace change\n"
+        "2. successful run_pytest after the latest workspace change\n"
+        "3. inspect_git_status after the latest workspace change\n"
+        "4. inspect_git_diff after the latest workspace change"
     )
     assert expected_order in continuation_prompt
     assert "Do not repeat already completed work unnecessarily." in (
@@ -450,21 +477,32 @@ def test_continues_once_after_an_early_final_response(
 def test_continuation_requests_only_missing_git_inspection(
     tmp_path: Path,
 ) -> None:
-    """Do not ask the model to repeat validations that already succeeded."""
+    """Do not ask the model to repeat post-change validations that succeeded."""
 
     repository = create_coding_repository(tmp_path / "project")
-    (repository / "module.py").write_text(
-        "def add(left: int, right: int) -> int:\n    return left + right\n",
-        encoding="utf-8",
-    )
     workspace = Workspace(repository)
     registry = create_coding_registry(workspace)
+    original_content = (
+        "def add(left: int, right: int) -> int:\n    return left - right\n"
+    )
 
     provider = ScriptedProvider(
         [
+            tool_response(
+                "replacement",
+                "apply_text_replacement",
+                {
+                    "path": "module.py",
+                    "expected_text": "return left - right",
+                    "replacement_text": "return left + right",
+                    "expected_file_sha256": hashlib.sha256(
+                        original_content.encode("utf-8")
+                    ).hexdigest(),
+                },
+            ),
             tool_response("ruff", "run_ruff_check", {"path": "."}),
             tool_response("pytest", "run_pytest", {"path": "."}),
-            ChatResponse(text="Validation completed."),
+            ChatResponse(text="The edit and validation completed."),
             tool_response("status", "inspect_git_status", {}),
             tool_response("diff", "inspect_git_diff", {}),
             ChatResponse(text="Git inspection completed."),
@@ -474,35 +512,55 @@ def test_continuation_requests_only_missing_git_inspection(
         id=SessionId("missing-git-continuation"),
         provider=provider,
         tool_registry=registry,
-        max_tool_rounds=2,
+        max_tool_rounds=3,
     )
 
     result = run_autonomous_coding_task(
         session,
-        "Validate and inspect the project.",
+        "Correct and validate the project.",
         tool_approval_handler=lambda _request: ToolApprovalDecision.APPROVE,
     )
 
-    continuation_prompt = provider.requests[3].messages[-1]["content"]
-    assert "1. inspect_git_status\n2. inspect_git_diff" in continuation_prompt
+    continuation_prompt = provider.requests[4].messages[-1]["content"]
+    assert (
+        "1. inspect_git_status after the latest workspace change\n"
+        "2. inspect_git_diff after the latest workspace change" in continuation_prompt
+    )
+    assert "successful approved workspace change" not in continuation_prompt
     assert "successful run_ruff_check" not in continuation_prompt
     assert "successful run_pytest" not in continuation_prompt
+    assert result.workspace_change_applied is True
     assert result.validation_succeeded is True
-    assert result.inspected_git_status is True
-    assert result.inspected_git_diff is True
+    assert result.inspected_git_status_after_change is True
+    assert result.inspected_git_diff_after_change is True
 
 
 def test_unsuccessful_validation_gets_one_bounded_continuation(
     tmp_path: Path,
 ) -> None:
-    """Request a failed validation again without issuing a third model turn."""
+    """Request a failed post-change validation again without a third turn."""
 
     repository = create_coding_repository(tmp_path / "project")
     workspace = Workspace(repository)
     registry = create_coding_registry(workspace)
+    original_content = (
+        "def add(left: int, right: int) -> int:\n    return left - right\n"
+    )
 
     provider = ScriptedProvider(
         [
+            tool_response(
+                "replacement",
+                "apply_text_replacement",
+                {
+                    "path": "module.py",
+                    "expected_text": "return left - right",
+                    "replacement_text": "return left * right",
+                    "expected_file_sha256": hashlib.sha256(
+                        original_content.encode("utf-8")
+                    ).hexdigest(),
+                },
+            ),
             tool_response("ruff", "run_ruff_check", {"path": "."}),
             tool_response("pytest", "run_pytest", {"path": "."}),
             tool_response("status", "inspect_git_status", {}),
@@ -515,25 +573,310 @@ def test_unsuccessful_validation_gets_one_bounded_continuation(
         id=SessionId("failed-validation-continuation"),
         provider=provider,
         tool_registry=registry,
+        max_tool_rounds=5,
+    )
+
+    result = run_autonomous_coding_task(
+        session,
+        "Correct and validate the intentionally failing project.",
+        tool_approval_handler=lambda _request: ToolApprovalDecision.APPROVE,
+    )
+
+    continuation_prompt = provider.requests[6].messages[-1]["content"]
+    assert (
+        "1. successful run_pytest after the latest workspace change"
+        in continuation_prompt
+    )
+    assert "successful approved workspace change" not in continuation_prompt
+    assert "successful run_ruff_check" not in continuation_prompt
+    assert "inspect_git_status" not in continuation_prompt
+    assert "inspect_git_diff" not in continuation_prompt
+    assert len(provider.requests) == 7
+    assert result.assistant_summary == "I cannot make further progress."
+    assert result.workspace_change_applied is True
+    assert result.validation_succeeded is False
+    assert result.inspected_git_status_after_change is True
+    assert result.inspected_git_diff_after_change is True
+
+
+def test_successful_noop_write_does_not_satisfy_change_gate(
+    tmp_path: Path,
+) -> None:
+    """Reject a successful action whose metadata proves no effective change."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    workspace = Workspace(repository)
+    registry = create_coding_registry(workspace)
+    original_content = (
+        "def add(left: int, right: int) -> int:\n    return left - right\n"
+    )
+
+    provider = ScriptedProvider(
+        [
+            tool_response(
+                "noop-replacement",
+                "apply_text_replacement",
+                {
+                    "path": "module.py",
+                    "expected_text": "return left - right",
+                    "replacement_text": "return left - right",
+                    "expected_file_sha256": hashlib.sha256(
+                        original_content.encode("utf-8")
+                    ).hexdigest(),
+                },
+            ),
+            tool_response("ruff", "run_ruff_check", {"path": "."}),
+            tool_response("pytest", "run_pytest", {"path": "."}),
+            tool_response("status", "inspect_git_status", {}),
+            tool_response("diff", "inspect_git_diff", {}),
+            ChatResponse(text="The no-op action and checks completed."),
+            ChatResponse(text="No effective workspace change was made."),
+        ]
+    )
+    session = AgentSession(
+        id=SessionId("successful-noop-write"),
+        provider=provider,
+        tool_registry=registry,
+        max_tool_rounds=5,
+    )
+
+    result = run_autonomous_coding_task(
+        session,
+        "Correct the add implementation.",
+        tool_approval_handler=lambda _request: ToolApprovalDecision.APPROVE,
+    )
+
+    continuation_prompt = provider.requests[6].messages[-1]["content"]
+    assert "successful approved workspace change" in continuation_prompt
+    assert len(provider.requests) == 7
+    assert result.workspace_change_applied is False
+    assert result.validation_succeeded is False
+    assert result.inspected_git_status_after_change is False
+    assert result.inspected_git_diff_after_change is False
+    assert (repository / "module.py").read_text(encoding="utf-8") == (original_content)
+
+
+def test_empty_file_creation_counts_as_effective_workspace_change(
+    tmp_path: Path,
+) -> None:
+    """Treat creation of an empty file as a real change despite zero changed lines."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    (repository / "module.py").write_text(
+        "def add(left: int, right: int) -> int:\n    return left + right\n",
+        encoding="utf-8",
+    )
+    run_git(repository, "add", "module.py")
+    run_git(repository, "commit", "-m", "make fixture tests pass")
+    workspace = Workspace(repository)
+    registry = create_coding_registry(workspace)
+
+    provider = ScriptedProvider(
+        [
+            tool_response(
+                "create-empty",
+                "apply_file_patch",
+                {
+                    "path": "empty.py",
+                    "expected_content": "",
+                    "replacement_content": "",
+                    "create_if_missing": True,
+                },
+            ),
+            tool_response("ruff", "run_ruff_check", {"path": "."}),
+            tool_response("pytest", "run_pytest", {"path": "."}),
+            tool_response("status", "inspect_git_status", {}),
+            tool_response("diff", "inspect_git_diff", {}),
+            ChatResponse(text="Created and validated the empty file."),
+        ]
+    )
+    session = AgentSession(
+        id=SessionId("empty-file-create"),
+        provider=provider,
+        tool_registry=registry,
+        max_tool_rounds=5,
+    )
+
+    result = run_autonomous_coding_task(
+        session,
+        "Create and validate empty.py.",
+        tool_approval_handler=lambda _request: ToolApprovalDecision.APPROVE,
+    )
+
+    assert len(provider.requests) == 6
+    assert result.workspace_change_applied is True
+    assert result.validation_succeeded is True
+    assert result.inspected_git_status_after_change is True
+    assert result.inspected_git_diff_after_change is True
+    assert (repository / "empty.py").is_file()
+    assert (repository / "empty.py").read_text(encoding="utf-8") == ""
+
+
+def test_no_change_requests_every_post_change_completion_gate(
+    tmp_path: Path,
+) -> None:
+    """Reject validation-only evidence for an autonomous coding task."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    workspace = Workspace(repository)
+    registry = create_coding_registry(workspace)
+
+    provider = ScriptedProvider(
+        [
+            tool_response("ruff", "run_ruff_check", {"path": "."}),
+            tool_response("pytest", "run_pytest", {"path": "."}),
+            tool_response("status", "inspect_git_status", {}),
+            tool_response("diff", "inspect_git_diff", {}),
+            ChatResponse(text="Everything passed without changes."),
+            ChatResponse(text="No change is required."),
+        ]
+    )
+    session = AgentSession(
+        id=SessionId("no-workspace-change"),
+        provider=provider,
+        tool_registry=registry,
         max_tool_rounds=4,
     )
 
     result = run_autonomous_coding_task(
         session,
-        "Validate the intentionally failing project.",
+        "Implement the requested correction.",
         tool_approval_handler=lambda _request: ToolApprovalDecision.APPROVE,
     )
 
     continuation_prompt = provider.requests[5].messages[-1]["content"]
-    assert "1. successful run_pytest" in continuation_prompt
-    assert "successful run_ruff_check" not in continuation_prompt
-    assert "inspect_git_status" not in continuation_prompt
-    assert "inspect_git_diff" not in continuation_prompt
+    expected_order = (
+        "1. successful approved workspace change\n"
+        "2. successful run_ruff_check after the latest workspace change\n"
+        "3. successful run_pytest after the latest workspace change\n"
+        "4. inspect_git_status after the latest workspace change\n"
+        "5. inspect_git_diff after the latest workspace change"
+    )
+    assert expected_order in continuation_prompt
     assert len(provider.requests) == 6
-    assert result.assistant_summary == "I cannot make further progress."
+    assert result.workspace_change_applied is False
     assert result.validation_succeeded is False
     assert result.inspected_git_status is True
     assert result.inspected_git_diff is True
+    assert result.inspected_git_status_after_change is False
+    assert result.inspected_git_diff_after_change is False
+
+
+def test_continuation_recovers_no_change_with_fresh_post_change_evidence(
+    tmp_path: Path,
+) -> None:
+    """Complete after a continuation applies and validates one real change."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    workspace = Workspace(repository)
+    registry = create_coding_registry(workspace)
+    original_content = (
+        "def add(left: int, right: int) -> int:\n    return left - right\n"
+    )
+
+    provider = ScriptedProvider(
+        [
+            tool_response("ruff-before", "run_ruff_check", {"path": "."}),
+            tool_response("pytest-before", "run_pytest", {"path": "."}),
+            tool_response("status-before", "inspect_git_status", {}),
+            tool_response("diff-before", "inspect_git_diff", {}),
+            ChatResponse(text="Validation completed without an edit."),
+            tool_response(
+                "replacement",
+                "apply_text_replacement",
+                {
+                    "path": "module.py",
+                    "expected_text": "return left - right",
+                    "replacement_text": "return left + right",
+                    "expected_file_sha256": hashlib.sha256(
+                        original_content.encode("utf-8")
+                    ).hexdigest(),
+                },
+            ),
+            tool_response("ruff-after", "run_ruff_check", {"path": "."}),
+            tool_response("pytest-after", "run_pytest", {"path": "."}),
+            tool_response("status-after", "inspect_git_status", {}),
+            tool_response("diff-after", "inspect_git_diff", {}),
+            ChatResponse(text="Applied, validated, and inspected the change."),
+        ]
+    )
+    session = AgentSession(
+        id=SessionId("recover-no-change"),
+        provider=provider,
+        tool_registry=registry,
+        max_tool_rounds=5,
+    )
+
+    result = run_autonomous_coding_task(
+        session,
+        "Correct the add implementation.",
+        tool_approval_handler=lambda _request: ToolApprovalDecision.APPROVE,
+    )
+
+    continuation_prompt = provider.requests[5].messages[-1]["content"]
+    assert "successful approved workspace change" in continuation_prompt
+    assert len(provider.requests) == 11
+    assert result.assistant_summary == ("Applied, validated, and inspected the change.")
+    assert result.workspace_change_applied is True
+    assert result.validation_succeeded is True
+    assert result.inspected_git_status_after_change is True
+    assert result.inspected_git_diff_after_change is True
+
+
+def test_change_after_stale_evidence_remains_incomplete_without_third_turn(
+    tmp_path: Path,
+) -> None:
+    """Require fresh validation and Git evidence after a continuation edit."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    workspace = Workspace(repository)
+    registry = create_coding_registry(workspace)
+    original_content = (
+        "def add(left: int, right: int) -> int:\n    return left - right\n"
+    )
+
+    provider = ScriptedProvider(
+        [
+            tool_response("ruff", "run_ruff_check", {"path": "."}),
+            tool_response("pytest", "run_pytest", {"path": "."}),
+            tool_response("status", "inspect_git_status", {}),
+            tool_response("diff", "inspect_git_diff", {}),
+            ChatResponse(text="Validation completed without an edit."),
+            tool_response(
+                "replacement",
+                "apply_text_replacement",
+                {
+                    "path": "module.py",
+                    "expected_text": "return left - right",
+                    "replacement_text": "return left + right",
+                    "expected_file_sha256": hashlib.sha256(
+                        original_content.encode("utf-8")
+                    ).hexdigest(),
+                },
+            ),
+            ChatResponse(text="Applied the requested edit."),
+        ]
+    )
+    session = AgentSession(
+        id=SessionId("stale-evidence-after-change"),
+        provider=provider,
+        tool_registry=registry,
+        max_tool_rounds=4,
+    )
+
+    result = run_autonomous_coding_task(
+        session,
+        "Correct the add implementation.",
+        tool_approval_handler=lambda _request: ToolApprovalDecision.APPROVE,
+    )
+
+    assert len(provider.requests) == 7
+    assert result.workspace_change_applied is True
+    assert result.validation_succeeded is False
+    assert result.inspected_git_status is True
+    assert result.inspected_git_diff is True
+    assert result.inspected_git_status_after_change is False
+    assert result.inspected_git_diff_after_change is False
 
 
 def test_approval_denial_does_not_issue_a_continuation(

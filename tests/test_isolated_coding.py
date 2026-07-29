@@ -78,12 +78,18 @@ def approve(_request) -> ToolApprovalDecision:
 
 def coding_result(
     *,
+    workspace_change_applied: bool = True,
     validation_succeeded: bool = True,
+    validation_after_change: bool = True,
     inspected_git_status: bool = True,
     inspected_git_diff: bool = True,
+    git_inspection_after_change: bool = True,
 ) -> AutonomousCodingResult:
     """Create one deterministic autonomous coding outcome."""
 
+    change_index = 2 if workspace_change_applied else None
+    validation_offset = 3 if validation_after_change else 0
+    git_offset = 5 if git_inspection_after_change else 1
     pytest_exit_code = 0 if validation_succeeded else 1
     return AutonomousCodingResult(
         task_spec=TaskSpec(
@@ -110,15 +116,20 @@ def coding_result(
                 tool_name="run_ruff_check",
                 result_status="success",
                 exit_code=0,
+                sequence_index=validation_offset,
             ),
             ValidationRun(
                 tool_name="run_pytest",
                 result_status="success",
                 exit_code=pytest_exit_code,
+                sequence_index=validation_offset + 1,
             ),
         ),
         inspected_git_status=inspected_git_status,
         inspected_git_diff=inspected_git_diff,
+        last_workspace_change_sequence_index=change_index,
+        latest_git_status_sequence_index=(git_offset if inspected_git_status else None),
+        latest_git_diff_sequence_index=(git_offset + 1 if inspected_git_diff else None),
     )
 
 
@@ -238,16 +249,28 @@ def test_runs_isolated_task_and_creates_verified_local_commit(
     ("result", "message"),
     [
         (
+            coding_result(workspace_change_applied=False),
+            "successful approved workspace change",
+        ),
+        (
             coding_result(validation_succeeded=False),
-            "successful Ruff and pytest validation",
+            "successful Ruff and pytest validation after the latest workspace change",
+        ),
+        (
+            coding_result(validation_after_change=False),
+            "successful Ruff and pytest validation after the latest workspace change",
         ),
         (
             coding_result(inspected_git_status=False),
-            "final Git status and diff",
+            "final Git status and diff after the latest workspace change",
         ),
         (
             coding_result(inspected_git_diff=False),
-            "final Git status and diff",
+            "final Git status and diff after the latest workspace change",
+        ),
+        (
+            coding_result(git_inspection_after_change=False),
+            "final Git status and diff after the latest workspace change",
         ),
     ],
 )
