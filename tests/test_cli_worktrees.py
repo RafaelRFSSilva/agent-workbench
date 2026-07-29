@@ -187,6 +187,7 @@ def isolated_workflow_result() -> SimpleNamespace:
             validation_succeeded=True,
             inspected_git_status=True,
             inspected_git_diff=True,
+            workspace_change_applied=True,
         ),
         commit_result=SimpleNamespace(
             branch_name="agent/task",
@@ -411,3 +412,75 @@ def test_main_reports_isolated_workflow_failure_without_fallback(
     assert "preserved for manual recovery" in output
     assert "Traceback" not in output
     assert "Isolated autonomous workflow result:" not in output
+
+
+@pytest.mark.parametrize(
+    ("workspace_change_applied", "expected"),
+    [
+        (True, "yes"),
+        (False, "no"),
+    ],
+)
+def test_workspace_change_applied_line_in_cli_output(
+    monkeypatch, capsys, workspace_change_applied, expected
+):
+    runtime = configuration(
+        workspace_root=Path("/source"),
+        enable_actions=True,
+        worktree_path=Path("/isolated"),
+        worktree_branch="agent/task",
+    )
+
+    def isolated_workflow_result() -> SimpleNamespace:
+        return SimpleNamespace(
+            worktree=SimpleNamespace(target_display="../isolated"),
+            coding_result=SimpleNamespace(
+                assistant_summary="Corrected and validated the implementation.",
+                tool_round_count=6,
+                validation_succeeded=True,
+                inspected_git_status=True,
+                inspected_git_diff=True,
+                workspace_change_applied=workspace_change_applied,
+            ),
+            commit_result=SimpleNamespace(
+                branch_name="agent/task",
+                new_head="b" * 40,
+                operation_count=2,
+            ),
+            final_worktree_state=SimpleNamespace(clean=True),
+        )
+
+    workflow = Mock(return_value=isolated_workflow_result())
+    create_session = Mock(
+        side_effect=AssertionError("source session must not be created")
+    )
+    monkeypatch.setattr("agent_workbench.cli.load_environment", Mock())
+    monkeypatch.setattr(
+        "agent_workbench.cli.resolve_runtime_configuration", Mock(return_value=runtime)
+    )
+    monkeypatch.setattr(
+        "agent_workbench.cli.run_isolated_autonomous_workflow", workflow
+    )
+    monkeypatch.setattr("agent_workbench.cli.create_agent_session", create_session)
+
+    main(
+        [
+            "--workspace",
+            "/source",
+            "--enable-actions",
+            "--task",
+            "Correct the add implementation.",
+            "--worktree-path",
+            "/isolated",
+            "--worktree-branch",
+            "agent/task",
+            "--commit-message",
+            "fix: correct add implementation",
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert f"Workspace change applied: {expected}" in output
+    idx_ws = output.index(f"Workspace change applied: {expected}")
+    idx_val = output.index("Validation succeeded:")
+    assert idx_ws < idx_val
