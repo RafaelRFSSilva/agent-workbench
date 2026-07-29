@@ -15,6 +15,55 @@ from agent_workbench.tools import (
 
 type ToolRoundObserver = Callable[[ToolInteractionRound], None]
 
+MAX_TOOL_INVOCATIONS_PER_RESPONSE = 8
+_MAX_TOOL_BATCH_RECOVERIES = 1
+_TOOL_BATCH_RECOVERY_INSTRUCTION = (
+    "The previous response requested an unsafe tool-call batch. Retry with at "
+    f"most {MAX_TOOL_INVOCATIONS_PER_RESPONSE} necessary tool calls, do not "
+    "repeat the same tool with identical arguments in one response, and wait "
+    "for the returned results before requesting more. If no tool call is "
+    "needed, respond normally."
+)
+
+
+def _requires_tool_batch_recovery(response: ChatResponse) -> bool:
+    """Return whether one provider response contains an unsafe tool batch."""
+
+    invocations = response.tool_invocations
+
+    if len(invocations) > MAX_TOOL_INVOCATIONS_PER_RESPONSE:
+        return True
+
+    for index, invocation in enumerate(invocations):
+        if any(
+            invocation.tool_name == previous.tool_name
+            and invocation.arguments == previous.arguments
+            for previous in invocations[:index]
+        ):
+            return True
+
+    return False
+
+
+def _add_tool_batch_recovery_instruction(
+    request: ChatRequest,
+    completed_rounds: tuple[ToolInteractionRound, ...],
+) -> ChatRequest:
+    """Return one temporary corrective request without rejected tool data."""
+
+    if request.system_prompt is None:
+        corrected_system_prompt = _TOOL_BATCH_RECOVERY_INSTRUCTION
+    else:
+        corrected_system_prompt = (
+            f"{request.system_prompt}\n\n{_TOOL_BATCH_RECOVERY_INSTRUCTION}"
+        )
+
+    return replace(
+        request,
+        system_prompt=corrected_system_prompt,
+        tool_interactions=completed_rounds,
+    )
+
 
 def run_tool_calling_loop(
     provider: ChatProvider,
@@ -40,9 +89,23 @@ def run_tool_calling_loop(
     completed_rounds = request.tool_interactions
     current_request = request
     executed_rounds = 0
+    tool_batch_recoveries = 0
 
     while True:
         response = provider.complete(current_request)
+
+        if response.tool_invocations and _requires_tool_batch_recovery(response):
+            if tool_batch_recoveries >= _MAX_TOOL_BATCH_RECOVERIES:
+                raise CompletionError(
+                    "The provider repeatedly requested an unsafe tool-call batch."
+                )
+
+            tool_batch_recoveries += 1
+            current_request = _add_tool_batch_recovery_instruction(
+                request,
+                completed_rounds,
+            )
+            continue
 
         if not response.tool_invocations:
             return response

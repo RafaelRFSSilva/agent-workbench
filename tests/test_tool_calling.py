@@ -13,7 +13,10 @@ from agent_workbench.messages import (
     ToolInteractionRound,
 )
 from agent_workbench.structured_outputs import JSONResponseFormat
-from agent_workbench.tool_calling import run_tool_calling_loop
+from agent_workbench.tool_calling import (
+    MAX_TOOL_INVOCATIONS_PER_RESPONSE,
+    run_tool_calling_loop,
+)
 from agent_workbench.tool_registry import ToolRegistry
 from agent_workbench.tools import (
     ToolApprovalDecision,
@@ -256,6 +259,208 @@ def test_executes_multiple_invocations_in_provider_order() -> None:
         "call-1",
         "call-2",
     )
+
+
+def test_recovers_one_oversized_tool_batch_without_executing_it() -> None:
+    """Retry one oversized batch without executing or exposing rejected calls."""
+
+    executions: list[dict[str, object]] = []
+    observed_rounds: list[ToolInteractionRound] = []
+    calculator = create_calculator_definition()
+    registry = ToolRegistry()
+    registry.register(
+        calculator,
+        lambda arguments: executions.append(arguments) or {"value": 4},
+    )
+    rejected_response = create_tool_response(
+        *(
+            ToolInvocation(
+                id=f"rejected-{index}",
+                tool_name="calculator",
+                arguments={"expression": f"secret-{index}"},
+            )
+            for index in range(MAX_TOOL_INVOCATIONS_PER_RESPONSE + 1)
+        )
+    )
+    accepted_response = create_tool_response(
+        ToolInvocation(
+            id="accepted",
+            tool_name="calculator",
+            arguments={"expression": "2 + 2"},
+        )
+    )
+    final_response = ChatResponse(text="Recovered.")
+    provider = FakeProvider(
+        [
+            rejected_response,
+            accepted_response,
+            final_response,
+        ]
+    )
+    request = ChatRequest(
+        messages=[{"role": "user", "content": "Calculate."}],
+        system_prompt="Base instructions.",
+        tools=(calculator,),
+    )
+
+    result = run_tool_calling_loop(
+        provider,
+        request,
+        registry,
+        max_tool_rounds=1,
+        tool_round_observer=observed_rounds.append,
+    )
+
+    assert result is final_response
+    assert executions == [{"expression": "2 + 2"}]
+    assert len(observed_rounds) == 1
+    assert observed_rounds[0].response is accepted_response
+    assert len(provider.requests) == 3
+    assert provider.requests[0] is request
+
+    recovery_request = provider.requests[1]
+    assert recovery_request.messages is request.messages
+    assert recovery_request.tools is request.tools
+    assert recovery_request.tool_interactions == ()
+    assert recovery_request.system_prompt is not None
+    assert recovery_request.system_prompt.startswith("Base instructions.\n\n")
+    assert (
+        f"at most {MAX_TOOL_INVOCATIONS_PER_RESPONSE} necessary tool calls"
+        in recovery_request.system_prompt
+    )
+    assert "secret-0" not in recovery_request.system_prompt
+
+    continued_request = provider.requests[2]
+    assert continued_request.system_prompt == request.system_prompt
+    assert continued_request.tool_interactions == tuple(observed_rounds)
+
+
+def test_recovers_duplicate_tool_batch_without_executing_it() -> None:
+    """Reject duplicate tool requests and allow one clean text retry."""
+
+    executions: list[dict[str, object]] = []
+    calculator = create_calculator_definition()
+    registry = ToolRegistry()
+    registry.register(
+        calculator,
+        lambda arguments: executions.append(arguments) or {"value": 4},
+    )
+    duplicate_response = create_tool_response(
+        ToolInvocation(
+            id="duplicate-1",
+            tool_name="calculator",
+            arguments={"expression": "2 + 2"},
+        ),
+        ToolInvocation(
+            id="duplicate-2",
+            tool_name="calculator",
+            arguments={"expression": "2 + 2"},
+        ),
+    )
+    final_response = ChatResponse(text="No tool call is needed.")
+    provider = FakeProvider([duplicate_response, final_response])
+
+    result = run_tool_calling_loop(
+        provider,
+        ChatRequest(messages=[]),
+        registry,
+        max_tool_rounds=1,
+    )
+
+    assert result is final_response
+    assert executions == []
+    assert len(provider.requests) == 2
+    assert provider.requests[1].tool_interactions == ()
+
+
+def test_repeated_unsafe_tool_batches_fail_after_one_recovery() -> None:
+    """Stop safely when the single corrective retry is also unsafe."""
+
+    executions: list[dict[str, object]] = []
+    observed_rounds: list[ToolInteractionRound] = []
+    calculator = create_calculator_definition()
+    registry = ToolRegistry()
+    registry.register(
+        calculator,
+        lambda arguments: executions.append(arguments) or {"value": 4},
+    )
+
+    def oversized_response(prefix: str) -> ChatResponse:
+        return create_tool_response(
+            *(
+                ToolInvocation(
+                    id=f"{prefix}-{index}",
+                    tool_name="calculator",
+                    arguments={"expression": f"{prefix}-secret-{index}"},
+                )
+                for index in range(MAX_TOOL_INVOCATIONS_PER_RESPONSE + 1)
+            )
+        )
+
+    provider = FakeProvider(
+        [
+            oversized_response("first"),
+            oversized_response("second"),
+        ]
+    )
+
+    with pytest.raises(
+        CompletionError,
+        match="repeatedly requested an unsafe tool-call batch",
+    ) as raised_error:
+        run_tool_calling_loop(
+            provider,
+            ChatRequest(messages=[]),
+            registry,
+            max_tool_rounds=1,
+            tool_round_observer=observed_rounds.append,
+        )
+
+    assert len(provider.requests) == 2
+    assert executions == []
+    assert observed_rounds == []
+    assert "secret" not in str(raised_error.value)
+
+
+def test_executes_the_maximum_safe_tool_batch() -> None:
+    """Execute a distinct batch exactly at the fixed safety boundary."""
+
+    executions: list[dict[str, object]] = []
+    calculator = create_calculator_definition()
+    registry = ToolRegistry()
+    registry.register(
+        calculator,
+        lambda arguments: executions.append(arguments) or {"value": 4},
+    )
+    safe_response = create_tool_response(
+        *(
+            ToolInvocation(
+                id=f"call-{index}",
+                tool_name="calculator",
+                arguments={"expression": f"{index} + 1"},
+            )
+            for index in range(MAX_TOOL_INVOCATIONS_PER_RESPONSE)
+        )
+    )
+    provider = FakeProvider(
+        [
+            safe_response,
+            ChatResponse(text="Completed."),
+        ]
+    )
+
+    result = run_tool_calling_loop(
+        provider,
+        ChatRequest(messages=[]),
+        registry,
+        max_tool_rounds=1,
+    )
+
+    assert result.text == "Completed."
+    assert executions == [
+        {"expression": f"{index} + 1"}
+        for index in range(MAX_TOOL_INVOCATIONS_PER_RESPONSE)
+    ]
 
 
 def test_appends_multiple_tool_rounds_before_final_response() -> None:
