@@ -13,6 +13,7 @@ from agent_workbench.workspace import Workspace
 from agent_workbench.workspace_tools import (
     MAX_DIRECTORY_ENTRIES,
     MAX_FILE_SIZE_BYTES,
+    MAX_LIST_DEPTH,
     MAX_READ_LINES,
     MAX_SEARCH_FILE_BYTES,
     MAX_SEARCH_FILES,
@@ -65,7 +66,10 @@ def test_registers_workspace_tools_in_order_with_exact_schemas(
         "search_text",
     )
     assert tuple(definition.description for definition in registry.definitions) == (
-        "List the direct entries of a directory inside the authorized workspace.",
+        (
+            "List directory entries inside the authorized workspace with optional "
+            "bounded recursive depth."
+        ),
         (
             "Read all or an inclusive bounded line range from a UTF-8 text file "
             "inside the authorized workspace and return the complete file SHA-256."
@@ -78,7 +82,12 @@ def test_registers_workspace_tools_in_order_with_exact_schemas(
             "properties": {
                 "path": {
                     "type": "string",
-                }
+                },
+                "depth": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_LIST_DEPTH,
+                },
             },
             "required": ["path"],
             "additionalProperties": False,
@@ -257,6 +266,159 @@ def test_rejects_directory_entry_count_above_the_limit(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="directory contains too many entries"):
         list_workspace_files(workspace, {"path": "."})
+
+
+def test_list_files_depth_constant_and_explicit_depth_one(
+    tmp_path: Path,
+) -> None:
+    """Expose the bounded depth and preserve direct-child behavior."""
+
+    assert MAX_LIST_DEPTH == 4
+    root, workspace = create_workspace(tmp_path)
+    (root / "alpha").mkdir()
+    (root / "alpha" / "nested.txt").write_text("nested", encoding="utf-8")
+    (root / "zeta.txt").write_text("zeta", encoding="utf-8")
+
+    omitted = list_workspace_files(workspace, {"path": "."})
+    explicit = list_workspace_files(workspace, {"path": ".", "depth": 1})
+
+    assert explicit == omitted
+    assert "depth" not in explicit
+    assert [entry["path"] for entry in explicit["entries"]] == [
+        "alpha",
+        "zeta.txt",
+    ]
+
+
+def test_lists_recursive_entries_in_complete_path_order(tmp_path: Path) -> None:
+    """Traverse to depth two with hidden entries and complete path ordering."""
+
+    root, workspace = create_workspace(tmp_path)
+    alpha = root / "alpha"
+    alpha.mkdir()
+    (alpha / ".hidden").write_text("hidden", encoding="utf-8")
+    (alpha / "beta").mkdir()
+    (alpha / "beta" / "too-deep.txt").write_text("deep", encoding="utf-8")
+    (root / "alpha-z.txt").write_text("root", encoding="utf-8")
+
+    result = list_workspace_files(workspace, {"path": ".", "depth": 2})
+
+    assert [entry["path"] for entry in result["entries"]] == [
+        "alpha",
+        "alpha-z.txt",
+        "alpha/.hidden",
+        "alpha/beta",
+    ]
+    assert result["entries"][0]["type"] == "directory"
+
+
+def test_lists_through_the_maximum_depth(tmp_path: Path) -> None:
+    """Traverse descendants through exactly MAX_LIST_DEPTH levels."""
+
+    root, workspace = create_workspace(tmp_path)
+    current = root
+    expected_paths = []
+    for level in range(1, MAX_LIST_DEPTH + 1):
+        current = current / f"level-{level}"
+        current.mkdir()
+        expected_paths.append(current.relative_to(root).as_posix())
+    (current / "beyond.txt").write_text("beyond", encoding="utf-8")
+
+    result = list_workspace_files(
+        workspace,
+        {"path": ".", "depth": MAX_LIST_DEPTH},
+    )
+
+    assert [entry["path"] for entry in result["entries"]] == expected_paths
+
+
+def test_does_not_descend_through_symlink_directories(tmp_path: Path) -> None:
+    """Show directory symlinks without traversing their targets."""
+
+    root, workspace = create_workspace(tmp_path)
+    target = root / "target"
+    target.mkdir()
+    (target / "inside.txt").write_text("inside", encoding="utf-8")
+    (root / "target-link").symlink_to(target, target_is_directory=True)
+
+    result = list_workspace_files(workspace, {"path": ".", "depth": 2})
+
+    assert [entry["path"] for entry in result["entries"]] == [
+        "target",
+        "target-link",
+        "target/inside.txt",
+    ]
+    assert result["entries"][1]["type"] == "symlink"
+
+
+def test_enforces_total_recursive_entry_boundary(tmp_path: Path) -> None:
+    """Allow 128 total entries and reject a recursive 129th entry."""
+
+    root, workspace = create_workspace(tmp_path)
+    nested = root / "nested"
+    nested.mkdir()
+    for index in range(MAX_DIRECTORY_ENTRIES - 1):
+        (nested / f"entry-{index:03d}.txt").write_text(
+            "entry",
+            encoding="utf-8",
+        )
+
+    result = list_workspace_files(workspace, {"path": ".", "depth": 2})
+    assert len(result["entries"]) == MAX_DIRECTORY_ENTRIES
+
+    (nested / "overflow.txt").write_text("overflow", encoding="utf-8")
+    with pytest.raises(
+        ToolArgumentError,
+        match="directory contains too many entries",
+    ):
+        list_workspace_files(workspace, {"path": ".", "depth": 2})
+
+
+@pytest.mark.parametrize(
+    "arguments, message",
+    [
+        (None, "requires an object"),
+        ({}, "path is required"),
+        ({"path": 1}, "path must be a string"),
+        ({"path": ".", "unknown": 1}, "unsupported fields: unknown"),
+        ({"path": ".", "depth": True}, "depth must be an integer"),
+        ({"path": ".", "depth": 1.5}, "depth must be an integer"),
+        ({"path": ".", "depth": 0}, "depth must be between"),
+        ({"path": ".", "depth": -1}, "depth must be between"),
+        (
+            {"path": ".", "depth": MAX_LIST_DEPTH + 1},
+            "depth must be between",
+        ),
+    ],
+)
+def test_rejects_invalid_list_files_arguments(
+    tmp_path: Path,
+    arguments: object,
+    message: str,
+) -> None:
+    """Reject invalid path, depth, and unsupported list_files arguments."""
+
+    _, workspace = create_workspace(tmp_path)
+
+    with pytest.raises(ToolArgumentError, match=message):
+        list_workspace_files(workspace, arguments)
+
+
+def test_list_files_preserves_arguments_and_working_directory(
+    tmp_path: Path,
+) -> None:
+    """Leave caller arguments and the process working directory unchanged."""
+
+    root, workspace = create_workspace(tmp_path)
+    (root / "notes.txt").write_text("notes", encoding="utf-8")
+    arguments = {"path": ".", "depth": 2}
+    original_arguments = dict(arguments)
+    original_cwd = Path.cwd()
+
+    list_workspace_files(workspace, arguments)
+
+    assert arguments == original_arguments
+    assert Path.cwd() == original_cwd
 
 
 def test_reads_valid_utf8_with_canonical_relative_path(tmp_path: Path) -> None:
@@ -580,23 +742,35 @@ def test_registry_handler_returns_partial_read_metadata(tmp_path: Path) -> None:
 def test_registry_returns_recoverable_list_files_argument_error(
     tmp_path: Path,
 ) -> None:
-    """Return a safe correctable error for invalid list_files arguments."""
+    """Return safe correctable errors for invalid list_files arguments."""
 
     _, workspace = create_workspace(tmp_path)
     registry = ToolRegistry()
     register_workspace_tools(registry, workspace)
 
-    result = registry.execute(
+    unsupported = registry.execute(
         ToolInvocation(
             id="list-invalid-1",
             tool_name="list_files",
-            arguments={"path": ".", "depth": 1},
+            arguments={"path": ".", "unknown": 1},
+        )
+    )
+    invalid_depth = registry.execute(
+        ToolInvocation(
+            id="list-invalid-2",
+            tool_name="list_files",
+            arguments={"path": ".", "depth": True},
         )
     )
 
-    assert result.status == "error"
-    assert result.error == (
-        "Invalid tool arguments: list_files accepts only one path string argument."
+    assert unsupported.status == "error"
+    assert unsupported.error == (
+        "Invalid tool arguments: list_files has unsupported fields: unknown."
+    )
+    assert invalid_depth.status == "error"
+    assert invalid_depth.error == (
+        "Invalid tool arguments: "
+        f"list_files depth must be an integer between 1 and {MAX_LIST_DEPTH}."
     )
 
 
