@@ -5,7 +5,13 @@ from collections.abc import Iterable
 from pathlib import Path
 import subprocess
 
-from agent_workbench.coding_loop import run_autonomous_coding_task
+import pytest
+
+from agent_workbench.coding_loop import (
+    MAX_AUTONOMOUS_COMPLETION_CONTINUATIONS,
+    run_autonomous_coding_task,
+)
+from agent_workbench.errors import CompletionError
 from agent_workbench.git_tools import register_git_tools
 from agent_workbench.messages import ChatRequest, ChatResponse
 from agent_workbench.session import AgentSession, SessionId
@@ -264,6 +270,22 @@ def test_recovers_from_invalid_validation_preview_and_retries(
                 {"path": "."},
             ),
             ChatResponse(text="Recovered from the invalid path and completed pytest."),
+            tool_response(
+                "ruff",
+                "run_ruff_check",
+                {"path": "."},
+            ),
+            tool_response(
+                "status",
+                "inspect_git_status",
+                {},
+            ),
+            tool_response(
+                "diff",
+                "inspect_git_diff",
+                {},
+            ),
+            ChatResponse(text="Completed the remaining mandatory checks."),
         ]
     )
 
@@ -271,7 +293,7 @@ def test_recovers_from_invalid_validation_preview_and_retries(
         id=SessionId("preview-recovery-test"),
         provider=provider,
         tool_registry=registry,
-        max_tool_rounds=2,
+        max_tool_rounds=3,
     )
 
     approval_requests = []
@@ -286,24 +308,44 @@ def test_recovers_from_invalid_validation_preview_and_retries(
         tool_approval_handler=approve,
     )
 
-    assert len(approval_requests) == 1
-    assert approval_requests[0].invocation.id == "valid-pytest"
+    assert len(approval_requests) == 2
+    assert tuple(request.invocation.id for request in approval_requests) == (
+        "valid-pytest",
+        "ruff",
+    )
 
-    assert result.tool_round_count == 2
+    assert result.tool_round_count == 5
     assert result.executed_tool_names == (
         "run_pytest",
         "run_pytest",
+        "run_ruff_check",
+        "inspect_git_status",
+        "inspect_git_diff",
     )
-    assert result.approved_action_names == ("run_pytest",)
+    assert result.approved_action_names == (
+        "run_pytest",
+        "run_ruff_check",
+    )
 
     assert tuple(validation.result_status for validation in result.validation_runs) == (
         "error",
+        "success",
         "success",
     )
     assert tuple(validation.exit_code for validation in result.validation_runs) == (
         None,
         0,
+        0,
     )
+    assert result.validation_succeeded is True
+    assert result.inspected_git_status is True
+    assert result.inspected_git_diff is True
+
+    continuation_prompt = provider.requests[3].messages[-1]["content"]
+    assert "successful run_ruff_check" in continuation_prompt
+    assert "successful run_pytest" not in continuation_prompt
+    assert "inspect_git_status" in continuation_prompt
+    assert "inspect_git_diff" in continuation_prompt
 
     invalid_result = provider.requests[1].tool_interactions[0].results[0]
     assert invalid_result.status == "error"
@@ -315,3 +357,226 @@ def test_recovers_from_invalid_validation_preview_and_retries(
     valid_result = provider.requests[2].tool_interactions[1].results[0]
     assert valid_result.status == "success"
     assert valid_result.output["exit_code"] == 0
+
+
+def test_continues_once_after_an_early_final_response(
+    tmp_path: Path,
+) -> None:
+    """Continue one edited task until all mandatory evidence is collected."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    workspace = Workspace(repository)
+    registry = create_coding_registry(workspace)
+    original_content = (
+        "def add(left: int, right: int) -> int:\n    return left - right\n"
+    )
+
+    provider = ScriptedProvider(
+        [
+            tool_response(
+                "replacement",
+                "apply_text_replacement",
+                {
+                    "path": "module.py",
+                    "expected_text": "return left - right",
+                    "replacement_text": "return left + right",
+                    "expected_file_sha256": hashlib.sha256(
+                        original_content.encode("utf-8")
+                    ).hexdigest(),
+                },
+            ),
+            ChatResponse(text="Implemented the requested edit."),
+            tool_response("ruff", "run_ruff_check", {"path": "."}),
+            tool_response("pytest", "run_pytest", {"path": "."}),
+            tool_response("status", "inspect_git_status", {}),
+            tool_response("diff", "inspect_git_diff", {}),
+            ChatResponse(text="Validation and Git inspection are complete."),
+        ]
+    )
+    session = AgentSession(
+        id=SessionId("early-final-continuation"),
+        provider=provider,
+        tool_registry=registry,
+        max_tool_rounds=4,
+    )
+    approval_requests = []
+    observed_rounds = []
+
+    def approve(request):
+        approval_requests.append(request)
+        return ToolApprovalDecision.APPROVE
+
+    result = run_autonomous_coding_task(
+        session,
+        "Correct the add implementation.",
+        tool_approval_handler=approve,
+        tool_round_observer=observed_rounds.append,
+    )
+
+    assert MAX_AUTONOMOUS_COMPLETION_CONTINUATIONS == 1
+    assert result.assistant_summary == "Validation and Git inspection are complete."
+    assert result.tool_round_count == 5
+    assert result.executed_tool_names == (
+        "apply_text_replacement",
+        "run_ruff_check",
+        "run_pytest",
+        "inspect_git_status",
+        "inspect_git_diff",
+    )
+    assert result.approved_action_names == (
+        "apply_text_replacement",
+        "run_ruff_check",
+        "run_pytest",
+    )
+    assert result.validation_succeeded is True
+    assert result.inspected_git_status is True
+    assert result.inspected_git_diff is True
+    assert len(observed_rounds) == 5
+    assert len(provider.requests) == 7
+
+    continuation_prompt = provider.requests[2].messages[-1]["content"]
+    expected_order = (
+        "1. successful run_ruff_check\n"
+        "2. successful run_pytest\n"
+        "3. inspect_git_status\n"
+        "4. inspect_git_diff"
+    )
+    assert expected_order in continuation_prompt
+    assert "Do not repeat already completed work unnecessarily." in (
+        continuation_prompt
+    )
+
+
+def test_continuation_requests_only_missing_git_inspection(
+    tmp_path: Path,
+) -> None:
+    """Do not ask the model to repeat validations that already succeeded."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    (repository / "module.py").write_text(
+        "def add(left: int, right: int) -> int:\n    return left + right\n",
+        encoding="utf-8",
+    )
+    workspace = Workspace(repository)
+    registry = create_coding_registry(workspace)
+
+    provider = ScriptedProvider(
+        [
+            tool_response("ruff", "run_ruff_check", {"path": "."}),
+            tool_response("pytest", "run_pytest", {"path": "."}),
+            ChatResponse(text="Validation completed."),
+            tool_response("status", "inspect_git_status", {}),
+            tool_response("diff", "inspect_git_diff", {}),
+            ChatResponse(text="Git inspection completed."),
+        ]
+    )
+    session = AgentSession(
+        id=SessionId("missing-git-continuation"),
+        provider=provider,
+        tool_registry=registry,
+        max_tool_rounds=2,
+    )
+
+    result = run_autonomous_coding_task(
+        session,
+        "Validate and inspect the project.",
+        tool_approval_handler=lambda _request: ToolApprovalDecision.APPROVE,
+    )
+
+    continuation_prompt = provider.requests[3].messages[-1]["content"]
+    assert "1. inspect_git_status\n2. inspect_git_diff" in continuation_prompt
+    assert "successful run_ruff_check" not in continuation_prompt
+    assert "successful run_pytest" not in continuation_prompt
+    assert result.validation_succeeded is True
+    assert result.inspected_git_status is True
+    assert result.inspected_git_diff is True
+
+
+def test_unsuccessful_validation_gets_one_bounded_continuation(
+    tmp_path: Path,
+) -> None:
+    """Request a failed validation again without issuing a third model turn."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    workspace = Workspace(repository)
+    registry = create_coding_registry(workspace)
+
+    provider = ScriptedProvider(
+        [
+            tool_response("ruff", "run_ruff_check", {"path": "."}),
+            tool_response("pytest", "run_pytest", {"path": "."}),
+            tool_response("status", "inspect_git_status", {}),
+            tool_response("diff", "inspect_git_diff", {}),
+            ChatResponse(text="The checks were attempted."),
+            ChatResponse(text="I cannot make further progress."),
+        ]
+    )
+    session = AgentSession(
+        id=SessionId("failed-validation-continuation"),
+        provider=provider,
+        tool_registry=registry,
+        max_tool_rounds=4,
+    )
+
+    result = run_autonomous_coding_task(
+        session,
+        "Validate the intentionally failing project.",
+        tool_approval_handler=lambda _request: ToolApprovalDecision.APPROVE,
+    )
+
+    continuation_prompt = provider.requests[5].messages[-1]["content"]
+    assert "1. successful run_pytest" in continuation_prompt
+    assert "successful run_ruff_check" not in continuation_prompt
+    assert "inspect_git_status" not in continuation_prompt
+    assert "inspect_git_diff" not in continuation_prompt
+    assert len(provider.requests) == 6
+    assert result.assistant_summary == "I cannot make further progress."
+    assert result.validation_succeeded is False
+    assert result.inspected_git_status is True
+    assert result.inspected_git_diff is True
+
+
+def test_approval_denial_does_not_issue_a_continuation(
+    tmp_path: Path,
+) -> None:
+    """Preserve default-deny behavior without sending another model request."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    workspace = Workspace(repository)
+    registry = create_coding_registry(workspace)
+    original_content = (
+        "def add(left: int, right: int) -> int:\n    return left - right\n"
+    )
+
+    provider = ScriptedProvider(
+        [
+            tool_response(
+                "replacement",
+                "apply_text_replacement",
+                {
+                    "path": "module.py",
+                    "expected_text": "return left - right",
+                    "replacement_text": "return left + right",
+                    "expected_file_sha256": hashlib.sha256(
+                        original_content.encode("utf-8")
+                    ).hexdigest(),
+                },
+            )
+        ]
+    )
+    session = AgentSession(
+        id=SessionId("denied-continuation"),
+        provider=provider,
+        tool_registry=registry,
+        max_tool_rounds=1,
+    )
+
+    with pytest.raises(CompletionError, match="approval was denied"):
+        run_autonomous_coding_task(
+            session,
+            "Correct the add implementation.",
+            tool_approval_handler=lambda _request: ToolApprovalDecision.DENY,
+        )
+
+    assert len(provider.requests) == 1
+    assert (repository / "module.py").read_text(encoding="utf-8") == (original_content)
