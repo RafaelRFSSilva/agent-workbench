@@ -303,6 +303,10 @@ def _display_isolated_autonomous_result(
     print(f"  Committed paths: {commit_result.operation_count}")
     print(f"  Tool rounds: {coding_result.tool_round_count}")
     print(
+        "  Workspace change applied: "
+        f"{'yes' if coding_result.workspace_change_applied else 'no'}"
+    )
+    print(
         "  Validation succeeded: "
         f"{'yes' if coding_result.validation_succeeded else 'no'}"
     )
