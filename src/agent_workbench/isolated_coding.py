@@ -239,17 +239,26 @@ def _validate_commit_message_input(message: object) -> str:
 def _require_commit_gates(coding_result: AutonomousCodingResult) -> None:
     """Require successful validation and final Git inspection before planning."""
 
+    if not coding_result.workspace_change_applied:
+        raise CompletionError(
+            "Isolated autonomous coding did not complete a successful approved "
+            "workspace change. The worktree and local branch were preserved "
+            "for manual recovery."
+        )
     if not coding_result.validation_succeeded:
         raise CompletionError(
             "Isolated autonomous coding did not complete successful Ruff and "
-            "pytest validation. The worktree and local branch were preserved "
-            "for manual recovery."
+            "pytest validation after the latest workspace change. The worktree "
+            "and local branch were preserved for manual recovery."
         )
-    if not coding_result.inspected_git_status or not coding_result.inspected_git_diff:
+    if (
+        not coding_result.inspected_git_status_after_change
+        or not coding_result.inspected_git_diff_after_change
+    ):
         raise CompletionError(
             "Isolated autonomous coding did not inspect the final Git status "
-            "and diff. The worktree and local branch were preserved for manual "
-            "recovery."
+            "and diff after the latest workspace change. The worktree and local "
+            "branch were preserved for manual recovery."
         )
 
 
