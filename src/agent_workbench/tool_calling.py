@@ -17,12 +17,30 @@ type ToolRoundObserver = Callable[[ToolInteractionRound], None]
 
 MAX_TOOL_INVOCATIONS_PER_RESPONSE = 8
 _MAX_TOOL_BATCH_RECOVERIES = 1
+_MAX_REPEATED_TOOL_BATCH_RECOVERIES = 1
+_REPEATED_INSPECTION_TOOL_NAMES = frozenset(
+    {
+        "inspect_git_diff",
+        "inspect_git_status",
+        "list_files",
+        "read_file",
+        "search_symbols",
+        "search_text",
+    }
+)
 _TOOL_BATCH_RECOVERY_INSTRUCTION = (
     "The previous response requested an unsafe tool-call batch. Retry with at "
     f"most {MAX_TOOL_INVOCATIONS_PER_RESPONSE} necessary tool calls, do not "
     "repeat the same tool with identical arguments in one response, and wait "
     "for the returned results before requesting more. If no tool call is "
     "needed, respond normally."
+)
+_REPEATED_TOOL_BATCH_RECOVERY_INSTRUCTION = (
+    "The previous response repeated the same read-only inspection tool-call batch "
+    "as the immediately preceding completed round. Choose a different next "
+    "operation based on the returned tool result, or respond normally if no "
+    "additional tool call is needed. Do not immediately repeat an identical "
+    "inspection tool name and arguments."
 )
 
 
@@ -45,18 +63,50 @@ def _requires_tool_batch_recovery(response: ChatResponse) -> bool:
     return False
 
 
-def _add_tool_batch_recovery_instruction(
+def _repeats_previous_inspection_batch(
+    response: ChatResponse,
+    completed_rounds: tuple[ToolInteractionRound, ...],
+) -> bool:
+    """Return whether a response repeats the previous read-only inspection batch."""
+
+    if not response.tool_invocations or not completed_rounds:
+        return False
+
+    if any(
+        invocation.tool_name not in _REPEATED_INSPECTION_TOOL_NAMES
+        for invocation in response.tool_invocations
+    ):
+        return False
+
+    previous_round = completed_rounds[-1]
+
+    if any(result.status != "success" for result in previous_round.results):
+        return False
+
+    previous_invocations = previous_round.response.tool_invocations
+
+    return len(response.tool_invocations) == len(previous_invocations) and all(
+        current.tool_name == previous.tool_name
+        and current.arguments == previous.arguments
+        for current, previous in zip(
+            response.tool_invocations,
+            previous_invocations,
+            strict=True,
+        )
+    )
+
+
+def _add_temporary_recovery_instruction(
     request: ChatRequest,
     completed_rounds: tuple[ToolInteractionRound, ...],
+    instruction: str,
 ) -> ChatRequest:
     """Return one temporary corrective request without rejected tool data."""
 
     if request.system_prompt is None:
-        corrected_system_prompt = _TOOL_BATCH_RECOVERY_INSTRUCTION
+        corrected_system_prompt = instruction
     else:
-        corrected_system_prompt = (
-            f"{request.system_prompt}\n\n{_TOOL_BATCH_RECOVERY_INSTRUCTION}"
-        )
+        corrected_system_prompt = f"{request.system_prompt}\n\n{instruction}"
 
     return replace(
         request,
@@ -90,6 +140,7 @@ def run_tool_calling_loop(
     current_request = request
     executed_rounds = 0
     tool_batch_recoveries = 0
+    repeated_tool_batch_recoveries = 0
 
     while True:
         response = provider.complete(current_request)
@@ -101,9 +152,24 @@ def run_tool_calling_loop(
                 )
 
             tool_batch_recoveries += 1
-            current_request = _add_tool_batch_recovery_instruction(
+            current_request = _add_temporary_recovery_instruction(
                 request,
                 completed_rounds,
+                _TOOL_BATCH_RECOVERY_INSTRUCTION,
+            )
+            continue
+
+        if _repeats_previous_inspection_batch(response, completed_rounds):
+            if repeated_tool_batch_recoveries >= _MAX_REPEATED_TOOL_BATCH_RECOVERIES:
+                raise CompletionError(
+                    "The provider repeatedly requested the same read-only inspection tool-call batch."
+                )
+
+            repeated_tool_batch_recoveries += 1
+            current_request = _add_temporary_recovery_instruction(
+                request,
+                completed_rounds,
+                _REPEATED_TOOL_BATCH_RECOVERY_INSTRUCTION,
             )
             continue
 
