@@ -106,19 +106,35 @@ def test_missing_model_error_is_translated(monkeypatch) -> None:
         provider.complete(ChatRequest(messages=[]))
 
 
-def test_malformed_tool_call_error_is_retried_with_corrective_instruction(
+def test_malformed_tool_call_error_is_retried_once_with_fresh_user_guidance(
     monkeypatch,
 ) -> None:
-    """Retry one malformed tool call with bounded corrective guidance."""
+    """Retry malformed tool JSON once with new guidance and unchanged options."""
 
     calls = []
+    calculator = ToolDefinition(
+        name="calculator",
+        description="Evaluate a mathematical expression.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "expression": {
+                    "type": "string",
+                }
+            },
+            "required": [
+                "expression",
+            ],
+            "additionalProperties": False,
+        },
+    )
 
     def fake_chat(**kwargs):
         calls.append(kwargs)
 
         if len(calls) == 1:
             raise ResponseError(
-                'error parsing tool call: raw=\'{"path":"tests"}}\'',
+                'error parsing tool call: raw=\'{"expression":"2 + 2"}}\'',
                 500,
             )
 
@@ -137,9 +153,15 @@ def test_malformed_tool_call_error_is_retried_with_corrective_instruction(
         messages=[
             {
                 "role": "user",
-                "content": "Inspect the tests.",
+                "content": "Calculate two plus two.",
             }
         ],
+        generation_config=GenerationConfig(
+            temperature=0.0,
+            top_p=1.0,
+            max_output_tokens=256,
+        ),
+        tools=(calculator,),
     )
 
     assert provider.complete(request) == ChatResponse(text="Recovered response.")
@@ -151,31 +173,39 @@ def test_malformed_tool_call_error_is_retried_with_corrective_instruction(
         },
         {
             "role": "user",
-            "content": "Inspect the tests.",
+            "content": "Calculate two plus two.",
         },
     ]
-    assert calls[1]["messages"] == [
+    assert calls[1]["messages"][:-1] == calls[0]["messages"]
+    assert calls[1]["messages"][-1] == {
+        "role": "user",
+        "content": (
+            "The previous response was rejected because at least one tool call "
+            "used malformed JSON. Retry the same task now. Generate fresh "
+            "arguments instead of quoting, reusing, or repairing the rejected "
+            "arguments. Every tool call must contain exactly one valid JSON "
+            "object matching the supplied schema, with all required arguments "
+            "present."
+        ),
+    }
+    assert calls[1]["options"] == calls[0]["options"]
+    assert calls[1]["tools"] == calls[0]["tools"]
+    assert calls[0]["messages"] == [
         {
             "role": "system",
-            "content": (
-                "Use tools carefully.\n\n"
-                "The previous completion could not be parsed because a tool "
-                "call contained malformed JSON. Generate the completion again "
-                "and ensure every tool call uses exactly one valid JSON object "
-                "matching the supplied tool schema."
-            ),
+            "content": "Use tools carefully.",
         },
         {
             "role": "user",
-            "content": "Inspect the tests.",
+            "content": "Calculate two plus two.",
         },
     ]
 
 
-def test_repeated_malformed_tool_call_errors_stop_after_retry_limit(
+def test_repeated_malformed_tool_call_errors_stop_after_one_retry(
     monkeypatch,
 ) -> None:
-    """Stop safely after two retries of malformed tool-call JSON."""
+    """Stop safely after one corrective retry of malformed tool-call JSON."""
 
     calls = []
 
@@ -193,7 +223,7 @@ def test_repeated_malformed_tool_call_errors_stop_after_retry_limit(
     with pytest.raises(
         CompletionError,
         match=(
-            "after 3 attempts because the model repeatedly generated "
+            "after 2 attempts because the model repeatedly generated "
             "malformed tool-call JSON"
         ),
     ) as error:
@@ -208,8 +238,17 @@ def test_repeated_malformed_tool_call_errors_stop_after_retry_limit(
             )
         )
 
-    assert len(calls) == 3
-    assert calls[1]["messages"] == calls[2]["messages"]
+    assert len(calls) == 2
+    assert calls[0]["messages"] == [
+        {
+            "role": "user",
+            "content": "Inspect the tests.",
+        }
+    ]
+    assert calls[1]["messages"][:-1] == calls[0]["messages"]
+    assert calls[1]["messages"][-1]["role"] == "user"
+    assert "malformed JSON" in calls[1]["messages"][-1]["content"]
+    assert "raw=" not in calls[1]["messages"][-1]["content"]
     assert "raw=" not in str(error.value)
 
 

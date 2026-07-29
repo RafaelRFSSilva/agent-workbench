@@ -13,12 +13,14 @@ from agent_workbench.structured_outputs import JSONSchema
 from agent_workbench.tools import ToolInvocation, ToolResult
 
 
-_MALFORMED_TOOL_CALL_RETRY_LIMIT = 2
+_MALFORMED_TOOL_CALL_RETRY_LIMIT = 1
 _MALFORMED_TOOL_CALL_ERROR_PREFIX = "error parsing tool call"
 _MALFORMED_TOOL_CALL_RETRY_INSTRUCTION = (
-    "The previous completion could not be parsed because a tool call contained "
-    "malformed JSON. Generate the completion again and ensure every tool call "
-    "uses exactly one valid JSON object matching the supplied tool schema."
+    "The previous response was rejected because at least one tool call used "
+    "malformed JSON. Retry the same task now. Generate fresh arguments instead "
+    "of quoting, reusing, or repairing the rejected arguments. Every tool call "
+    "must contain exactly one valid JSON object matching the supplied schema, "
+    "with all required arguments present."
 )
 
 
@@ -122,31 +124,17 @@ def _is_malformed_tool_call_error(error: ResponseError) -> bool:
 def _add_malformed_tool_call_retry_instruction(
     arguments: OllamaChatArguments,
 ) -> OllamaChatArguments:
-    """Add one temporary corrective instruction for a provider retry."""
-
-    retry_messages = list(arguments["messages"])
-
-    if retry_messages and retry_messages[0]["role"] == "system":
-        first_message = retry_messages[0]
-        retry_messages[0] = {
-            "role": "system",
-            "content": (
-                f"{first_message['content']}\n\n"
-                f"{_MALFORMED_TOOL_CALL_RETRY_INSTRUCTION}"
-            ),
-        }
-    else:
-        retry_messages.insert(
-            0,
-            {
-                "role": "system",
-                "content": _MALFORMED_TOOL_CALL_RETRY_INSTRUCTION,
-            },
-        )
+    """Append one temporary corrective user instruction for a provider retry."""
 
     return {
         **arguments,
-        "messages": retry_messages,
+        "messages": [
+            *arguments["messages"],
+            {
+                "role": "user",
+                "content": _MALFORMED_TOOL_CALL_RETRY_INSTRUCTION,
+            },
+        ],
     }
 
 
