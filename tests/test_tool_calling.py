@@ -71,6 +71,27 @@ def create_calculator_definition() -> ToolDefinition:
     )
 
 
+def create_read_file_definition() -> ToolDefinition:
+    """Create a read-only file inspection definition for loop tests."""
+
+    return ToolDefinition(
+        name="read_file",
+        description="Read one file.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                }
+            },
+            "required": [
+                "path",
+            ],
+            "additionalProperties": False,
+        },
+    )
+
+
 def create_tool_response(
     *invocations: ToolInvocation,
     text: str = "",
@@ -420,6 +441,335 @@ def test_repeated_unsafe_tool_batches_fail_after_one_recovery() -> None:
     assert executions == []
     assert observed_rounds == []
     assert "secret" not in str(raised_error.value)
+
+
+def test_recovers_one_repeated_inspection_batch_without_reexecuting_it() -> None:
+    """Reject one consecutive repeated inspection before duplicate execution."""
+
+    executions: list[dict[str, object]] = []
+    observed_rounds: list[ToolInteractionRound] = []
+    read_file = create_read_file_definition()
+    registry = ToolRegistry()
+    registry.register(
+        read_file,
+        lambda arguments: executions.append(arguments) or {"content": "value"},
+    )
+    first_response = create_tool_response(
+        ToolInvocation(
+            id="first",
+            tool_name="read_file",
+            arguments={"path": "secret-repeat.py"},
+        )
+    )
+    repeated_response = create_tool_response(
+        ToolInvocation(
+            id="repeated-with-new-id",
+            tool_name="read_file",
+            arguments={"path": "secret-repeat.py"},
+        )
+    )
+    different_response = create_tool_response(
+        ToolInvocation(
+            id="different",
+            tool_name="read_file",
+            arguments={"path": "different.py"},
+        )
+    )
+    final_response = ChatResponse(text="Recovered.")
+    provider = FakeProvider(
+        [
+            first_response,
+            repeated_response,
+            different_response,
+            final_response,
+        ]
+    )
+    request = ChatRequest(
+        messages=[{"role": "user", "content": "Inspect files."}],
+        system_prompt="Base instructions.",
+        tools=(read_file,),
+    )
+
+    result = run_tool_calling_loop(
+        provider,
+        request,
+        registry,
+        max_tool_rounds=2,
+        tool_round_observer=observed_rounds.append,
+    )
+
+    assert result is final_response
+    assert executions == [
+        {"path": "secret-repeat.py"},
+        {"path": "different.py"},
+    ]
+    assert tuple(round_.response for round_ in observed_rounds) == (
+        first_response,
+        different_response,
+    )
+    assert len(provider.requests) == 4
+
+    recovery_request = provider.requests[2]
+    assert recovery_request.messages is request.messages
+    assert recovery_request.tools is request.tools
+    assert recovery_request.tool_interactions == (observed_rounds[0],)
+    assert recovery_request.system_prompt is not None
+    assert recovery_request.system_prompt.startswith("Base instructions.\n\n")
+    assert "immediately preceding completed round" in recovery_request.system_prompt
+    assert "secret-repeat.py" not in recovery_request.system_prompt
+
+    continued_request = provider.requests[3]
+    assert continued_request.system_prompt == request.system_prompt
+    assert continued_request.tool_interactions == tuple(observed_rounds)
+
+
+def test_repeated_inspection_batch_fails_after_one_recovery() -> None:
+    """Stop when one corrective retry repeats the same inspection again."""
+
+    executions: list[dict[str, object]] = []
+    observed_rounds: list[ToolInteractionRound] = []
+    read_file = create_read_file_definition()
+    registry = ToolRegistry()
+    registry.register(
+        read_file,
+        lambda arguments: executions.append(arguments) or {"content": "value"},
+    )
+
+    def repeated_response(identifier: str) -> ChatResponse:
+        return create_tool_response(
+            ToolInvocation(
+                id=identifier,
+                tool_name="read_file",
+                arguments={"path": "secret-repeat.py"},
+            )
+        )
+
+    provider = FakeProvider(
+        [
+            repeated_response("first"),
+            repeated_response("second"),
+            repeated_response("third"),
+        ]
+    )
+
+    with pytest.raises(
+        CompletionError,
+        match="repeatedly requested the same read-only inspection tool-call batch",
+    ) as raised_error:
+        run_tool_calling_loop(
+            provider,
+            ChatRequest(messages=[]),
+            registry,
+            max_tool_rounds=3,
+            tool_round_observer=observed_rounds.append,
+        )
+
+    assert len(provider.requests) == 3
+    assert executions == [{"path": "secret-repeat.py"}]
+    assert len(observed_rounds) == 1
+    assert "secret-repeat.py" not in str(raised_error.value)
+
+
+def test_allows_inspection_with_different_arguments_in_consecutive_rounds() -> None:
+    """Allow consecutive inspections that request distinct information."""
+
+    executions: list[dict[str, object]] = []
+    read_file = create_read_file_definition()
+    registry = ToolRegistry()
+    registry.register(
+        read_file,
+        lambda arguments: executions.append(arguments) or {"content": "value"},
+    )
+    provider = FakeProvider(
+        [
+            create_tool_response(
+                ToolInvocation(
+                    id="first",
+                    tool_name="read_file",
+                    arguments={"path": "first.py"},
+                )
+            ),
+            create_tool_response(
+                ToolInvocation(
+                    id="second",
+                    tool_name="read_file",
+                    arguments={"path": "second.py"},
+                )
+            ),
+            ChatResponse(text="Completed."),
+        ]
+    )
+
+    result = run_tool_calling_loop(
+        provider,
+        ChatRequest(messages=[]),
+        registry,
+        max_tool_rounds=2,
+    )
+
+    assert result.text == "Completed."
+    assert executions == [
+        {"path": "first.py"},
+        {"path": "second.py"},
+    ]
+
+
+def test_allows_repeated_inspection_after_an_error_result() -> None:
+    """Allow retrying identical inspection arguments after execution failure."""
+
+    attempts = 0
+
+    def inspect(arguments: dict[str, object]) -> dict[str, object]:
+        nonlocal attempts
+        attempts += 1
+
+        if attempts == 1:
+            raise ValueError("temporary failure")
+
+        return {"content": arguments["path"]}
+
+    read_file = create_read_file_definition()
+    registry = ToolRegistry()
+    registry.register(read_file, inspect)
+    requested_response = create_tool_response(
+        ToolInvocation(
+            id="first",
+            tool_name="read_file",
+            arguments={"path": "module.py"},
+        )
+    )
+    repeated_response = create_tool_response(
+        ToolInvocation(
+            id="second",
+            tool_name="read_file",
+            arguments={"path": "module.py"},
+        )
+    )
+    provider = FakeProvider(
+        [
+            requested_response,
+            repeated_response,
+            ChatResponse(text="Recovered after retry."),
+        ]
+    )
+
+    result = run_tool_calling_loop(
+        provider,
+        ChatRequest(messages=[]),
+        registry,
+        max_tool_rounds=2,
+    )
+
+    assert result.text == "Recovered after retry."
+    assert attempts == 2
+    assert len(provider.requests) == 3
+    assert tuple(
+        round_.results[0].status for round_ in provider.requests[2].tool_interactions
+    ) == ("error", "success")
+
+
+def test_allows_nonconsecutive_reuse_of_an_inspection_batch() -> None:
+    """Compare inspections only with the immediately preceding completed round."""
+
+    executions: list[dict[str, object]] = []
+    read_file = create_read_file_definition()
+    registry = ToolRegistry()
+    registry.register(
+        read_file,
+        lambda arguments: executions.append(arguments) or {"content": "value"},
+    )
+
+    def response(identifier: str, path: str) -> ChatResponse:
+        return create_tool_response(
+            ToolInvocation(
+                id=identifier,
+                tool_name="read_file",
+                arguments={"path": path},
+            )
+        )
+
+    provider = FakeProvider(
+        [
+            response("first", "first.py"),
+            response("second", "second.py"),
+            response("third", "first.py"),
+            ChatResponse(text="Completed."),
+        ]
+    )
+
+    result = run_tool_calling_loop(
+        provider,
+        ChatRequest(messages=[]),
+        registry,
+        max_tool_rounds=3,
+    )
+
+    assert result.text == "Completed."
+    assert executions == [
+        {"path": "first.py"},
+        {"path": "second.py"},
+        {"path": "first.py"},
+    ]
+
+
+def test_recovers_repeated_inspection_from_preexisting_tool_history() -> None:
+    """Protect resumed requests from repeating their latest inspection batch."""
+
+    executions: list[dict[str, object]] = []
+    read_file = create_read_file_definition()
+    previous_response = create_tool_response(
+        ToolInvocation(
+            id="previous",
+            tool_name="read_file",
+            arguments={"path": "secret-repeat.py"},
+        )
+    )
+    previous_round = ToolInteractionRound(
+        response=previous_response,
+        results=(
+            ToolResult(
+                invocation_id="previous",
+                status="success",
+                output={"content": "value"},
+            ),
+        ),
+    )
+    registry = ToolRegistry()
+    registry.register(
+        read_file,
+        lambda arguments: executions.append(arguments) or {"content": "changed"},
+    )
+    provider = FakeProvider(
+        [
+            create_tool_response(
+                ToolInvocation(
+                    id="repeated",
+                    tool_name="read_file",
+                    arguments={"path": "secret-repeat.py"},
+                )
+            ),
+            ChatResponse(text="Use the previous result."),
+        ]
+    )
+    request = ChatRequest(
+        messages=[],
+        tools=(read_file,),
+        tool_interactions=(previous_round,),
+    )
+
+    result = run_tool_calling_loop(
+        provider,
+        request,
+        registry,
+        max_tool_rounds=1,
+    )
+
+    assert result.text == "Use the previous result."
+    assert executions == []
+    assert len(provider.requests) == 2
+    assert provider.requests[1].tool_interactions == (previous_round,)
+    assert provider.requests[1].system_prompt is not None
+    assert "secret-repeat.py" not in provider.requests[1].system_prompt
 
 
 def test_executes_the_maximum_safe_tool_batch() -> None:
