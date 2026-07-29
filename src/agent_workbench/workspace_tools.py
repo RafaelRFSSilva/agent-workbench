@@ -9,7 +9,10 @@ from agent_workbench.tools import JSONObject, ToolDefinition
 from agent_workbench.workspace import Workspace
 
 MAX_DIRECTORY_ENTRIES = 128
-"""Maximum direct directory entries returned by list_files."""
+"""Maximum total entries returned by one list_files invocation."""
+
+MAX_LIST_DEPTH = 4
+"""Maximum recursive depth accepted by list_files."""
 
 MAX_FILE_SIZE_BYTES = 100 * 1024
 """Maximum UTF-8 file size returned by read_file."""
@@ -32,12 +35,17 @@ MAX_SEARCH_MATCHES = 256
 MAX_SEARCH_LINE_LENGTH = 1_000
 """Maximum characters returned for one matching line."""
 
-_PATH_INPUT_SCHEMA: JSONObject = {
+_LIST_FILES_INPUT_SCHEMA: JSONObject = {
     "type": "object",
     "properties": {
         "path": {
             "type": "string",
-        }
+        },
+        "depth": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": MAX_LIST_DEPTH,
+        },
     },
     "required": ["path"],
     "additionalProperties": False,
@@ -64,8 +72,11 @@ _READ_FILE_INPUT_SCHEMA: JSONObject = {
 
 LIST_FILES_DEFINITION = ToolDefinition(
     name="list_files",
-    description="List the direct entries of a directory inside the authorized workspace.",
-    input_schema=_PATH_INPUT_SCHEMA,
+    description=(
+        "List directory entries inside the authorized workspace with optional "
+        "bounded recursive depth."
+    ),
+    input_schema=_LIST_FILES_INPUT_SCHEMA,
 )
 
 READ_FILE_DEFINITION = ToolDefinition(
@@ -123,34 +134,48 @@ def list_workspace_files(
     workspace: Workspace,
     arguments: object,
 ) -> JSONObject:
-    """List direct entries of a workspace directory without recursion."""
+    """List bounded directory entries with optional recursive depth."""
 
-    directory_path = workspace.resolve(_get_requested_path("list_files", arguments))
+    requested_path, depth = _get_list_files_arguments(arguments)
+    directory_path = workspace.resolve(requested_path)
 
     if not directory_path.is_dir():
         raise ToolArgumentError("list_files path must reference a directory.")
 
-    try:
-        children = sorted(
-            directory_path.iterdir(),
-            key=lambda child: child.name,
-        )
-    except OSError:
-        raise ValueError("Unable to list workspace directory.") from None
+    entries: list[JSONObject] = []
 
-    if len(children) > MAX_DIRECTORY_ENTRIES:
-        raise ToolArgumentError("workspace directory contains too many entries.")
+    def visit(current_directory: Path, current_depth: int) -> None:
+        try:
+            children = sorted(
+                current_directory.iterdir(),
+                key=lambda child: _workspace_relative_path(workspace, child),
+            )
+        except OSError:
+            raise ValueError("Unable to list workspace directory.") from None
+
+        for child in children:
+            entries.append(
+                {
+                    "name": child.name,
+                    "path": _workspace_relative_path(workspace, child),
+                    "type": _entry_type(child),
+                }
+            )
+
+            if len(entries) > MAX_DIRECTORY_ENTRIES:
+                raise ToolArgumentError(
+                    "workspace directory contains too many entries."
+                )
+
+            if current_depth < depth and not child.is_symlink() and child.is_dir():
+                visit(child, current_depth + 1)
+
+    visit(directory_path, 1)
+    entries.sort(key=lambda entry: str(entry["path"]))
 
     return {
         "path": _workspace_relative_path(workspace, directory_path),
-        "entries": [
-            {
-                "name": child.name,
-                "path": _workspace_relative_path(workspace, child),
-                "type": _entry_type(child),
-            }
-            for child in children
-        ],
+        "entries": entries,
     }
 
 
@@ -281,6 +306,41 @@ def search_workspace_text(
         "matches": matches,
         "truncated": truncated,
     }
+
+
+def _get_list_files_arguments(arguments: object) -> tuple[Path, int]:
+    """Validate and normalize one bounded list_files request."""
+
+    if not isinstance(arguments, dict):
+        raise ToolArgumentError(
+            "list_files requires an object with path and optional depth."
+        )
+
+    unsupported_fields = sorted(set(arguments) - {"path", "depth"})
+    if unsupported_fields:
+        raise ToolArgumentError(
+            "list_files has unsupported fields: " + ", ".join(unsupported_fields) + "."
+        )
+
+    if "path" not in arguments:
+        raise ToolArgumentError("list_files path is required.")
+
+    path = arguments["path"]
+    if not isinstance(path, str):
+        raise ToolArgumentError("list_files path must be a string.")
+
+    depth = arguments.get("depth", 1)
+    if isinstance(depth, bool) or not isinstance(depth, int):
+        raise ToolArgumentError(
+            f"list_files depth must be an integer between 1 and {MAX_LIST_DEPTH}."
+        )
+
+    if depth < 1 or depth > MAX_LIST_DEPTH:
+        raise ToolArgumentError(
+            f"list_files depth must be between 1 and {MAX_LIST_DEPTH}."
+        )
+
+    return Path(path), depth
 
 
 def _get_requested_path(tool_name: str, arguments: object) -> Path:
