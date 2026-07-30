@@ -1,5 +1,6 @@
 """Command-line arguments and runtime configuration resolution."""
 
+import sys
 from argparse import ArgumentParser, ArgumentTypeError
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -239,16 +240,35 @@ def _positive_output_token_limit(value: str) -> int:
     return parsed_value
 
 
+def _normalize_cli_argv(
+    argv: Sequence[str] | None,
+) -> tuple[list[str], bool]:
+    """Remove the optional code command before normal argument parsing."""
+
+    normalized_argv = list(sys.argv[1:] if argv is None else argv)
+    code_command = bool(normalized_argv and normalized_argv[0] == "code")
+
+    if code_command:
+        normalized_argv = normalized_argv[1:]
+
+    return normalized_argv, code_command
+
+
 def parse_cli_arguments(
     argv: Sequence[str] | None = None,
 ) -> CLIArguments:
     """Parse optional provider and model command-line arguments."""
 
+    normalized_argv, code_command = _normalize_cli_argv(argv)
     parser = ArgumentParser(
-        prog="agent-workbench",
+        prog="agent-workbench code" if code_command else "agent-workbench",
         description=(
-            "Start an interactive conversation or run one supervised "
-            "autonomous coding task."
+            "Run one supervised autonomous coding task."
+            if code_command
+            else (
+                "Start an interactive conversation or run one supervised "
+                "autonomous coding task."
+            )
         ),
     )
 
@@ -375,7 +395,7 @@ def parse_cli_arguments(
         help="New local branch for an isolated worktree; requires --worktree-path.",
     )
 
-    parsed_arguments = parser.parse_args(argv)
+    parsed_arguments = parser.parse_args(normalized_argv)
 
     setup_conflicts = (
         parsed_arguments.provider is not None

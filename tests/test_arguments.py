@@ -1108,3 +1108,96 @@ def test_commit_message_requires_worktree_isolation() -> None:
                 enable_actions=True,
             )
         )
+
+
+def test_parse_cli_arguments_accepts_code_command() -> None:
+    """Parse autonomous task options after the explicit code command."""
+
+    arguments = parse_cli_arguments(
+        [
+            "code",
+            "--workspace",
+            ".",
+            "--enable-actions",
+            "--task",
+            "  Test task.  ",
+        ]
+    )
+
+    assert arguments.workspace_root == Path(".")
+    assert arguments.enable_actions is True
+    assert arguments.task_prompt == "Test task."
+
+
+def test_parse_cli_arguments_preserves_flag_only_compatibility() -> None:
+    """Keep the established flag-only syntax identical to the code command."""
+
+    flag_only = parse_cli_arguments(
+        [
+            "--workspace",
+            ".",
+            "--enable-actions",
+            "--task",
+            "Test task.",
+        ]
+    )
+    explicit_code = parse_cli_arguments(
+        [
+            "code",
+            "--workspace",
+            ".",
+            "--enable-actions",
+            "--task",
+            "Test task.",
+        ]
+    )
+
+    assert explicit_code == flag_only
+
+
+def test_parse_cli_arguments_reads_code_from_process_argv(
+    monkeypatch,
+) -> None:
+    """Support the installed console entry point when argv is omitted."""
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "agent-workbench",
+            "code",
+            "--workspace",
+            ".",
+            "--enable-actions",
+            "--task",
+            "Test task.",
+        ],
+    )
+
+    arguments = parse_cli_arguments()
+
+    assert arguments.workspace_root == Path(".")
+    assert arguments.enable_actions is True
+    assert arguments.task_prompt == "Test task."
+
+
+def test_code_command_help_uses_command_specific_usage(capsys) -> None:
+    """Display the explicit code command in autonomous help output."""
+
+    with pytest.raises(SystemExit) as exc_info:
+        parse_cli_arguments(["code", "--help"])
+
+    assert exc_info.value.code == 0
+    output = capsys.readouterr().out
+    assert "usage: agent-workbench code" in output
+    assert "Run one supervised autonomous coding task." in output
+    assert "--task TASK" in output
+
+
+def test_parse_cli_arguments_rejects_unknown_command(capsys) -> None:
+    """Reject unsupported first positional commands."""
+
+    with pytest.raises(SystemExit) as exc_info:
+        parse_cli_arguments(["review"])
+
+    assert exc_info.value.code == 2
+    assert "unrecognized arguments: review" in capsys.readouterr().err
