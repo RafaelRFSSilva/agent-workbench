@@ -208,6 +208,8 @@ instructions as exactly one system-level section:
 They are never inserted into the user task. Direct and isolated coding use the
 same composition contract. A local Codex `AGENTS.md` is separate operator
 guidance and is not loaded as Agent Workbench project instructions.
+Non-coding interactive invocations do not read, validate, or apply the optional
+instructions file.
 
 Project instructions are model context, not executable commands or permission
 grants. They do not bypass tool or action approvals, cannot authorize arbitrary

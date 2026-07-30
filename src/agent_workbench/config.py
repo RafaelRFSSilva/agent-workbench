@@ -71,6 +71,8 @@ class ProjectConfiguration:
 
 def discover_project_configuration(
     start_path: Path,
+    *,
+    include_project_instructions: bool = False,
 ) -> ProjectConfiguration | None:
     """Find and load the nearest project configuration above one directory."""
 
@@ -103,7 +105,11 @@ def discover_project_configuration(
                 project_root=current,
                 configuration_path=configuration_path,
                 configuration=load_project_configuration(configuration_path),
-                project_instructions=load_project_instructions(current),
+                project_instructions=(
+                    load_project_instructions(current)
+                    if include_project_instructions
+                    else None
+                ),
             )
 
         parent = current.parent

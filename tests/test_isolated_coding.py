@@ -296,7 +296,10 @@ def test_isolated_coding_uses_discovered_project_instructions_in_provider_reques
     run_git(source, "commit", "-m", "add project configuration")
     nested = source / "src" / "package"
     nested.mkdir(parents=True)
-    discovered = discover_project_configuration(nested)
+    discovered = discover_project_configuration(
+        nested,
+        include_project_instructions=True,
+    )
     assert discovered is not None
     task = "Correct the add implementation."
     runtime = resolve_runtime_configuration(

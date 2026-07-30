@@ -78,8 +78,8 @@ into the user task, treated as a context-file attachment, or duplicated.
 Explicit system prompts and built-in or custom agent profiles retain their
 existing selection semantics. Direct and isolated coding workflows use the
 same system-context composition, and validated instructions do not leak into
-later, unrelated sessions. Non-coding interactive sessions do not apply these
-coding instructions.
+later, unrelated sessions. Non-coding interactive sessions do not read,
+validate, or apply these coding instructions.
 
 ### Security boundary
 

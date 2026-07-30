@@ -1537,8 +1537,39 @@ def test_main_discovers_explicit_workspace_configuration_before_provider(
 
     main(["--workspace", str(tmp_path)])
 
-    discover_mock.assert_called_once_with(tmp_path)
+    discover_mock.assert_called_once_with(
+        tmp_path,
+        include_project_instructions=False,
+    )
     assert resolve_mock.call_args.kwargs["project_configuration"] is discovered
+
+
+def test_non_coding_cli_ignores_invalid_project_instructions(
+    monkeypatch,
+    tmp_path,
+    capsys,
+) -> None:
+    """Do not inspect or compose coding-only instructions for interactive use."""
+
+    configuration_path = tmp_path / PROJECT_CONFIG_RELATIVE_PATH
+    configuration_path.parent.mkdir()
+    configuration_path.write_text(EXPECTED_INITIALIZED_CONFIG, encoding="utf-8")
+    (configuration_path.parent / "instructions.md").write_bytes(b"invalid\xff")
+    monkeypatch.chdir(tmp_path)
+    provider = FakeProvider()
+    monkeypatch.setattr(
+        "agent_workbench.session_factory.create_provider",
+        lambda _provider_name, _model_name: provider,
+    )
+    run_cli_mock = Mock()
+    monkeypatch.setattr("agent_workbench.cli.run_cli", run_cli_mock)
+
+    main([])
+
+    session = run_cli_mock.call_args.args[0]
+    assert session.system_prompt == get_agent_profile("developer").system_prompt
+    assert "<project_instructions>" not in session.system_prompt
+    assert "Configuration error:" not in capsys.readouterr().out
 
 
 def test_init_creates_deterministic_loadable_project_configuration(

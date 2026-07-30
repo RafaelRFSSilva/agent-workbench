@@ -301,6 +301,29 @@ def test_project_configuration_is_discovered_from_root_and_nested_directory(
     assert nested_result.configuration.provider == "ollama"
 
 
+def test_non_coding_discovery_does_not_inspect_project_instructions(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Load project configuration without touching coding-only instructions."""
+
+    _write_project_configuration(tmp_path, '[coding]\nprovider = "ollama"\n')
+
+    def fail_if_called(_project_root):
+        raise AssertionError("project instructions loader must not be called")
+
+    monkeypatch.setattr(
+        "agent_workbench.config.load_project_instructions",
+        fail_if_called,
+    )
+
+    result = discover_project_configuration(tmp_path)
+
+    assert result is not None
+    assert result.configuration.provider == "ollama"
+    assert result.project_instructions is None
+
+
 def test_discovery_loads_instructions_from_the_exact_configuration_root(
     tmp_path: Path,
 ) -> None:
@@ -321,7 +344,10 @@ def test_discovery_loads_instructions_from_the_exact_configuration_root(
     nested = project / "src" / "package"
     nested.mkdir(parents=True)
 
-    result = discover_project_configuration(nested)
+    result = discover_project_configuration(
+        nested,
+        include_project_instructions=True,
+    )
 
     assert result is not None
     assert result.project_root == project.resolve()
@@ -340,7 +366,10 @@ def test_discovery_does_not_load_parent_instructions_or_agents_file(
     _write_project_configuration(project, '[coding]\nmodel = "inner"\n')
     (project / "AGENTS.md").write_text("Do not load AGENTS.", encoding="utf-8")
 
-    result = discover_project_configuration(project)
+    result = discover_project_configuration(
+        project,
+        include_project_instructions=True,
+    )
 
     assert result is not None
     assert result.project_instructions is None
