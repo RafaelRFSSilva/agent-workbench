@@ -33,6 +33,10 @@ DEFAULT_DISCOVER_MAX_TOOL_ROUNDS = 4
 DEFAULT_EDIT_COMPLETION_CONTINUATIONS = 2
 DEFAULT_MAX_REPAIR_ATTEMPTS = 2
 DEFAULT_REPAIR_COMPLETION_CONTINUATIONS = 2
+MAX_DISCOVERY_EVIDENCE_ITEMS = 12
+MAX_DISCOVERY_EVIDENCE_ITEM_CHARACTERS = 800
+MAX_DISCOVERY_EVIDENCE_CHARACTERS = 4_000
+MAX_DISCOVERY_SUMMARY_CHARACTERS = 1_000
 MAX_REPAIR_OUTPUT_CHARACTERS = 4_000
 
 _READ_ONLY_TOOL_NAMES = frozenset(
@@ -70,6 +74,10 @@ _REQUIRED_CODING_TOOLS = frozenset(
     }
 )
 _MAXIMUM_ROUNDS_ERROR = "The maximum number of tool execution rounds was exceeded."
+_MAXIMUM_ROUNDS_CHANGE_SUMMARY = (
+    "A successful workspace change was applied before the model-facing "
+    "phase exhausted its tool-round budget."
+)
 _ABSOLUTE_PATH_PATTERN = re.compile(r"(?<![\w.])/(?:[^\s\x00]+)")
 _SENSITIVE_LINE_PATTERN = re.compile(
     r"(?i)(?:^|[^a-z])(?:api[_-]?key|password|secret|token|\.env)(?:[^a-z]|$)"
@@ -122,6 +130,15 @@ class ValidationRun:
     result_status: str
     exit_code: int | None
     sequence_index: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class _DiscoveryEvidence:
+    """Store one bounded safe summary of a successful discovery result."""
+
+    tool_name: str
+    paths: tuple[str, ...]
+    metadata: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,6 +200,8 @@ class _WorkflowState:
     rounds: list[ToolInteractionRound] = field(default_factory=list)
     approved_action_names: list[str] = field(default_factory=list)
     approved_action_ids: set[str] = field(default_factory=set)
+    discovery_evidence: list[_DiscoveryEvidence] = field(default_factory=list)
+    discovery_summary: str = ""
     assistant_summary: str = ""
     repair_attempt_count: int = 0
     completion_continuation_count: int = 0
@@ -386,8 +405,10 @@ def _run_discover_phase(
     """Run bounded read-only discovery and always advance to EDIT."""
 
     state.phase = CodingPhase.DISCOVER
+    phase_start = len(state.rounds)
+    response: ChatResponse | None = None
     try:
-        session.send(
+        response = session.send(
             _build_phase_prompt(
                 state,
                 outstanding=(
@@ -409,6 +430,11 @@ def _run_discover_phase(
                 CodingPhase.DISCOVER,
                 f"discovery completion failed: {exc}",
             ) from None
+    finally:
+        _capture_discovery_evidence(state, state.rounds[phase_start:])
+
+    if response is not None:
+        state.discovery_summary = _bounded_prompt_summary(response.text)
 
 
 def _run_model_change_phase(
@@ -425,7 +451,6 @@ def _run_model_change_phase(
     """Require a successful workspace action during EDIT or one REPAIR attempt."""
 
     state.phase = phase
-    phase_start = len(state.rounds)
     local_continuations = 0
     outstanding = (
         "Apply at least one successful controlled workspace change.",
@@ -434,6 +459,7 @@ def _run_model_change_phase(
     )
 
     while True:
+        call_start = len(state.rounds)
         prompt = (
             _build_repair_prompt(state, failed_validations, outstanding)
             if phase is CodingPhase.REPAIR
@@ -450,34 +476,46 @@ def _run_model_change_phase(
                 recover_approval_preview_errors=True,
             )
         except CompletionError as exc:
-            raise _workflow_failure(
-                state,
-                phase,
-                f"model-facing phase failed: {exc}",
-            ) from None
-
-        state.assistant_summary = response.text
-        if _rounds_contain_successful_change(
-            state.rounds[phase_start:],
-            state.approved_action_ids,
-        ):
-            return True
+            if str(exc) != _MAXIMUM_ROUNDS_ERROR:
+                raise _workflow_failure(
+                    state,
+                    phase,
+                    f"model-facing phase failed: {exc}",
+                ) from None
+            current_call_rounds = state.rounds[call_start:]
+            if _rounds_contain_successful_change(
+                current_call_rounds,
+                state.approved_action_ids,
+            ):
+                state.assistant_summary = _MAXIMUM_ROUNDS_CHANGE_SUMMARY
+                return True
+            incomplete_reason = (
+                "the model-facing call exhausted its tool-round budget without "
+                "completing the required workspace change"
+            )
+        else:
+            state.assistant_summary = response.text
+            current_call_rounds = state.rounds[call_start:]
+            if _rounds_contain_successful_change(
+                current_call_rounds,
+                state.approved_action_ids,
+            ):
+                return True
+            incomplete_reason = "no successful new workspace change was observed"
 
         if local_continuations >= continuation_limit:
             if phase is CodingPhase.EDIT:
                 raise _workflow_failure(
                     state,
                     phase,
-                    "completion continuation limit reached without a successful "
-                    "workspace change",
+                    f"completion continuation limit reached after {incomplete_reason}",
                 )
             return False
 
         local_continuations += 1
         state.completion_continuation_count += 1
         outstanding = (
-            f"{phase.value} is incomplete because no successful new workspace "
-            "change was observed.",
+            f"{phase.value} is incomplete because {incomplete_reason}.",
             "Apply a controlled workspace change now.",
             "Assistant prose is not evidence of a workspace change.",
         )
@@ -741,9 +779,15 @@ def _build_phase_prompt(
     """Build an explicit bounded model-facing phase prompt."""
 
     completed = _completed_evidence_lines(state)
+    acceptance_criteria = _numbered_lines(
+        _sanitize_prompt_text(criterion)
+        for criterion in state.task_spec.acceptance_criteria
+    )
     return (
         "Continue one externally controlled deterministic coding workflow.\n\n"
         f"Original objective:\n{_sanitize_prompt_text(state.task_spec.objective)}\n\n"
+        "Acceptance criteria:\n"
+        f"{acceptance_criteria}\n\n"
         f"Current phase: {state.phase.value}\n\n"
         "Completed phase evidence:\n"
         f"{_numbered_lines(completed)}\n\n"
@@ -806,6 +850,12 @@ def _completed_evidence_lines(state: _WorkflowState) -> tuple[str, ...]:
     ]
     if result.executed_tool_names:
         lines.append("Executed tools: " + ", ".join(result.executed_tool_names[-16:]))
+    lines.extend(
+        f"Discovery evidence: {_format_discovery_evidence(evidence)}"
+        for evidence in state.discovery_evidence
+    )
+    if state.discovery_summary:
+        lines.append(f"Discovery summary: {state.discovery_summary}")
     if result.validation_runs:
         latest = result.validation_runs[-len(_VALIDATION_TOOL_NAMES) :]
         lines.append(
@@ -817,6 +867,145 @@ def _completed_evidence_lines(state: _WorkflowState) -> tuple[str, ...]:
             )
         )
     return tuple(lines)
+
+
+def _capture_discovery_evidence(
+    state: _WorkflowState,
+    rounds: Iterable[ToolInteractionRound],
+) -> None:
+    """Retain bounded path and metadata evidence even for rolled-back turns."""
+
+    combined_characters = sum(
+        len(_format_discovery_evidence(evidence))
+        for evidence in state.discovery_evidence
+    )
+    for round_ in rounds:
+        for invocation, result in zip(
+            round_.response.tool_invocations,
+            round_.results,
+            strict=True,
+        ):
+            if (
+                len(state.discovery_evidence) >= MAX_DISCOVERY_EVIDENCE_ITEMS
+                or result.status != "success"
+                or not isinstance(result.output, dict)
+            ):
+                continue
+            evidence = _bounded_discovery_evidence(
+                invocation.tool_name,
+                result.output,
+            )
+            formatted = _format_discovery_evidence(evidence)
+            if (
+                not evidence.paths
+                and not evidence.metadata
+                or combined_characters + len(formatted)
+                > MAX_DISCOVERY_EVIDENCE_CHARACTERS
+            ):
+                continue
+            state.discovery_evidence.append(evidence)
+            combined_characters += len(formatted)
+
+
+def _bounded_discovery_evidence(
+    tool_name: str,
+    output: JSONObject,
+) -> _DiscoveryEvidence:
+    """Extract only safe paths and scalar metadata within one item limit."""
+
+    paths = _discovery_output_paths(output)
+    metadata = _discovery_output_metadata(output)
+    bounded_paths: list[str] = []
+    bounded_metadata: list[str] = []
+
+    for path in paths:
+        candidate = _DiscoveryEvidence(
+            tool_name=tool_name,
+            paths=tuple([*bounded_paths, path]),
+            metadata=tuple(bounded_metadata),
+        )
+        if len(_format_discovery_evidence(candidate)) > (
+            MAX_DISCOVERY_EVIDENCE_ITEM_CHARACTERS
+        ):
+            break
+        bounded_paths.append(path)
+
+    for item in metadata:
+        candidate = _DiscoveryEvidence(
+            tool_name=tool_name,
+            paths=tuple(bounded_paths),
+            metadata=tuple([*bounded_metadata, item]),
+        )
+        if len(_format_discovery_evidence(candidate)) > (
+            MAX_DISCOVERY_EVIDENCE_ITEM_CHARACTERS
+        ):
+            break
+        bounded_metadata.append(item)
+
+    return _DiscoveryEvidence(
+        tool_name=tool_name,
+        paths=tuple(bounded_paths),
+        metadata=tuple(bounded_metadata),
+    )
+
+
+def _discovery_output_paths(output: JSONObject) -> tuple[str, ...]:
+    """Return deterministic safe workspace paths without result body text."""
+
+    candidates: list[str] = []
+    direct_path = output.get("path")
+    if isinstance(direct_path, str):
+        candidates.append(direct_path)
+    for collection_name in ("entries", "matches"):
+        collection = output.get(collection_name)
+        if not isinstance(collection, list):
+            continue
+        for item in collection:
+            if isinstance(item, dict):
+                candidate = item.get("path")
+                if isinstance(candidate, str):
+                    candidates.append(candidate)
+
+    return tuple(
+        dict.fromkeys(
+            path
+            for path in candidates
+            if _is_safe_prompt_path(path) and _sanitize_prompt_text(path) == path
+        )
+    )
+
+
+def _discovery_output_metadata(output: JSONObject) -> tuple[str, ...]:
+    """Return allowlisted scalar metadata and bounded collection counts."""
+
+    values: list[str] = []
+    for key in (
+        "size_bytes",
+        "line_start",
+        "line_end",
+        "total_lines",
+        "files_inspected",
+        "files_skipped",
+        "truncated",
+    ):
+        value = output.get(key)
+        if isinstance(value, bool) or isinstance(value, int):
+            values.append(f"{key}={value}")
+    for key in ("entries", "matches"):
+        value = output.get(key)
+        if isinstance(value, list):
+            values.append(f"{key}={len(value)}")
+    return tuple(values)
+
+
+def _format_discovery_evidence(evidence: _DiscoveryEvidence) -> str:
+    """Format one already bounded discovery evidence item."""
+
+    paths = ", ".join(evidence.paths) if evidence.paths else "none"
+    value = f"{evidence.tool_name} | paths: {paths}"
+    if evidence.metadata:
+        value += " | metadata: " + ", ".join(evidence.metadata)
+    return value
 
 
 def _numbered_lines(lines: Iterable[str]) -> str:
@@ -877,6 +1066,13 @@ def _sanitize_repair_output(output: str) -> str:
     """Bound and redact validation output before placing it in a repair prompt."""
 
     return _sanitize_prompt_text(output)[:MAX_REPAIR_OUTPUT_CHARACTERS]
+
+
+def _bounded_prompt_summary(text: str) -> str:
+    """Return one sanitized single-line bounded model summary."""
+
+    sanitized = _sanitize_prompt_text(text)
+    return " ".join(sanitized.split())[:MAX_DISCOVERY_SUMMARY_CHARACTERS]
 
 
 def _sanitize_prompt_text(text: str) -> str:

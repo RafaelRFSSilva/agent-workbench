@@ -1282,10 +1282,11 @@ format, and ordered tool definitions are forwarded through the existing
 objective and an ordered tuple of acceptance criteria. The public
 `AgentSession.task_spec` property is read-only and defaults to `None`.
 
-The task specification is not currently forwarded through `ChatRequest`,
-inserted into prompts, translated by provider adapters, evaluated by the tool
-loop, or used to control session lifecycle. Those behaviors belong to future
-task orchestration rather than the base session boundary.
+The base session does not automatically forward the task specification through
+`ChatRequest`, translate it in provider adapters, evaluate it in the tool loop,
+or use it to control session lifecycle. Application controllers may consume
+the metadata explicitly; the deterministic coding controller includes its
+objective and ordered acceptance criteria in each model-facing phase prompt.
 
 The synchronous `send()` operation rejects blank content and re-entrant sends,
 sets the status to `completing`, and selects direct provider completion or the
@@ -1311,12 +1312,20 @@ such session to one validated worktree without changing those boundaries.
 
 `run_autonomous_coding_task()` is an implemented single-session application
 controller. It owns a typed `CodingPhase`, bounded `CodingWorkflowLimits`, and
-accumulated tool evidence. Model-facing work is restricted to:
+accumulated tool evidence. Every model-facing prompt repeats the sanitized
+original objective and ordered `TaskSpec` acceptance criteria. Model-facing
+work is restricted to:
 
 * `DISCOVER`: existing read-only repository/workspace tools, with a four-round
-  maximum.
+  maximum. Successful rounds produce typed evidence containing only bounded
+  safe workspace-relative paths and allowlisted metadata. Item, per-item
+  character, and combined character limits prevent tool output from becoming
+  unbounded. A normal completion also contributes a bounded sanitized
+  discovery summary.
 * `EDIT`: read-only tools plus controlled patch, replacement, and transaction
-  actions.
+  actions. Its prompt carries the explicit discovery evidence even when the
+  DISCOVER send exhausted its round limit and its conversation turn was rolled
+  back.
 * `REPAIR`: the same tools as EDIT, with the original objective, failed
   validation names and exit codes, bounded redacted output, safe changed paths,
   and current counters repeated in every prompt.
@@ -1328,6 +1337,13 @@ REPAIR. A successful repair must contain a new successful workspace action,
 after which the complete validation sequence runs again. Two EDIT completion
 continuations, two repair attempts, and two completion continuations per repair
 are the v1 defaults.
+
+If one EDIT or REPAIR send raises the exact maximum-tool-round error, the
+controller inspects only tool rounds from that call. A successful approved
+workspace change advances to validation with a deterministic fallback summary.
+Otherwise the send consumes one existing bounded completion continuation and
+the next prompt states the exhaustion reason. Other completion errors remain
+terminal.
 
 After the latest validation sequence succeeds, the controller invokes
 `inspect_git_status` and `inspect_git_diff`. DONE requires a successful

@@ -40,7 +40,10 @@ class ScriptedProvider:
     name = "scripted"
     model_name = "scripted-coding-model"
 
-    def __init__(self, responses: Iterable[ChatResponse]) -> None:
+    def __init__(
+        self,
+        responses: Iterable[ChatResponse | CompletionError],
+    ) -> None:
         self._responses = iter(responses)
         self.requests: list[ChatRequest] = []
 
@@ -48,7 +51,10 @@ class ScriptedProvider:
         """Record one request and return the next scripted response."""
 
         self.requests.append(request)
-        return next(self._responses)
+        response = next(self._responses)
+        if isinstance(response, CompletionError):
+            raise response
+        return response
 
 
 def run_git(repository: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
@@ -118,6 +124,7 @@ def create_session(
     provider: ScriptedProvider,
     *,
     fail_git_diff: bool = False,
+    max_tool_rounds: int = 8,
 ) -> AgentSession:
     """Create one action-enabled scripted coding session."""
 
@@ -128,7 +135,7 @@ def create_session(
             Workspace(repository),
             fail_git_diff=fail_git_diff,
         ),
-        max_tool_rounds=8,
+        max_tool_rounds=max_tool_rounds,
     )
 
 
@@ -294,8 +301,9 @@ def test_discovery_round_limit_advances_to_edit(tmp_path: Path) -> None:
         ]
     )
 
+    session = create_session(repository, provider)
     result = run_autonomous_coding_task(
-        create_session(repository, provider),
+        session,
         "Correct the add implementation.",
         tool_approval_handler=approve,
     )
@@ -313,6 +321,79 @@ def test_discovery_round_limit_advances_to_edit(tmp_path: Path) -> None:
     edit_prompt = provider.requests[5].messages[-1]["content"]
     assert "Current phase: EDIT" in edit_prompt
     assert "Observed tool rounds: 4" in edit_prompt
+    assert "read_file | paths: module.py" in edit_prompt
+    assert "read_file | paths: test_module.py" in edit_prompt
+    assert "list_files | paths:" in edit_prompt
+    assert "search_text | paths:" in edit_prompt
+    assert all(
+        "Current phase: DISCOVER" not in message["content"]
+        for message in session.messages
+    )
+
+
+def test_discovery_evidence_and_summary_are_bounded_and_sanitized(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Exclude private, sensitive, and oversized discovery data from EDIT."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    original = "def add(left: int, right: int) -> int:\n    return left - right\n"
+    oversized = "safe-prefix-" + ("x" * 10_000) + "-oversized-tail"
+
+    def unsafe_read(_workspace, _arguments):
+        return {
+            "path": "module.py",
+            "content": (
+                "TOKEN=discovery-secret\n"
+                "/home/private/repository/secret.py\n"
+                f"{oversized}\n"
+            ),
+            "size_bytes": len(oversized),
+            "sha256": "a" * 64,
+        }
+
+    monkeypatch.setattr(
+        "agent_workbench.workspace_tools.read_workspace_file",
+        unsafe_read,
+    )
+    provider = ScriptedProvider(
+        [
+            tool_response("read", "read_file", {"path": "module.py"}),
+            ChatResponse(
+                text=(
+                    "Found module.py.\n"
+                    "PASSWORD=discovery-summary-secret\n"
+                    "Inspect /home/private/repository next.\n"
+                    f"{oversized}"
+                )
+            ),
+            replacement_response(
+                "edit",
+                expected_content=original,
+                expected_text="return left - right",
+                replacement_text="return left + right",
+            ),
+            ChatResponse(text="Edit complete."),
+        ]
+    )
+
+    run_autonomous_coding_task(
+        create_session(repository, provider),
+        "Correct the add implementation.",
+        tool_approval_handler=approve,
+    )
+
+    edit_prompt = provider.requests[2].messages[-1]["content"]
+    assert "read_file | paths: module.py" in edit_prompt
+    assert "size_bytes=" in edit_prompt
+    assert "Discovery summary: Found module.py." in edit_prompt
+    assert "[redacted sensitive content]" in edit_prompt
+    assert "[absolute-path]" in edit_prompt
+    assert "discovery-secret" not in edit_prompt
+    assert "/home/private" not in edit_prompt
+    assert "-oversized-tail" not in edit_prompt
+    assert len(edit_prompt) < 10_000
 
 
 def test_edit_completion_continuation_then_successful_change(
@@ -348,6 +429,188 @@ def test_edit_completion_continuation_then_successful_change(
     assert "Current phase: EDIT" in continuation
     assert "no successful new workspace change was observed" in continuation
     assert "Assistant prose is not evidence" in continuation
+
+
+def test_edit_round_exhaustion_continues_then_changes_file(
+    tmp_path: Path,
+) -> None:
+    """Consume one EDIT continuation after inspection-only round exhaustion."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    original = "def add(left: int, right: int) -> int:\n    return left - right\n"
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            tool_response("edit-read-module", "read_file", {"path": "module.py"}),
+            tool_response(
+                "edit-read-test",
+                "read_file",
+                {"path": "test_module.py"},
+            ),
+            replacement_response(
+                "edit-after-exhaustion",
+                expected_content=original,
+                expected_text="return left - right",
+                replacement_text="return left + right",
+            ),
+            ChatResponse(text="Edit complete."),
+        ]
+    )
+
+    result = run_autonomous_coding_task(
+        create_session(repository, provider, max_tool_rounds=1),
+        "Correct the add implementation.",
+        tool_approval_handler=approve,
+    )
+
+    assert result.final_phase is CodingPhase.DONE
+    assert result.completion_continuation_count == 1
+    continuation = provider.requests[3].messages[-1]["content"]
+    assert "Current phase: EDIT" in continuation
+    assert "exhausted its tool-round budget" in continuation
+    assert "without completing the required workspace change" in continuation
+
+
+def test_repair_round_exhaustion_continues_then_repairs(
+    tmp_path: Path,
+) -> None:
+    """Consume one REPAIR continuation after inspection-only exhaustion."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    original = "def add(left: int, right: int) -> int:\n    return left - right\n"
+    multiplied = "def add(left: int, right: int) -> int:\n    return left * right\n"
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            replacement_response(
+                "bad-edit",
+                expected_content=original,
+                expected_text="return left - right",
+                replacement_text="return left * right",
+            ),
+            ChatResponse(text="Bad edit complete."),
+            tool_response("repair-read", "read_file", {"path": "module.py"}),
+            tool_response(
+                "repair-extra-read",
+                "read_file",
+                {"path": "test_module.py"},
+            ),
+            replacement_response(
+                "repair-after-exhaustion",
+                expected_content=multiplied,
+                expected_text="return left * right",
+                replacement_text="return left + right",
+            ),
+            ChatResponse(text="Repair complete."),
+        ]
+    )
+
+    result = run_autonomous_coding_task(
+        create_session(repository, provider, max_tool_rounds=1),
+        "Correct the add implementation.",
+        tool_approval_handler=approve,
+    )
+
+    assert result.final_phase is CodingPhase.DONE
+    assert result.repair_attempt_count == 1
+    assert result.completion_continuation_count == 1
+    continuation = provider.requests[5].messages[-1]["content"]
+    assert "Current phase: REPAIR" in continuation
+    assert "exhausted its tool-round budget" in continuation
+
+
+def test_edit_round_exhaustion_after_change_advances_to_validation(
+    tmp_path: Path,
+) -> None:
+    """Accept a successful EDIT action even without a final model response."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    original = "def add(left: int, right: int) -> int:\n    return left - right\n"
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            replacement_response(
+                "edit-before-exhaustion",
+                expected_content=original,
+                expected_text="return left - right",
+                replacement_text="return left + right",
+            ),
+            tool_response("unexecuted-read", "read_file", {"path": "module.py"}),
+        ]
+    )
+
+    result = run_autonomous_coding_task(
+        create_session(repository, provider, max_tool_rounds=1),
+        "Correct the add implementation.",
+        tool_approval_handler=approve,
+    )
+
+    assert result.final_phase is CodingPhase.DONE
+    assert result.completion_continuation_count == 0
+    assert result.assistant_summary == (
+        "A successful workspace change was applied before the model-facing "
+        "phase exhausted its tool-round budget."
+    )
+
+
+def test_repeated_edit_round_exhaustion_stops_at_continuation_limit(
+    tmp_path: Path,
+) -> None:
+    """Stop after two bounded EDIT continuations without a change."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            tool_response("read-1", "read_file", {"path": "module.py"}),
+            tool_response("exhaust-1", "read_file", {"path": "test_module.py"}),
+            tool_response("read-2", "read_file", {"path": "module.py"}),
+            tool_response("exhaust-2", "read_file", {"path": "test_module.py"}),
+            tool_response("read-3", "read_file", {"path": "module.py"}),
+            tool_response("exhaust-3", "read_file", {"path": "test_module.py"}),
+        ]
+    )
+
+    with pytest.raises(
+        CompletionError,
+        match=(
+            r"phase EDIT: completion continuation limit reached after the "
+            r"model-facing call exhausted its tool-round budget.*"
+            r"repair_attempts=0, completion_continuations=2"
+        ),
+    ):
+        run_autonomous_coding_task(
+            create_session(repository, provider, max_tool_rounds=1),
+            "Correct the add implementation.",
+            tool_approval_handler=approve,
+        )
+
+
+def test_unrelated_model_phase_completion_error_remains_terminal(
+    tmp_path: Path,
+) -> None:
+    """Do not convert unrelated completion failures into continuations."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            CompletionError("Unrelated provider failure."),
+        ]
+    )
+
+    with pytest.raises(
+        CompletionError,
+        match=(
+            r"phase EDIT: model-facing phase failed: Unrelated provider failure.*"
+            r"completion_continuations=0"
+        ),
+    ):
+        run_autonomous_coding_task(
+            create_session(repository, provider, max_tool_rounds=1),
+            "Correct the add implementation.",
+            tool_approval_handler=approve,
+        )
 
 
 def test_failed_validation_enters_repair_and_revalidates(
@@ -728,6 +991,75 @@ def test_phase_prompts_include_explicit_evidence_and_attempt_counters(
     assert "Executed tools: read_file" in edit_prompt
     assert DEFAULT_DISCOVER_MAX_TOOL_ROUNDS == 4
     assert DEFAULT_REPAIR_COMPLETION_CONTINUATIONS == 2
+
+
+def test_custom_acceptance_criteria_reach_every_model_facing_phase(
+    tmp_path: Path,
+) -> None:
+    """Preserve ordered sanitized criteria through all phase continuations."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    original = "def add(left: int, right: int) -> int:\n    return left - right\n"
+    multiplied = "def add(left: int, right: int) -> int:\n    return left * right\n"
+    criteria = (
+        "Preserve the public function signature.",
+        "Inspect /home/private/repository only when required.",
+        "TOKEN=acceptance-secret",
+        "Correct the arithmetic behavior.",
+        "Keep the focused test passing.",
+    )
+    displayed_criteria = (
+        "Preserve the public function signature.",
+        "Inspect [absolute-path] only when required.",
+        "[redacted sensitive content]",
+        "Correct the arithmetic behavior.",
+        "Keep the focused test passing.",
+    )
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Found module.py and its focused test."),
+            ChatResponse(text="No edit yet."),
+            replacement_response(
+                "bad-edit",
+                expected_content=original,
+                expected_text="return left - right",
+                replacement_text="return left * right",
+            ),
+            ChatResponse(text="Bad edit complete."),
+            ChatResponse(text="No repair yet."),
+            replacement_response(
+                "repair",
+                expected_content=multiplied,
+                expected_text="return left * right",
+                replacement_text="return left + right",
+            ),
+            ChatResponse(text="Repair complete."),
+        ]
+    )
+
+    result = run_autonomous_coding_task(
+        create_session(repository, provider),
+        "Correct the add implementation.",
+        acceptance_criteria=criteria,
+        tool_approval_handler=approve,
+    )
+
+    assert result.final_phase is CodingPhase.DONE
+    phase_prompt_indexes = (0, 1, 2, 4, 5)
+    for request_index in phase_prompt_indexes:
+        prompt = provider.requests[request_index].messages[-1]["content"]
+        assert "Acceptance criteria:" in prompt
+        positions = [
+            prompt.index(f"{index}. {criterion}")
+            for index, criterion in enumerate(displayed_criteria, start=1)
+        ]
+        assert positions == sorted(positions)
+        assert "/home/private" not in prompt
+        assert "acceptance-secret" not in prompt
+    assert (
+        "Discovery summary: Found module.py and its focused test."
+        in (provider.requests[1].messages[-1]["content"])
+    )
 
 
 def test_approval_denial_fails_current_phase_without_validation(

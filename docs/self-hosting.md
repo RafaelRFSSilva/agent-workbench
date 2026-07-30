@@ -39,6 +39,16 @@ repository-lifecycle changes.
 13. Preserve the worktree, local branch, and commit for external review.
 14. Push and create a Pull Request manually only after external review.
 
+Every DISCOVER, EDIT, and REPAIR prompt, including continuations, receives the
+original ordered acceptance criteria. The controller carries bounded sanitized
+discovery paths, metadata, and a normal discovery summary into later phases;
+that evidence remains available when a maximum-round DISCOVER turn is not
+committed to session history. If one EDIT or REPAIR send exhausts its
+tool-round budget, a successful approved change can still advance to
+validation. Without a change, the controller consumes one of the existing two
+bounded completion continuations and states the exhaustion reason. Unrelated
+completion errors remain terminal.
+
 ## Recommended launch command
 
 From the clean primary Agent Workbench repository:
@@ -197,9 +207,10 @@ manual analysis of the exact preserved state.
 
 The implemented regression battery uses scripted providers and real temporary
 Git repositories. It deterministically proves phase progression, edit
-continuations, validation-driven repair, the repair limit, false completion
-rejection, and the final diff gate. Automated tests do not call Ollama or any
-paid/cloud provider.
+continuations (including maximum-tool-round recovery), bounded cross-phase
+discovery evidence, ordered acceptance criteria, validation-driven repair, the
+repair limit, false completion rejection, and the final diff gate. Automated
+tests do not call Ollama or any paid/cloud provider.
 
 Those tests validate controller behavior, not local-model capability. Manual
 benchmarks of this deterministic workflow with `gpt-oss:20b` or another real
