@@ -444,15 +444,23 @@ def test_repeated_unsafe_tool_batches_fail_after_one_recovery() -> None:
 
 
 def test_recovers_one_repeated_inspection_batch_without_reexecuting_it() -> None:
-    """Reject one consecutive repeated inspection before duplicate execution."""
+    """Withhold inspection tools for one recovery without duplicate execution."""
 
-    executions: list[dict[str, object]] = []
+    inspection_executions: list[dict[str, object]] = []
+    calculator_executions: list[dict[str, object]] = []
     observed_rounds: list[ToolInteractionRound] = []
     read_file = create_read_file_definition()
+    calculator = create_calculator_definition()
     registry = ToolRegistry()
     registry.register(
         read_file,
-        lambda arguments: executions.append(arguments) or {"content": "value"},
+        lambda arguments: (
+            inspection_executions.append(arguments) or {"content": "value"}
+        ),
+    )
+    registry.register(
+        calculator,
+        lambda arguments: calculator_executions.append(arguments) or {"value": 4},
     )
     first_response = create_tool_response(
         ToolInvocation(
@@ -468,11 +476,11 @@ def test_recovers_one_repeated_inspection_batch_without_reexecuting_it() -> None
             arguments={"path": "secret-repeat.py"},
         )
     )
-    different_response = create_tool_response(
+    recovery_response = create_tool_response(
         ToolInvocation(
-            id="different",
-            tool_name="read_file",
-            arguments={"path": "different.py"},
+            id="calculate",
+            tool_name="calculator",
+            arguments={"expression": "2 + 2"},
         )
     )
     final_response = ChatResponse(text="Recovered.")
@@ -480,14 +488,14 @@ def test_recovers_one_repeated_inspection_batch_without_reexecuting_it() -> None
         [
             first_response,
             repeated_response,
-            different_response,
+            recovery_response,
             final_response,
         ]
     )
     request = ChatRequest(
         messages=[{"role": "user", "content": "Inspect files."}],
         system_prompt="Base instructions.",
-        tools=(read_file,),
+        tools=(read_file, calculator),
     )
 
     result = run_tool_calling_loop(
@@ -499,19 +507,18 @@ def test_recovers_one_repeated_inspection_batch_without_reexecuting_it() -> None
     )
 
     assert result is final_response
-    assert executions == [
-        {"path": "secret-repeat.py"},
-        {"path": "different.py"},
-    ]
+    assert inspection_executions == [{"path": "secret-repeat.py"}]
+    assert calculator_executions == [{"expression": "2 + 2"}]
     assert tuple(round_.response for round_ in observed_rounds) == (
         first_response,
-        different_response,
+        recovery_response,
     )
     assert len(provider.requests) == 4
 
     recovery_request = provider.requests[2]
     assert recovery_request.messages is request.messages
-    assert recovery_request.tools is request.tools
+    assert recovery_request.tools == (calculator,)
+    assert request.tools == (read_file, calculator)
     assert recovery_request.tool_interactions == (observed_rounds[0],)
     assert recovery_request.system_prompt is not None
     assert recovery_request.system_prompt.startswith("Base instructions.\n\n")
@@ -520,7 +527,71 @@ def test_recovers_one_repeated_inspection_batch_without_reexecuting_it() -> None
 
     continued_request = provider.requests[3]
     assert continued_request.system_prompt == request.system_prompt
+    assert continued_request.tools is request.tools
     assert continued_request.tool_interactions == tuple(observed_rounds)
+
+
+def test_repeated_inspection_recovery_withholds_every_inspection_definition() -> None:
+    """Temporarily remove every read-only inspection definition from recovery."""
+
+    read_file = create_read_file_definition()
+    calculator = create_calculator_definition()
+    inspection_definitions = tuple(
+        ToolDefinition(
+            name=name,
+            description=f"Inspect with {name}.",
+            input_schema={
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        )
+        for name in (
+            "inspect_git_diff",
+            "inspect_git_status",
+            "list_files",
+            "search_symbols",
+            "search_text",
+        )
+    )
+    registry = ToolRegistry()
+    registry.register(read_file, lambda arguments: {"content": "value"})
+    first_response = create_tool_response(
+        ToolInvocation(
+            id="first",
+            tool_name="read_file",
+            arguments={"path": "module.py"},
+        )
+    )
+    repeated_response = create_tool_response(
+        ToolInvocation(
+            id="second",
+            tool_name="read_file",
+            arguments={"path": "module.py"},
+        )
+    )
+    provider = FakeProvider(
+        [
+            first_response,
+            repeated_response,
+            ChatResponse(text="Use the existing inspection result."),
+        ]
+    )
+    request = ChatRequest(
+        messages=[],
+        tools=(read_file, *inspection_definitions, calculator),
+    )
+
+    result = run_tool_calling_loop(
+        provider,
+        request,
+        registry,
+        max_tool_rounds=1,
+    )
+
+    assert result.text == "Use the existing inspection result."
+    assert provider.requests[2].tools == (calculator,)
+    assert request.tools == (read_file, *inspection_definitions, calculator)
 
 
 def test_repeated_inspection_batch_fails_after_one_recovery() -> None:
@@ -768,6 +839,8 @@ def test_recovers_repeated_inspection_from_preexisting_tool_history() -> None:
     assert executions == []
     assert len(provider.requests) == 2
     assert provider.requests[1].tool_interactions == (previous_round,)
+    assert provider.requests[1].tools == ()
+    assert request.tools == (read_file,)
     assert provider.requests[1].system_prompt is not None
     assert "secret-repeat.py" not in provider.requests[1].system_prompt
 
