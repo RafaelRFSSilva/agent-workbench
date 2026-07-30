@@ -12,6 +12,9 @@ from agent_workbench.coding_loop import (
     DEFAULT_EDIT_COMPLETION_CONTINUATIONS,
     DEFAULT_MAX_REPAIR_ATTEMPTS,
     DEFAULT_REPAIR_COMPLETION_CONTINUATIONS,
+    MAX_ACTION_FAILURE_EVIDENCE_CHARACTERS,
+    MAX_ACTION_FAILURE_EVIDENCE_ITEM_CHARACTERS,
+    MAX_ACTION_FAILURE_EVIDENCE_ITEMS,
     CodingPhase,
     CodingWorkflowLimits,
     run_autonomous_coding_task,
@@ -454,6 +457,246 @@ def test_edit_completion_continuation_then_successful_change(
     assert "Current phase: EDIT" in continuation
     assert "no successful new workspace change was observed" in continuation
     assert "Assistant prose is not evidence" in continuation
+
+
+def test_stale_patch_failure_reaches_next_edit_prompt_and_clears_after_rewrite(
+    tmp_path: Path,
+) -> None:
+    """Carry safe stale evidence once, then clear it after a successful rewrite."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    original = "def add(left: int, right: int) -> int:\n    return left - right\n"
+    multiplied = "def add(left: int, right: int) -> int:\n    return left * right\n"
+    corrected = "def add(left: int, right: int) -> int:\n    return left + right\n"
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            tool_response(
+                "stale-patch",
+                "apply_file_patch",
+                {
+                    "path": "module.py",
+                    "expected_content": (
+                        "STALE-EXPECTED /home/private/expected.py SECRET-CONTENT"
+                    ),
+                    "replacement_content": (
+                        "REPLACEMENT /home/private/replacement.py SECRET-CONTENT"
+                    ),
+                },
+            ),
+            ChatResponse(text="The patch could not be applied."),
+            rewrite_response(
+                "rewrite",
+                expected_content=original,
+                replacement_content=multiplied,
+            ),
+            ChatResponse(text="Rewrite applied."),
+            rewrite_response(
+                "repair",
+                expected_content=multiplied,
+                replacement_content=corrected,
+            ),
+            ChatResponse(text="Repair applied."),
+        ]
+    )
+
+    result = run_autonomous_coding_task(
+        create_session(repository, provider),
+        "Correct the add implementation.",
+        tool_approval_handler=approve,
+    )
+
+    continuation = provider.requests[3].messages[-1]["content"]
+    assert "Action failure evidence:" in continuation
+    assert "tool=apply_file_patch" in continuation
+    assert "path=module.py" in continuation
+    assert "phase=EDIT" in continuation
+    assert "attempt=1" in continuation
+    assert "expected content does not match" in continuation
+    assert "The previous action did not change the workspace." in continuation
+    assert "reread the target" in continuation
+    assert "apply_file_rewrite" in continuation
+    assert "SHA from the latest read_file" in continuation
+    assert "short literal snippet copied exactly from the latest file" in continuation
+    assert "STALE-EXPECTED" not in continuation
+    assert "REPLACEMENT" not in continuation
+    assert "SECRET-CONTENT" not in continuation
+    assert "/home/private" not in continuation
+
+    repair_prompts = [
+        request.messages[-1]["content"]
+        for request in provider.requests
+        if "Current phase: REPAIR" in request.messages[-1]["content"]
+    ]
+    assert repair_prompts
+    assert all(
+        "expected content does not match" not in prompt for prompt in repair_prompts
+    )
+    assert result.final_phase is CodingPhase.DONE
+
+
+def test_failed_text_replacement_reaches_next_repair_prompt(
+    tmp_path: Path,
+) -> None:
+    """Carry one failed exact replacement into a later REPAIR send."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    original = "def add(left: int, right: int) -> int:\n    return left - right\n"
+    multiplied = "def add(left: int, right: int) -> int:\n    return left * right\n"
+    corrected = "def add(left: int, right: int) -> int:\n    return left + right\n"
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            rewrite_response(
+                "bad-edit",
+                expected_content=original,
+                replacement_content=multiplied,
+            ),
+            ChatResponse(text="Initial edit applied."),
+            replacement_response(
+                "failed-replacement",
+                expected_content=multiplied,
+                expected_text="not present",
+                replacement_text="SECRET-REPLACEMENT",
+            ),
+            ChatResponse(text="Exact replacement failed."),
+            rewrite_response(
+                "repair",
+                expected_content=multiplied,
+                replacement_content=corrected,
+            ),
+            ChatResponse(text="Repair applied."),
+        ]
+    )
+
+    result = run_autonomous_coding_task(
+        create_session(repository, provider),
+        "Correct the add implementation.",
+        tool_approval_handler=approve,
+    )
+
+    prompts = [
+        request.messages[-1]["content"]
+        for request in provider.requests
+        if "Current phase: REPAIR" in request.messages[-1]["content"]
+    ]
+    continuation = next(
+        prompt for prompt in prompts if "Action failure evidence:" in prompt
+    )
+    assert "tool=apply_text_replacement" in continuation
+    assert "path=module.py" in continuation
+    assert "phase=REPAIR" in continuation
+    assert "attempt=1" in continuation
+    assert "expected 1 occurrence(s) but found 0" in continuation
+    assert "not present" not in continuation
+    assert "SECRET-REPLACEMENT" not in continuation
+    assert result.final_phase is CodingPhase.DONE
+
+
+def test_repeated_action_failures_are_sanitized_and_bounded(
+    tmp_path: Path,
+) -> None:
+    """Bound repeated evidence by item, per-item, and combined named limits."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    original = "def add(left: int, right: int) -> int:\n    return left - right\n"
+    corrected = "def add(left: int, right: int) -> int:\n    return left + right\n"
+    failures = [
+        tool_response(
+            f"failure-{index}",
+            "apply_file_patch",
+            {
+                "path": (
+                    "module.py" if index % 2 == 0 else "/home/private/SECRET-CONTENT.py"
+                ),
+                "expected_content": f"EXPECTED-SECRET-{index}",
+                "replacement_content": f"REPLACEMENT-SECRET-{index}",
+            },
+        )
+        for index in range(MAX_ACTION_FAILURE_EVIDENCE_ITEMS)
+    ]
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            *failures,
+            tool_response(
+                "round-limit-trigger",
+                "apply_file_patch",
+                {
+                    "path": "module.py",
+                    "expected_content": "STALE",
+                    "replacement_content": "SECRET",
+                },
+            ),
+            rewrite_response(
+                "rewrite",
+                expected_content=original,
+                replacement_content=corrected,
+            ),
+            ChatResponse(text="Rewrite applied."),
+        ]
+    )
+
+    result = run_autonomous_coding_task(
+        create_session(repository, provider),
+        "Correct the add implementation.",
+        tool_approval_handler=approve,
+    )
+
+    continuation = provider.requests[-2].messages[-1]["content"]
+    evidence_block = continuation.split("Action failure evidence:\n", 1)[1].split(
+        "\n\n", 1
+    )[0]
+    evidence_lines = evidence_block.splitlines()
+    assert len(evidence_lines) <= MAX_ACTION_FAILURE_EVIDENCE_ITEMS
+    assert all(
+        len(line.removeprefix(f"{index}. "))
+        <= (MAX_ACTION_FAILURE_EVIDENCE_ITEM_CHARACTERS)
+        for index, line in enumerate(evidence_lines, start=1)
+    )
+    assert (
+        sum(
+            len(line.removeprefix(f"{index}. "))
+            for index, line in enumerate(evidence_lines, start=1)
+        )
+        <= MAX_ACTION_FAILURE_EVIDENCE_CHARACTERS
+    )
+    assert "/home/private" not in continuation
+    assert "EXPECTED-SECRET" not in continuation
+    assert "REPLACEMENT-SECRET" not in continuation
+    assert result.final_phase is CodingPhase.DONE
+
+
+def test_unrelated_tool_error_is_not_action_failure_evidence(tmp_path: Path) -> None:
+    """Do not classify a failed inspection as a controlled-action failure."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    original = "def add(left: int, right: int) -> int:\n    return left - right\n"
+    corrected = "def add(left: int, right: int) -> int:\n    return left + right\n"
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            tool_response("missing-read", "read_file", {"path": "missing.py"}),
+            ChatResponse(text="Inspection failed."),
+            rewrite_response(
+                "rewrite",
+                expected_content=original,
+                replacement_content=corrected,
+            ),
+            ChatResponse(text="Rewrite applied."),
+        ]
+    )
+
+    result = run_autonomous_coding_task(
+        create_session(repository, provider),
+        "Correct the add implementation.",
+        tool_approval_handler=approve,
+    )
+
+    continuation = provider.requests[3].messages[-1]["content"]
+    assert "Action failure evidence:" not in continuation
+    assert "tool=read_file" not in continuation
+    assert result.final_phase is CodingPhase.DONE
 
 
 def test_edit_round_exhaustion_continues_then_changes_file(

@@ -37,6 +37,9 @@ MAX_DISCOVERY_EVIDENCE_ITEMS = 12
 MAX_DISCOVERY_EVIDENCE_ITEM_CHARACTERS = 800
 MAX_DISCOVERY_EVIDENCE_CHARACTERS = 4_000
 MAX_DISCOVERY_SUMMARY_CHARACTERS = 1_000
+MAX_ACTION_FAILURE_EVIDENCE_ITEMS = 8
+MAX_ACTION_FAILURE_EVIDENCE_ITEM_CHARACTERS = 400
+MAX_ACTION_FAILURE_EVIDENCE_CHARACTERS = 2_000
 MAX_REPAIR_OUTPUT_CHARACTERS = 4_000
 
 _READ_ONLY_TOOL_NAMES = frozenset(
@@ -143,6 +146,17 @@ class _DiscoveryEvidence:
 
 
 @dataclass(frozen=True, slots=True)
+class _ActionFailureEvidence:
+    """Store one bounded safe controlled-action failure summary."""
+
+    tool_name: str
+    path: str | None
+    error_message: str
+    phase: CodingPhase
+    attempt_number: int
+
+
+@dataclass(frozen=True, slots=True)
 class AutonomousCodingResult:
     """Summarize one completed deterministic coding workflow."""
 
@@ -203,11 +217,13 @@ class _WorkflowState:
     approved_action_names: list[str] = field(default_factory=list)
     approved_action_ids: set[str] = field(default_factory=set)
     discovery_evidence: list[_DiscoveryEvidence] = field(default_factory=list)
+    action_failure_evidence: list[_ActionFailureEvidence] = field(default_factory=list)
     discovery_summary: str = ""
     assistant_summary: str = ""
     repair_attempt_count: int = 0
     completion_continuation_count: int = 0
     controller_invocation_count: int = 0
+    current_action_attempt_number: int = 0
 
 
 def run_autonomous_coding_task(
@@ -233,6 +249,7 @@ def run_autonomous_coding_task(
 
     def observe_tool_round(round_: ToolInteractionRound) -> None:
         state.rounds.append(round_)
+        _capture_action_failure_evidence(state, round_)
         if tool_round_observer is not None:
             tool_round_observer(round_)
 
@@ -461,6 +478,11 @@ def _run_model_change_phase(
     )
 
     while True:
+        state.current_action_attempt_number = (
+            state.repair_attempt_count
+            if phase is CodingPhase.REPAIR
+            else local_continuations + 1
+        )
         call_start = len(state.rounds)
         prompt = (
             _build_repair_prompt(state, failed_validations, outstanding)
@@ -822,6 +844,18 @@ def _build_phase_prompt(
         _sanitize_prompt_text(criterion)
         for criterion in state.task_spec.acceptance_criteria
     )
+    action_failure_section = ""
+    if state.action_failure_evidence:
+        action_failure_section = (
+            "\n\nAction failure evidence:\n"
+            f"{_numbered_lines(_format_action_failure_evidence(item) for item in state.action_failure_evidence)}\n\n"
+            "Action failure recovery:\n"
+            "The previous action did not change the workspace. The model must "
+            "reread the target before trying again. For a whole-file replacement, use "
+            "apply_file_rewrite with the SHA from the latest read_file. For a "
+            "small exact change, you may use apply_text_replacement with a short "
+            "literal snippet copied exactly from the latest file."
+        )
     return (
         "Continue one externally controlled deterministic coding workflow.\n\n"
         f"Original objective:\n{_sanitize_prompt_text(state.task_spec.objective)}\n\n"
@@ -829,7 +863,8 @@ def _build_phase_prompt(
         f"{acceptance_criteria}\n\n"
         f"Current phase: {state.phase.value}\n\n"
         "Completed phase evidence:\n"
-        f"{_numbered_lines(completed)}\n\n"
+        f"{_numbered_lines(completed)}"
+        f"{action_failure_section}\n\n"
         "Outstanding requirements:\n"
         f"{_numbered_lines(outstanding)}\n\n"
         "Current attempt counters:\n"
@@ -944,6 +979,133 @@ def _capture_discovery_evidence(
                 continue
             state.discovery_evidence.append(evidence)
             combined_characters += len(formatted)
+
+
+def _capture_action_failure_evidence(
+    state: _WorkflowState,
+    round_: ToolInteractionRound,
+) -> None:
+    """Retain only bounded safe failures for controlled workspace actions."""
+
+    if state.phase not in {CodingPhase.EDIT, CodingPhase.REPAIR}:
+        return
+
+    for invocation, result in zip(
+        round_.response.tool_invocations,
+        round_.results,
+        strict=True,
+    ):
+        if invocation.tool_name not in _WORKSPACE_CHANGE_TOOL_NAMES:
+            continue
+        if result.status == "success" and _workspace_change_result_applied(
+            invocation.tool_name,
+            invocation.arguments,
+            result.output,
+        ):
+            _clear_obsolete_action_failure_evidence(state, result.output)
+            continue
+        if result.status != "error":
+            continue
+
+        evidence = _bounded_action_failure_evidence(
+            invocation.tool_name,
+            invocation.arguments,
+            result.error,
+            phase=state.phase,
+            attempt_number=state.current_action_attempt_number,
+        )
+        state.action_failure_evidence.append(evidence)
+        while (
+            len(state.action_failure_evidence) > MAX_ACTION_FAILURE_EVIDENCE_ITEMS
+            or sum(
+                len(_format_action_failure_evidence(item))
+                for item in state.action_failure_evidence
+            )
+            > MAX_ACTION_FAILURE_EVIDENCE_CHARACTERS
+        ):
+            state.action_failure_evidence.pop(0)
+
+
+def _bounded_action_failure_evidence(
+    tool_name: str,
+    arguments: object,
+    error: str | None,
+    *,
+    phase: CodingPhase,
+    attempt_number: int,
+) -> _ActionFailureEvidence:
+    """Build one sanitized failure item within its exact character budget."""
+
+    path = _safe_action_failure_path(arguments)
+    message = " ".join(
+        _sanitize_prompt_text(error or "Controlled workspace action failed.").split()
+    )
+    placeholder = _ActionFailureEvidence(
+        tool_name=tool_name,
+        path=path,
+        error_message="",
+        phase=phase,
+        attempt_number=attempt_number,
+    )
+    available = max(
+        0,
+        MAX_ACTION_FAILURE_EVIDENCE_ITEM_CHARACTERS
+        - len(_format_action_failure_evidence(placeholder)),
+    )
+    return _ActionFailureEvidence(
+        tool_name=tool_name,
+        path=path,
+        error_message=message[:available],
+        phase=phase,
+        attempt_number=attempt_number,
+    )
+
+
+def _safe_action_failure_path(arguments: object) -> str | None:
+    """Extract one bounded workspace-relative action path when unambiguous."""
+
+    if not isinstance(arguments, dict):
+        return None
+    candidate = arguments.get("path")
+    if candidate is None:
+        changes = arguments.get("changes")
+        if isinstance(changes, list) and len(changes) == 1:
+            change = changes[0]
+            if isinstance(change, dict):
+                candidate = change.get("path")
+    if (
+        not isinstance(candidate, str)
+        or not _is_safe_prompt_path(candidate)
+        or len(candidate) > MAX_ACTION_FAILURE_EVIDENCE_ITEM_CHARACTERS // 2
+    ):
+        return None
+    return candidate
+
+
+def _clear_obsolete_action_failure_evidence(
+    state: _WorkflowState,
+    output: object,
+) -> None:
+    """Clear current guidance for paths changed successfully afterward."""
+
+    changed_paths = set(_changed_paths_from_workspace_result(output))
+    if not changed_paths:
+        return
+    state.action_failure_evidence = [
+        evidence
+        for evidence in state.action_failure_evidence
+        if evidence.path not in changed_paths
+    ]
+
+
+def _format_action_failure_evidence(evidence: _ActionFailureEvidence) -> str:
+    """Format one already bounded controlled-action failure item."""
+
+    path = evidence.path if evidence.path is not None else "unavailable"
+    return (
+        f"tool={evidence.tool_name}, path={path}, phase={evidence.phase.value}, "
+        f"attempt={evidence.attempt_number}, error={evidence.error_message}"
+    )
 
 
 def _bounded_discovery_evidence(
