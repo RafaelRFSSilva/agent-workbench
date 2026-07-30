@@ -91,7 +91,7 @@ def inspect_workspace_git_status(
     workspace: Workspace,
     arguments: object,
 ) -> JSONObject:
-    """Return fixed Git status output for the authorized workspace root."""
+    """Return fixed Git status and typed changed-path evidence."""
 
     _require_root_arguments("inspect_git_status", arguments)
     output = _run_git(
@@ -103,10 +103,91 @@ def inspect_workspace_git_status(
             "status",
             "--short",
             "--branch",
+            "--untracked-files=all",
+            "-z",
         ],
     )
+    status, changed_paths, unsafe_changed_path_count = _parse_status_output(output)
 
-    return {"status": output}
+    return {
+        "status": status,
+        "changed_paths": list(changed_paths),
+        "unsafe_changed_path_count": unsafe_changed_path_count,
+    }
+
+
+def _parse_status_output(output: str) -> tuple[str, tuple[str, ...], int]:
+    """Build display-safe status and deterministic safe changed paths."""
+
+    records = output.split("\0") if "\0" in output else output.splitlines()
+    records = [record for record in records if record]
+    display_lines: list[str] = []
+    changed_paths: set[str] = set()
+    unsafe_changed_path_count = 0
+    index = 0
+
+    if records and records[0].startswith("## "):
+        display_lines.append(records[0])
+        index = 1
+
+    while index < len(records):
+        record = records[index]
+        index += 1
+        if len(record) < 4 or record[2] != " ":
+            unsafe_changed_path_count += 1
+            display_lines.append("?? [unsafe path]")
+            continue
+
+        status = record[:2]
+        destination = record[3:]
+        source: str | None = None
+        if ("R" in status or "C" in status) and index < len(records):
+            source = records[index]
+            index += 1
+
+        display_destination = _record_changed_path(
+            destination,
+            changed_paths,
+        )
+        if display_destination is None:
+            unsafe_changed_path_count += 1
+            display_destination = "[unsafe path]"
+
+        if source is None:
+            display_lines.append(f"{status} {display_destination}")
+            continue
+
+        display_source = _record_changed_path(source, changed_paths)
+        if display_source is None:
+            unsafe_changed_path_count += 1
+            display_source = "[unsafe path]"
+        display_lines.append(f"{status} {display_source} -> {display_destination}")
+
+    status_output = "\n".join(display_lines)
+    if status_output:
+        status_output += "\n"
+    return status_output, tuple(sorted(changed_paths)), unsafe_changed_path_count
+
+
+def _record_changed_path(path: str, changed_paths: set[str]) -> str | None:
+    """Record one safe workspace-relative Git path or return no display value."""
+
+    if (
+        not path
+        or path.startswith(("-", ":"))
+        or "\\" in path
+        or any(ord(character) < 32 or ord(character) == 127 for character in path)
+    ):
+        return None
+    pure_path = PurePosixPath(path)
+    if (
+        pure_path.is_absolute()
+        or not pure_path.parts
+        or any(part in {"", ".", "..", ".git", ".env"} for part in pure_path.parts)
+    ):
+        return None
+    changed_paths.add(path)
+    return path
 
 
 def inspect_workspace_git_diff(

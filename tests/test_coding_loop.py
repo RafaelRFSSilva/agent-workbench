@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from agent_workbench import validation_tools
 from agent_workbench.coding_loop import (
     DEFAULT_DISCOVER_MAX_TOOL_ROUNDS,
     DEFAULT_EDIT_COMPLETION_CONTINUATIONS,
@@ -301,6 +302,257 @@ def test_controller_runs_discover_edit_validate_verify_and_done(
     assert not edit_tools.intersection(
         {"run_ruff_format", "run_ruff_check", "run_pytest"}
     )
+
+
+def test_formats_only_successful_approved_python_path_and_preserves_baseline_dirty(
+    tmp_path: Path,
+) -> None:
+    """Never format an unrelated baseline-dirty Python file."""
+
+    repository = create_coding_repository(tmp_path / "project", passing=True)
+    original_module = (repository / "module.py").read_text(encoding="utf-8")
+    dirty_test = (
+        "from module import add\n\n\ndef test_add() -> None:\n    assert add(1,2)==3\n"
+    )
+    (repository / "test_module.py").write_text(dirty_test, encoding="utf-8")
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            replacement_response(
+                "edit",
+                expected_content=original_module,
+                expected_text="return left + right",
+                replacement_text="return  left+right",
+            ),
+            ChatResponse(text="Edit complete."),
+        ]
+    )
+
+    result = run_autonomous_coding_task(
+        create_session(repository, provider),
+        "Exercise scoped formatting.",
+        tool_approval_handler=approve,
+    )
+
+    format_runs = [
+        run for run in result.validation_runs if run.tool_name == "run_ruff_format"
+    ]
+    assert [run.target_paths for run in format_runs] == [("module.py",)]
+    assert format_runs[0].skipped is False
+    assert (
+        (repository / "module.py")
+        .read_text(encoding="utf-8")
+        .endswith("return left + right\n")
+    )
+    assert (repository / "test_module.py").read_text(encoding="utf-8") == dirty_test
+    assert result.baseline_changed_paths == ("test_module.py",)
+
+
+def test_formats_multiple_successful_approved_python_paths_in_sorted_order(
+    tmp_path: Path,
+) -> None:
+    """Format every approved changed Python file in deterministic path order."""
+
+    repository = create_coding_repository(tmp_path / "project", passing=True)
+    (repository / "alpha.py").write_text("value = 1\n", encoding="utf-8")
+    (repository / "zeta.py").write_text("value = 1\n", encoding="utf-8")
+    run_git(repository, "add", "alpha.py", "zeta.py")
+    run_git(repository, "commit", "-m", "add formatting fixtures")
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            tool_response(
+                "edit",
+                "apply_workspace_changes",
+                {
+                    "changes": [
+                        {
+                            "path": "zeta.py",
+                            "expected_content": "value = 1\n",
+                            "replacement_content": "value=2\n",
+                        },
+                        {
+                            "path": "alpha.py",
+                            "expected_content": "value = 1\n",
+                            "replacement_content": "value=2\n",
+                        },
+                    ]
+                },
+            ),
+            ChatResponse(text="Edit complete."),
+        ]
+    )
+    observed = []
+
+    result = run_autonomous_coding_task(
+        create_session(repository, provider),
+        "Update both modules.",
+        tool_approval_handler=approve,
+        tool_round_observer=observed.append,
+    )
+
+    format_targets = [
+        invocation.arguments["path"]
+        for round_ in observed
+        for invocation in round_.response.tool_invocations
+        if invocation.tool_name == "run_ruff_format"
+    ]
+    assert format_targets == ["alpha.py", "zeta.py"]
+    assert [
+        run.target_paths
+        for run in result.validation_runs
+        if run.tool_name == "run_ruff_format"
+    ] == [("alpha.py",), ("zeta.py",)]
+
+
+def test_non_python_change_skips_formatter_but_runs_project_checks(
+    tmp_path: Path,
+) -> None:
+    """Represent the safe formatter skip while retaining read-only validation."""
+
+    repository = create_coding_repository(tmp_path / "project", passing=True)
+    (repository / "README.md").write_text("before\n", encoding="utf-8")
+    run_git(repository, "add", "README.md")
+    run_git(repository, "commit", "-m", "add readme")
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            tool_response(
+                "edit",
+                "apply_file_patch",
+                {
+                    "path": "README.md",
+                    "expected_content": "before\n",
+                    "replacement_content": "after\n",
+                },
+            ),
+            ChatResponse(text="Edit complete."),
+        ]
+    )
+
+    result = run_autonomous_coding_task(
+        create_session(repository, provider),
+        "Update the documentation.",
+        tool_approval_handler=approve,
+    )
+
+    assert result.validation_runs[0].tool_name == "run_ruff_format"
+    assert result.validation_runs[0].skipped is True
+    assert result.validation_runs[0].target_paths == ()
+    assert "run_ruff_format" not in result.executed_tool_names
+    assert tuple(run.tool_name for run in result.validation_runs[1:]) == (
+        "run_ruff_check",
+        "run_pytest",
+    )
+    assert result.validation_succeeded is True
+
+
+def test_formatter_created_unexpected_path_fails_before_done(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Fail immediately when mutable validation changes an unapproved path."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    original = (repository / "module.py").read_text(encoding="utf-8")
+    original_run_validation = validation_tools.run_validation
+
+    def intrusive_validation(workspace, tool_name, arguments):
+        result = original_run_validation(workspace, tool_name, arguments)
+        if tool_name == "run_ruff_format":
+            (repository / "unexpected.py").write_text("value = 1\n", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(validation_tools, "run_validation", intrusive_validation)
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            replacement_response(
+                "edit",
+                expected_content=original,
+                expected_text="return left - right",
+                replacement_text="return left + right",
+            ),
+            ChatResponse(text="Edit complete."),
+        ]
+    )
+
+    with pytest.raises(
+        CompletionError,
+        match=(
+            r"phase VALIDATE: unexpected changed paths after run_ruff_format: "
+            r"unexpected\.py"
+        ),
+    ):
+        run_autonomous_coding_task(
+            create_session(repository, provider),
+            "Correct the add implementation.",
+            tool_approval_handler=approve,
+        )
+
+    assert (repository / "unexpected.py").exists()
+
+
+@pytest.mark.parametrize("unexpected_kind", ["tracked", "untracked"])
+def test_final_unexpected_paths_are_rejected_before_done(
+    tmp_path: Path,
+    monkeypatch,
+    unexpected_kind: str,
+) -> None:
+    """Reject unexpected final tracked and untracked paths after validation."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    original = (repository / "module.py").read_text(encoding="utf-8")
+    original_status = inspect_workspace_git_status
+    status_calls = 0
+
+    def intrusive_status(workspace, arguments):
+        nonlocal status_calls
+        status_calls += 1
+        if status_calls == 3:
+            if unexpected_kind == "tracked":
+                (repository / "test_module.py").write_text(
+                    "def test_unexpected() -> None:\n    assert True\n",
+                    encoding="utf-8",
+                )
+            else:
+                (repository / "unexpected.txt").write_text(
+                    "preserve me\n",
+                    encoding="utf-8",
+                )
+        return original_status(workspace, arguments)
+
+    monkeypatch.setattr(
+        "agent_workbench.git_tools.inspect_workspace_git_status",
+        intrusive_status,
+    )
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            replacement_response(
+                "edit",
+                expected_content=original,
+                expected_text="return left - right",
+                replacement_text="return left + right",
+            ),
+            ChatResponse(text="Edit complete."),
+        ]
+    )
+    expected_path = (
+        "test_module.py" if unexpected_kind == "tracked" else "unexpected.txt"
+    )
+
+    with pytest.raises(
+        CompletionError,
+        match=rf"phase VERIFY: unexpected changed paths before DONE: {expected_path}",
+    ):
+        run_autonomous_coding_task(
+            create_session(repository, provider),
+            "Correct the add implementation.",
+            tool_approval_handler=approve,
+        )
+
+    assert (repository / expected_path).exists()
 
 
 def test_discovery_round_limit_advances_to_edit(tmp_path: Path) -> None:

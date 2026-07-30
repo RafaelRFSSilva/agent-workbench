@@ -146,8 +146,32 @@ def test_inspects_clean_and_dirty_status_without_absolute_paths(tmp_path: Path) 
     dirty_result = inspect_workspace_git_status(workspace, {})
 
     assert clean_result["status"].startswith("## ")
+    assert clean_result["changed_paths"] == []
+    assert clean_result["unsafe_changed_path_count"] == 0
     assert "README.md" in dirty_result["status"]
+    assert dirty_result["changed_paths"] == ["README.md"]
+    assert dirty_result["unsafe_changed_path_count"] == 0
     assert str(root) not in dirty_result["status"]
+
+
+def test_status_reports_sorted_tracked_untracked_and_renamed_paths(
+    tmp_path: Path,
+) -> None:
+    """Return deterministic typed changed-path evidence without mutating Git."""
+
+    root, workspace = create_workspace(tmp_path)
+    initialize_repository(root)
+    run_git(root, "mv", "README.md", "renamed.md")
+    (root / "alpha.py").write_text("value = 1\n", encoding="utf-8")
+
+    result = inspect_workspace_git_status(workspace, {})
+
+    assert result["changed_paths"] == ["README.md", "alpha.py", "renamed.md"]
+    assert result["unsafe_changed_path_count"] == 0
+    assert "README.md -> renamed.md" in result["status"]
+    assert run_git(root, "status", "--porcelain=v1").stdout == (
+        b"R  README.md -> renamed.md\n?? alpha.py\n"
+    )
 
 
 @pytest.mark.parametrize("root_alias", ["", "."])
@@ -489,6 +513,8 @@ def test_uses_fixed_non_shell_commands_and_disables_external_diffs(
         "status",
         "--short",
         "--branch",
+        "--untracked-files=all",
+        "-z",
     ]
     assert diff_unstaged_call.args[0] == [
         "git",

@@ -186,6 +186,8 @@ class ValidationRun:
     result_status: str
     exit_code: int | None
     sequence_index: int = 0
+    target_paths: tuple[str, ...] = ()
+    skipped: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -240,6 +242,7 @@ class AutonomousCodingResult:
     latest_git_status_sequence_index: int | None = None
     latest_git_diff_sequence_index: int | None = None
     approved_workspace_paths: tuple[str, ...] = ()
+    baseline_changed_paths: tuple[str, ...] = ()
 
     @property
     def validation_succeeded(self) -> bool:
@@ -287,6 +290,9 @@ class _WorkflowState:
     completion_continuation_count: int = 0
     controller_invocation_count: int = 0
     current_action_attempt_number: int = 0
+    baseline_changed_paths: tuple[str, ...] = ()
+    baseline_unsafe_changed_path_count: int = 0
+    skipped_validation_runs: list[ValidationRun] = field(default_factory=list)
 
 
 def run_autonomous_coding_task(
@@ -309,6 +315,17 @@ def run_autonomous_coding_task(
         limits=limits,
     )
     state = _WorkflowState(task_spec=task_spec, limits=limits)
+    try:
+        (
+            state.baseline_changed_paths,
+            state.baseline_unsafe_changed_path_count,
+        ) = _inspect_changed_paths(registry, state)
+    except CompletionError as exc:
+        raise _workflow_failure(
+            state,
+            CodingPhase.DISCOVER,
+            f"baseline changed-path inspection failed: {exc}",
+        ) from None
 
     def observe_tool_round(round_: ToolInteractionRound) -> None:
         state.rounds.append(round_)
@@ -393,6 +410,13 @@ def run_autonomous_coding_task(
         handle_tool_approval,
     )
     _require_verification_success(state, verification_results)
+    status_result = dict(verification_results)["inspect_git_status"]
+    _require_no_unexpected_changed_paths(
+        state,
+        status_result,
+        phase=CodingPhase.VERIFY,
+        context="before DONE",
+    )
 
     result = _build_result(state, final_phase=CodingPhase.DONE)
     if not result.workspace_change_applied:
@@ -616,25 +640,205 @@ def _run_validation_phase(
 ) -> tuple[tuple[str, ToolResult], ...]:
     """Invoke the complete fixed Python validation sequence."""
 
-    results = []
-    for tool_name in _VALIDATION_TOOL_NAMES:
-        try:
-            result = _execute_controller_invocation(
+    results: list[tuple[str, ToolResult]] = []
+    format_targets = tuple(
+        path for path in _approved_workspace_paths(state) if path.endswith(".py")
+    )
+    if not format_targets:
+        sequence_index = _tool_result_count(state.rounds) + 1
+        skipped = ToolResult(
+            invocation_id=f"controller-skipped-{sequence_index}-run_ruff_format",
+            status="success",
+            output={
+                "tool": "run_ruff_format",
+                "path": ".",
+                "exit_code": 0,
+                "skipped": True,
+            },
+        )
+        state.skipped_validation_runs.append(
+            ValidationRun(
+                tool_name="run_ruff_format",
+                result_status="success",
+                exit_code=None,
+                sequence_index=sequence_index,
+                target_paths=(),
+                skipped=True,
+            )
+        )
+        results.append(("run_ruff_format", skipped))
+    else:
+        for path in format_targets:
+            result = _run_validation_tool(
                 registry,
                 state,
-                tool_name,
-                {"path": "."},
+                "run_ruff_format",
+                {"path": path},
                 observer,
                 approval_handler,
             )
-        except CompletionError as exc:
-            raise _workflow_failure(
+            results.append(("run_ruff_format", result))
+            _require_no_unexpected_changed_paths(
                 state,
-                CodingPhase.VALIDATE,
-                f"{tool_name} could not execute: {exc}",
-            ) from None
+                _inspect_changed_paths_result(registry, state),
+                phase=CodingPhase.VALIDATE,
+                context="after run_ruff_format",
+            )
+
+    for tool_name in ("run_ruff_check", "run_pytest"):
+        result = _run_validation_tool(
+            registry,
+            state,
+            tool_name,
+            {"path": "."},
+            observer,
+            approval_handler,
+        )
         results.append((tool_name, result))
     return tuple(results)
+
+
+def _run_validation_tool(
+    registry: ToolRegistry,
+    state: _WorkflowState,
+    tool_name: str,
+    arguments: JSONObject,
+    observer: ToolRoundObserver,
+    approval_handler: ToolApprovalHandler,
+) -> ToolResult:
+    """Invoke one fixed validation and preserve phase-specific failures."""
+
+    try:
+        return _execute_controller_invocation(
+            registry,
+            state,
+            tool_name,
+            arguments,
+            observer,
+            approval_handler,
+        )
+    except CompletionError as exc:
+        raise _workflow_failure(
+            state,
+            CodingPhase.VALIDATE,
+            f"{tool_name} could not execute: {exc}",
+        ) from None
+
+
+def _inspect_changed_paths_result(
+    registry: ToolRegistry,
+    state: _WorkflowState,
+) -> ToolResult:
+    """Run one hidden read-only status inspection for controller safety."""
+
+    state.controller_invocation_count += 1
+    invocation = ToolInvocation(
+        id=(
+            f"controller-{state.controller_invocation_count}-inspect_git_status-safety"
+        ),
+        tool_name="inspect_git_status",
+        arguments={},
+    )
+    return registry.execute(invocation)
+
+
+def _inspect_changed_paths(
+    registry: ToolRegistry,
+    state: _WorkflowState,
+) -> tuple[tuple[str, ...], int]:
+    """Return validated typed changed-path evidence from read-only Git status."""
+
+    return _changed_path_evidence(_inspect_changed_paths_result(registry, state))
+
+
+def _changed_path_evidence(result: ToolResult) -> tuple[tuple[str, ...], int]:
+    """Validate one Git status result without accepting unsafe path values."""
+
+    if result.status != "success" or not isinstance(result.output, dict):
+        raise CompletionError("Git status inspection did not succeed.")
+    raw_paths = result.output.get("changed_paths")
+    unsafe_count = result.output.get("unsafe_changed_path_count")
+    if (
+        not isinstance(raw_paths, list)
+        or any(
+            not isinstance(path, str) or not _is_safe_prompt_path(path)
+            for path in raw_paths
+        )
+        or isinstance(unsafe_count, bool)
+        or not isinstance(unsafe_count, int)
+        or unsafe_count < 0
+    ):
+        raise CompletionError("Git status returned invalid changed-path evidence.")
+    paths = tuple(sorted(set(raw_paths)))
+    if len(paths) != len(raw_paths):
+        raise CompletionError("Git status returned invalid changed-path evidence.")
+    return paths, unsafe_count
+
+
+def _require_no_unexpected_changed_paths(
+    state: _WorkflowState,
+    status_result: ToolResult,
+    *,
+    phase: CodingPhase,
+    context: str,
+) -> None:
+    """Reject paths outside the baseline and successful approved actions."""
+
+    try:
+        current_paths, unsafe_count = _changed_path_evidence(status_result)
+    except CompletionError as exc:
+        raise _workflow_failure(
+            state,
+            phase,
+            f"changed-path inspection {context} failed: {exc}",
+        ) from None
+
+    allowed_paths = set(state.baseline_changed_paths)
+    allowed_paths.update(_approved_workspace_paths(state))
+    unexpected = sorted(set(current_paths) - allowed_paths)
+    if unexpected:
+        raise _workflow_failure(
+            state,
+            phase,
+            f"unexpected changed paths {context}: {', '.join(unexpected)}",
+        )
+    if unsafe_count > state.baseline_unsafe_changed_path_count:
+        raise _workflow_failure(
+            state,
+            phase,
+            f"unexpected unsafe changed path {context}",
+        )
+
+
+def _approved_workspace_paths(state: _WorkflowState) -> tuple[str, ...]:
+    """Return exact safe paths changed by successful approved task actions."""
+
+    paths: set[str] = set()
+    for round_ in state.rounds:
+        for invocation, result in zip(
+            round_.response.tool_invocations,
+            round_.results,
+            strict=True,
+        ):
+            if (
+                invocation.tool_name not in _WORKSPACE_CHANGE_TOOL_NAMES
+                or invocation.id not in state.approved_action_ids
+                or result.status != "success"
+                or not _workspace_change_result_applied(
+                    invocation.tool_name,
+                    invocation.arguments,
+                    result.output,
+                )
+            ):
+                continue
+            paths.update(_changed_paths_from_workspace_result(result.output))
+    return tuple(sorted(paths))
+
+
+def _tool_result_count(rounds: Iterable[ToolInteractionRound]) -> int:
+    """Count completed tool results across interaction rounds."""
+
+    return sum(len(round_.results) for round_ in rounds)
 
 
 def _run_verify_phase(
@@ -832,6 +1036,7 @@ def _build_result(
                         result_status=str(result.status),
                         exit_code=_validation_exit_code(result.output),
                         sequence_index=sequence_index,
+                        target_paths=_validation_target_paths(result.output),
                     )
                 )
 
@@ -847,6 +1052,13 @@ def _build_result(
                 latest_git_diff_sequence_index = sequence_index
 
     workspace_change_applied = last_workspace_change_sequence_index is not None
+    validation_runs.extend(state.skipped_validation_runs)
+    validation_runs.sort(
+        key=lambda run: (
+            run.sequence_index,
+            _VALIDATION_TOOL_NAMES.index(run.tool_name),
+        )
+    )
     return AutonomousCodingResult(
         task_spec=state.task_spec,
         assistant_summary=state.assistant_summary,
@@ -865,7 +1077,19 @@ def _build_result(
         latest_git_status_sequence_index=latest_git_status_sequence_index,
         latest_git_diff_sequence_index=latest_git_diff_sequence_index,
         approved_workspace_paths=tuple(sorted(approved_workspace_paths)),
+        baseline_changed_paths=state.baseline_changed_paths,
     )
+
+
+def _validation_target_paths(output: object) -> tuple[str, ...]:
+    """Extract one safe validation target path from structured evidence."""
+
+    if not isinstance(output, dict):
+        return ()
+    path = output.get("path")
+    if not isinstance(path, str) or path == "." or not _is_safe_prompt_path(path):
+        return ()
+    return (path,)
 
 
 def _changed_paths_from_workspace_result(output: object) -> tuple[str, ...]:
@@ -1534,7 +1758,7 @@ def _validation_succeeded_after_latest_change(
     return (
         latest is not None
         and latest.result_status == "success"
-        and latest.exit_code == 0
+        and (latest.skipped or latest.exit_code == 0)
     )
 
 
