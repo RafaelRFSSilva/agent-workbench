@@ -1377,3 +1377,348 @@ def test_recovers_approval_preview_failure_as_tool_error_when_enabled() -> None:
     assert approvals == []
     assert observed_rounds == [expected_round]
     assert provider.requests[1].tool_interactions == (expected_round,)
+
+
+def test_withholds_inspection_tools_after_six_inspection_only_rounds() -> None:
+    """Require progress after a bounded successful inspection-only streak."""
+
+    read_executions: list[dict[str, object]] = []
+    calculator_executions: list[dict[str, object]] = []
+    read_file = create_read_file_definition()
+    calculator = create_calculator_definition()
+    registry = ToolRegistry()
+    registry.register(
+        read_file,
+        lambda arguments: read_executions.append(arguments) or {"content": "value"},
+    )
+    registry.register(
+        calculator,
+        lambda arguments: calculator_executions.append(arguments) or {"value": 4},
+    )
+    inspection_responses = [
+        create_tool_response(
+            ToolInvocation(
+                id=f"read-{index}",
+                tool_name="read_file",
+                arguments={"path": f"module-{index}.py"},
+            )
+        )
+        for index in range(6)
+    ]
+    calculator_response = create_tool_response(
+        ToolInvocation(
+            id="calculate",
+            tool_name="calculator",
+            arguments={"expression": "2 + 2"},
+        )
+    )
+    final_response = ChatResponse(text="Completed after making progress.")
+    provider = FakeProvider(
+        [*inspection_responses, calculator_response, final_response]
+    )
+    request = ChatRequest(messages=[], tools=(read_file, calculator))
+
+    result = run_tool_calling_loop(
+        provider,
+        request,
+        registry,
+        max_tool_rounds=7,
+    )
+
+    assert result is final_response
+    assert len(read_executions) == 6
+    assert calculator_executions == [{"expression": "2 + 2"}]
+    assert provider.requests[6].tools == (calculator,)
+    assert provider.requests[6].system_prompt is not None
+    assert "module-0.py" not in provider.requests[6].system_prompt
+    assert provider.requests[7].tools is request.tools
+    assert request.tools == (read_file, calculator)
+
+
+def test_rejects_inspection_requested_while_streak_recovery_withholds_it() -> None:
+    """Fail before executing inspection ignored by the recovery provider."""
+
+    executions: list[dict[str, object]] = []
+    read_file = create_read_file_definition()
+    registry = ToolRegistry()
+    registry.register(
+        read_file,
+        lambda arguments: executions.append(arguments) or {"content": "value"},
+    )
+    inspection_responses = [
+        create_tool_response(
+            ToolInvocation(
+                id=f"read-{index}",
+                tool_name="read_file",
+                arguments={"path": f"module-{index}.py"},
+            )
+        )
+        for index in range(7)
+    ]
+    provider = FakeProvider(inspection_responses)
+
+    with pytest.raises(
+        CompletionError,
+        match="inspection tools were withheld during recovery",
+    ):
+        run_tool_calling_loop(
+            provider,
+            ChatRequest(messages=[], tools=(read_file,)),
+            registry,
+            max_tool_rounds=7,
+        )
+
+    assert len(provider.requests) == 7
+    assert len(executions) == 6
+    assert provider.requests[6].tools == ()
+
+
+def test_noninspection_round_resets_the_inspection_streak() -> None:
+    """Allow additional inspections after meaningful non-inspection progress."""
+
+    read_file = create_read_file_definition()
+    calculator = create_calculator_definition()
+    registry = ToolRegistry()
+    registry.register(read_file, lambda arguments: {"content": "value"})
+    registry.register(calculator, lambda arguments: {"value": 4})
+    first_inspections = [
+        create_tool_response(
+            ToolInvocation(
+                id=f"first-{index}",
+                tool_name="read_file",
+                arguments={"path": f"first-{index}.py"},
+            )
+        )
+        for index in range(5)
+    ]
+    calculator_response = create_tool_response(
+        ToolInvocation(
+            id="calculate",
+            tool_name="calculator",
+            arguments={"expression": "2 + 2"},
+        )
+    )
+    second_inspections = [
+        create_tool_response(
+            ToolInvocation(
+                id=f"second-{index}",
+                tool_name="read_file",
+                arguments={"path": f"second-{index}.py"},
+            )
+        )
+        for index in range(5)
+    ]
+    final_response = ChatResponse(text="Completed.")
+    provider = FakeProvider(
+        [
+            *first_inspections,
+            calculator_response,
+            *second_inspections,
+            final_response,
+        ]
+    )
+    request = ChatRequest(messages=[], tools=(read_file, calculator))
+
+    result = run_tool_calling_loop(
+        provider,
+        request,
+        registry,
+        max_tool_rounds=11,
+    )
+
+    assert result is final_response
+    assert all(
+        provider_request.tools is request.tools
+        for provider_request in provider.requests
+    )
+
+
+def test_existing_six_round_inspection_streak_starts_withheld_recovery() -> None:
+    """Recover immediately when request history already reaches the limit."""
+
+    read_file = create_read_file_definition()
+    calculator = create_calculator_definition()
+    completed_rounds = tuple(
+        ToolInteractionRound(
+            response=create_tool_response(
+                ToolInvocation(
+                    id=f"read-{index}",
+                    tool_name="read_file",
+                    arguments={"path": f"module-{index}.py"},
+                )
+            ),
+            results=(
+                ToolResult(
+                    invocation_id=f"read-{index}",
+                    status="success",
+                    output={"content": "value"},
+                ),
+            ),
+        )
+        for index in range(6)
+    )
+    final_response = ChatResponse(text="Use the existing inspection results.")
+    provider = FakeProvider([final_response])
+    request = ChatRequest(
+        messages=[],
+        tools=(read_file, calculator),
+        tool_interactions=completed_rounds,
+    )
+
+    result = run_tool_calling_loop(
+        provider,
+        request,
+        ToolRegistry(),
+        max_tool_rounds=1,
+    )
+
+    assert result is final_response
+    assert provider.requests[0].tools == (calculator,)
+    assert provider.requests[0].tool_interactions is completed_rounds
+    assert provider.requests[0].system_prompt is not None
+    assert "module-0.py" not in provider.requests[0].system_prompt
+    assert request.tools == (read_file, calculator)
+
+
+def test_approval_preview_error_resets_inspection_streak() -> None:
+    """Treat a recovered non-inspection preview error as a streak break."""
+
+    read_file = create_read_file_definition()
+    calculator = create_calculator_definition()
+    registry = ToolRegistry()
+    registry.register(read_file, lambda arguments: {"content": "value"})
+
+    def fail_preview(_arguments):
+        raise CompletionError("invalid target")
+
+    registry.register(
+        calculator,
+        lambda arguments: {"value": 4},
+        requires_approval=True,
+        approval_preview=fail_preview,
+    )
+    first_inspections = [
+        create_tool_response(
+            ToolInvocation(
+                id=f"first-{index}",
+                tool_name="read_file",
+                arguments={"path": f"first-{index}.py"},
+            )
+        )
+        for index in range(5)
+    ]
+    preview_error_response = create_tool_response(
+        ToolInvocation(
+            id="invalid-calculation",
+            tool_name="calculator",
+            arguments={"expression": "2 + 2"},
+        )
+    )
+    final_inspection = create_tool_response(
+        ToolInvocation(
+            id="final-read",
+            tool_name="read_file",
+            arguments={"path": "final.py"},
+        )
+    )
+    final_response = ChatResponse(text="Completed.")
+    provider = FakeProvider(
+        [
+            *first_inspections,
+            preview_error_response,
+            final_inspection,
+            final_response,
+        ]
+    )
+    request = ChatRequest(
+        messages=[],
+        tools=(read_file, calculator),
+    )
+
+    result = run_tool_calling_loop(
+        provider,
+        request,
+        registry,
+        max_tool_rounds=7,
+        recover_approval_preview_errors=True,
+    )
+
+    assert result is final_response
+    assert all(
+        provider_request.tools is request.tools
+        for provider_request in provider.requests
+    )
+
+
+def test_unsafe_batch_recovery_keeps_inspection_tools_withheld() -> None:
+    """Keep streak recovery active through one unsafe non-inspection batch."""
+
+    read_file = create_read_file_definition()
+    calculator = create_calculator_definition()
+    read_executions: list[dict[str, object]] = []
+    calculator_executions: list[dict[str, object]] = []
+    registry = ToolRegistry()
+    registry.register(
+        read_file,
+        lambda arguments: read_executions.append(arguments) or {"content": "value"},
+    )
+    registry.register(
+        calculator,
+        lambda arguments: calculator_executions.append(arguments) or {"value": 4},
+    )
+    inspections = [
+        create_tool_response(
+            ToolInvocation(
+                id=f"read-{index}",
+                tool_name="read_file",
+                arguments={"path": f"module-{index}.py"},
+            )
+        )
+        for index in range(6)
+    ]
+    unsafe_response = create_tool_response(
+        ToolInvocation(
+            id="duplicate-1",
+            tool_name="calculator",
+            arguments={"expression": "2 + 2"},
+        ),
+        ToolInvocation(
+            id="duplicate-2",
+            tool_name="calculator",
+            arguments={"expression": "2 + 2"},
+        ),
+    )
+    calculator_response = create_tool_response(
+        ToolInvocation(
+            id="calculate",
+            tool_name="calculator",
+            arguments={"expression": "2 + 2"},
+        )
+    )
+    final_response = ChatResponse(text="Completed.")
+    provider = FakeProvider(
+        [
+            *inspections,
+            unsafe_response,
+            calculator_response,
+            final_response,
+        ]
+    )
+    request = ChatRequest(
+        messages=[],
+        tools=(read_file, calculator),
+    )
+
+    result = run_tool_calling_loop(
+        provider,
+        request,
+        registry,
+        max_tool_rounds=7,
+    )
+
+    assert result is final_response
+    assert len(read_executions) == 6
+    assert calculator_executions == [{"expression": "2 + 2"}]
+    assert provider.requests[6].tools == (calculator,)
+    assert provider.requests[7].tools == (calculator,)
+    assert provider.requests[8].tools is request.tools
