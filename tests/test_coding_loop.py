@@ -13,6 +13,7 @@ from agent_workbench.coding_loop import (
     DEFAULT_MAX_REPAIR_ATTEMPTS,
     DEFAULT_REPAIR_COMPLETION_CONTINUATIONS,
     CodingPhase,
+    CodingWorkflowLimits,
     run_autonomous_coding_task,
 )
 from agent_workbench.errors import CompletionError
@@ -759,3 +760,269 @@ def test_approval_denial_fails_current_phase_without_validation(
         )
 
     assert run_git(repository, "status", "--short").stdout == ""
+
+
+class TestDeterministicRegressionBattery:
+    """Exercise representative coding outcomes without any real model provider."""
+
+    def test_changes_wrong_constant_and_passes(self, tmp_path: Path) -> None:
+        """Correct one tracked constant and reach controller-owned DONE."""
+
+        repository = create_coding_repository(tmp_path / "project", passing=True)
+        original = "ANSWER = 1\n"
+        replacement = "ANSWER = 2\n"
+        (repository / "module.py").write_text(original, encoding="utf-8")
+        (repository / "test_module.py").write_text(
+            "from module import ANSWER\n"
+            "\n"
+            "\n"
+            "def test_answer() -> None:\n"
+            "    assert ANSWER == 2\n",
+            encoding="utf-8",
+        )
+        run_git(repository, "add", "module.py", "test_module.py")
+        run_git(repository, "commit", "-m", "constant fixture")
+        provider = ScriptedProvider(
+            [
+                ChatResponse(text="Discovery complete."),
+                replacement_response(
+                    "constant-edit",
+                    expected_content=original,
+                    expected_text="ANSWER = 1",
+                    replacement_text="ANSWER = 2",
+                ),
+                ChatResponse(text="Constant corrected."),
+            ]
+        )
+
+        result = run_autonomous_coding_task(
+            create_session(repository, provider),
+            "Correct the wrong constant.",
+            tool_approval_handler=approve,
+        )
+
+        assert result.final_phase is CodingPhase.DONE
+        assert result.validation_succeeded is True
+        assert (repository / "module.py").read_text(encoding="utf-8") == replacement
+
+    def test_repairs_function_after_first_pytest_failure(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Use failed controller-run pytest evidence to drive one repair."""
+
+        repository = create_coding_repository(tmp_path / "project")
+        original = "def add(left: int, right: int) -> int:\n    return left - right\n"
+        multiplied = "def add(left: int, right: int) -> int:\n    return left * right\n"
+        provider = ScriptedProvider(
+            [
+                ChatResponse(text="Discovery complete."),
+                replacement_response(
+                    "bad-edit",
+                    expected_content=original,
+                    expected_text="return left - right",
+                    replacement_text="return left * right",
+                ),
+                ChatResponse(text="First edit complete."),
+                replacement_response(
+                    "repair",
+                    expected_content=multiplied,
+                    expected_text="return left * right",
+                    replacement_text="return left + right",
+                ),
+                ChatResponse(text="Repair complete."),
+            ]
+        )
+
+        result = run_autonomous_coding_task(
+            create_session(repository, provider),
+            "Repair the add function.",
+            tool_approval_handler=approve,
+        )
+
+        pytest_runs = [
+            run for run in result.validation_runs if run.tool_name == "run_pytest"
+        ]
+        assert [run.exit_code for run in pytest_runs] == [1, 0]
+        assert result.repair_attempt_count == 1
+        assert result.final_phase is CodingPhase.DONE
+
+    def test_adds_small_function_and_test(self, tmp_path: Path) -> None:
+        """Add implementation and test changes in one approved transaction."""
+
+        repository = create_coding_repository(tmp_path / "project", passing=True)
+        original_module = (
+            "def add(left: int, right: int) -> int:\n    return left + right\n"
+        )
+        replacement_module = (
+            f"{original_module}\n\ndef double(value: int) -> int:\n"
+            "    return value * 2\n"
+        )
+        original_test = (
+            "from module import add\n"
+            "\n"
+            "\n"
+            "def test_add() -> None:\n"
+            "    assert add(1, 2) == 3\n"
+        )
+        replacement_test = (
+            "from module import add, double\n"
+            "\n"
+            "\n"
+            "def test_add() -> None:\n"
+            "    assert add(1, 2) == 3\n"
+            "\n"
+            "\n"
+            "def test_double() -> None:\n"
+            "    assert double(3) == 6\n"
+        )
+        provider = ScriptedProvider(
+            [
+                ChatResponse(text="Discovery complete."),
+                tool_response(
+                    "add-function-and-test",
+                    "apply_workspace_changes",
+                    {
+                        "changes": [
+                            {
+                                "path": "module.py",
+                                "expected_content": original_module,
+                                "replacement_content": replacement_module,
+                            },
+                            {
+                                "path": "test_module.py",
+                                "expected_content": original_test,
+                                "replacement_content": replacement_test,
+                            },
+                        ]
+                    },
+                ),
+                ChatResponse(text="Function and test added."),
+            ]
+        )
+
+        result = run_autonomous_coding_task(
+            create_session(repository, provider),
+            "Add double and its test.",
+            tool_approval_handler=approve,
+        )
+
+        assert result.final_phase is CodingPhase.DONE
+        assert result.validation_succeeded is True
+        assert "def double" in (repository / "module.py").read_text(encoding="utf-8")
+        assert "test_double" in (repository / "test_module.py").read_text(
+            encoding="utf-8"
+        )
+
+    def test_rejects_completion_without_diff(self, tmp_path: Path) -> None:
+        """Reject repeated success prose before controller validation starts."""
+
+        repository = create_coding_repository(tmp_path / "project", passing=True)
+        provider = ScriptedProvider(
+            [
+                ChatResponse(text="Discovery complete."),
+                ChatResponse(text="Complete."),
+                ChatResponse(text="Still complete."),
+                ChatResponse(text="No diff needed."),
+            ]
+        )
+
+        with pytest.raises(
+            CompletionError,
+            match=r"phase EDIT: completion continuation limit reached",
+        ):
+            run_autonomous_coding_task(
+                create_session(repository, provider),
+                "Make the requested change.",
+                tool_approval_handler=approve,
+            )
+
+        assert run_git(repository, "diff").stdout == ""
+
+    def test_rejects_completion_while_tests_are_failing(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Keep a failed pytest result from becoming successful model prose."""
+
+        repository = create_coding_repository(tmp_path / "project")
+        original = "def add(left: int, right: int) -> int:\n    return left - right\n"
+        provider = ScriptedProvider(
+            [
+                ChatResponse(text="Discovery complete."),
+                replacement_response(
+                    "bad-edit",
+                    expected_content=original,
+                    expected_text="return left - right",
+                    replacement_text="return left * right",
+                ),
+                ChatResponse(text="The task passes."),
+                ChatResponse(text="Repair is complete."),
+                ChatResponse(text="Tests now pass."),
+                ChatResponse(text="No change needed."),
+                ChatResponse(text="Second repair complete."),
+                ChatResponse(text="Everything passes."),
+                ChatResponse(text="Done."),
+            ]
+        )
+        observed_rounds = []
+
+        with pytest.raises(
+            CompletionError,
+            match=r"phase REPAIR: repair completed without a successful new workspace change",
+        ):
+            run_autonomous_coding_task(
+                create_session(repository, provider),
+                "Correct the add function.",
+                tool_approval_handler=approve,
+                tool_round_observer=observed_rounds.append,
+            )
+
+        pytest_results = [
+            result
+            for round_ in observed_rounds
+            for invocation, result in zip(
+                round_.response.tool_invocations,
+                round_.results,
+                strict=True,
+            )
+            if invocation.tool_name == "run_pytest"
+        ]
+        assert pytest_results[-1].output["exit_code"] == 1
+
+    def test_stops_at_configured_repair_limit(self, tmp_path: Path) -> None:
+        """Honor a typed one-attempt repair configuration."""
+
+        repository = create_coding_repository(tmp_path / "project")
+        original = "def add(left: int, right: int) -> int:\n    return left - right\n"
+        multiplied = "def add(left: int, right: int) -> int:\n    return left * right\n"
+        provider = ScriptedProvider(
+            [
+                ChatResponse(text="Discovery complete."),
+                replacement_response(
+                    "bad-edit",
+                    expected_content=original,
+                    expected_text="return left - right",
+                    replacement_text="return left * right",
+                ),
+                ChatResponse(text="First edit complete."),
+                replacement_response(
+                    "only-repair",
+                    expected_content=multiplied,
+                    expected_text="return left * right",
+                    replacement_text="return left / right",
+                ),
+                ChatResponse(text="Only repair complete."),
+            ]
+        )
+
+        with pytest.raises(
+            CompletionError,
+            match=r"repair_attempts=1, completion_continuations=0",
+        ):
+            run_autonomous_coding_task(
+                create_session(repository, provider),
+                "Correct the add function.",
+                tool_approval_handler=approve,
+                limits=CodingWorkflowLimits(repair_attempts=1),
+            )

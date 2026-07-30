@@ -10,7 +10,10 @@ from agent_workbench.arguments import (
     parse_cli_arguments,
     resolve_runtime_configuration,
 )
-from agent_workbench.coding_loop import run_autonomous_coding_task
+from agent_workbench.coding_loop import (
+    AutonomousCodingResult,
+    run_autonomous_coding_task,
+)
 from agent_workbench.config import load_environment
 from agent_workbench.errors import (
     CompletionError,
@@ -220,10 +223,7 @@ def _run_autonomous_task(
 
     print(f"\nAssistant: {result.assistant_summary}\n")
     print("Autonomous task result:")
-    print(f"  Tool rounds: {result.tool_round_count}")
-    print(f"  Validation succeeded: {'yes' if result.validation_succeeded else 'no'}")
-    print(f"  Git status inspected: {'yes' if result.inspected_git_status else 'no'}")
-    print(f"  Git diff inspected: {'yes' if result.inspected_git_diff else 'no'}")
+    _display_coding_evidence(result)
 
     if result.validation_runs:
         print("  Validation runs:")
@@ -301,22 +301,7 @@ def _display_isolated_autonomous_result(
     print(f"  Branch: {commit_result.branch_name}")
     print(f"  New isolated HEAD: {commit_result.new_head}")
     print(f"  Committed paths: {commit_result.operation_count}")
-    print(f"  Tool rounds: {coding_result.tool_round_count}")
-    print(
-        "  Workspace change applied: "
-        f"{'yes' if coding_result.workspace_change_applied else 'no'}"
-    )
-    print(
-        "  Validation succeeded: "
-        f"{'yes' if coding_result.validation_succeeded else 'no'}"
-    )
-    print(
-        "  Git status inspected: "
-        f"{'yes' if coding_result.inspected_git_status else 'no'}"
-    )
-    print(
-        f"  Git diff inspected: {'yes' if coding_result.inspected_git_diff else 'no'}"
-    )
+    _display_coding_evidence(coding_result)
     print(
         "  Final worktree clean: "
         f"{'yes' if result.final_worktree_state.clean else 'no'}"
@@ -324,6 +309,22 @@ def _display_isolated_autonomous_result(
     print("  Primary working tree unchanged.")
     print("  Worktree and local branch preserved.")
     print("  No merge, push, worktree removal, or branch deletion was performed.")
+
+
+def _display_coding_evidence(result: AutonomousCodingResult) -> None:
+    """Display deterministic workflow evidence in one stable shared order."""
+
+    print(f"  Final phase: {result.final_phase.value}")
+    print(f"  Tool rounds: {result.tool_round_count}")
+    print(
+        "  Workspace change applied: "
+        f"{'yes' if result.workspace_change_applied else 'no'}"
+    )
+    print(f"  Repair attempts: {result.repair_attempt_count}")
+    print(f"  Completion continuations: {result.completion_continuation_count}")
+    print(f"  Validation succeeded: {'yes' if result.validation_succeeded else 'no'}")
+    print(f"  Git status inspected: {'yes' if result.inspected_git_status else 'no'}")
+    print(f"  Git diff inspected: {'yes' if result.inspected_git_diff else 'no'}")
 
 
 def _prompt_for_isolated_commit_approval(request) -> ToolApprovalDecision:

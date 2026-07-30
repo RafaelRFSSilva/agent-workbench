@@ -368,6 +368,15 @@ without coordination.
 - [x] Integrate commit message and complete commit approval into the CLI.
 - [x] Validate the complete local flow with `COMMIT-842`.
 - [x] Add a self-hosting operator guide.
+- [x] Add provider-independent per-send tool allowlists and round limits.
+- [x] Enforce deterministic DISCOVER, EDIT, VALIDATE, REPAIR, VERIFY, and DONE
+  phases outside the model.
+- [x] Run Ruff format, Ruff check, pytest, Git status, and Git diff from the
+  controller through existing approval and execution boundaries.
+- [x] Reject false completion, failed validation, exhausted repair limits,
+  failed Git inspection, and empty final diffs before commit planning.
+- [x] Add scripted-provider regression scenarios backed by real temporary Git
+  repositories.
 - [ ] Add controlled patch application.
 - [ ] Add conflict detection.
 - [ ] Add review-before-apply workflows.
@@ -540,7 +549,9 @@ Text input remains fully supported.
 - [ ] Measure structured output validity.
 - [ ] Evaluate retrieval relevance.
 - [ ] Measure task and handoff success.
+- [x] Add a deterministic scripted-provider coding workflow regression battery.
 - [ ] Add reproducible benchmark scenarios.
+- [ ] Benchmark the deterministic workflow manually with real local models.
 - [ ] Persist conversations and agent sessions.
 - [ ] Persist tasks, traces, indexes, and evaluation results.
 - [ ] Add schema versioning and migrations.
@@ -589,46 +600,31 @@ Security must be implemented throughout the roadmap.
 
 ## Immediate Next Milestone
 
-The provider-independent recovery-evidence foundation is complete.
+The provider-independent deterministic coding workflow is complete.
 
-Handled isolated-commit and worktree lifecycle failures now produce immutable
-structured evidence from conservative read-only Git inspection. The current
-implementation can report observed branch, target, registration, source HEAD,
-worktree HEAD, index, and staged-path state without performing destructive
-automatic cleanup.
-
-This foundation does not yet provide persistent lifecycle journals, restart
-recovery, automatic rollback, or recovery after process or machine failure.
+The application now owns phase progression, invokes fixed Python validation and
+Git verification itself, requires a real workspace action and non-empty final
+diff, and bounds discovery, edit continuations, and repair attempts. Scripted
+providers and real temporary Git repositories cover representative success and
+failure paths without calling Ollama or paid/cloud providers.
 
 The next implementation milestone is:
 
-> Autonomous coding loop.
+> Persistent lifecycle records and crash-safe restart recovery.
 
-The first loop should allow one supervised agent to receive a development
-prompt and perform a complete bounded coding cycle:
-
-1. Convert the prompt into one explicit task specification.
-2. Inspect the workspace and relevant files.
-3. Produce an implementation plan.
-4. Apply controlled file changes through the existing workspace tools.
-5. Run the configured validation commands.
-6. Inspect validation failures and revise the implementation.
-7. Stop after success or a bounded iteration limit.
-8. Present the resulting status, validation output, and final diff.
-9. Create an exact local commit only after explicit operator approval.
-
-The initial implementation remains single-agent and single-worktree. It must
-not introduce arbitrary shell access, network access, automatic push, merge,
-branch deletion, or hidden approval.
+This work must preserve the existing conservative rule: unexpected staged
+state, partial staging, failed commits, changed HEAD, and ambiguous refs remain
+available for manual recovery. It must not introduce automatic reset, restore,
+clean, stash, force removal, push, merge, or branch deletion.
 
 ## Near-Term Sequence
 
-1. Add the autonomous coding loop.
-2. Add persistent lifecycle records and crash-safe restart recovery.
-3. Add deletion and rename transactions with explicit conflict handling.
-4. Build local project retrieval and project configuration.
-5. Add task lifecycle, assignment, dependencies, and multi-agent foundations.
-6. Build terminal and VS Code experiences.
+1. Add persistent lifecycle records and crash-safe restart recovery.
+2. Add deletion and rename transactions with explicit conflict handling.
+3. Build local project retrieval and project configuration.
+4. Add task lifecycle, assignment, dependencies, and multi-agent foundations.
+5. Build terminal and VS Code experiences.
+6. Add reproducible manual benchmarks with real local models.
 
 ## Related Documentation
 

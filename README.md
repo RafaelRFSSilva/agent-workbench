@@ -33,9 +33,9 @@ Implemented capabilities:
   conversation ownership, and synchronous direct or tool-enabled sends.
 - Immutable provider-independent `TaskSpec` metadata with ordered acceptance
   criteria and optional read-only attachment to an `AgentSession`.
-- One-shot supervised autonomous coding tasks through `--task`, with bounded
-  tool rounds, explicit action approvals, validation evidence, final Git
-  inspection, and an optional completed-tool trace.
+- One-shot deterministic coding tasks through `--task`, with controller-owned
+  DISCOVER, EDIT, VALIDATE, REPAIR, VERIFY, and DONE phases; explicit action
+  approvals; fixed validation; final Git inspection; and optional tool traces.
 - Reusable `AgentSession` construction from resolved runtime configuration,
   including providers and deterministic optional tool registries.
 - End-to-end isolated autonomous coding with approved worktree creation,
@@ -620,13 +620,34 @@ uv run agent-workbench \
 `--task` requires both `--workspace` and `--enable-actions`. It cannot be
 combined with `--setup`.
 
-The coding loop is bounded to 16 tool rounds by default. Use the optional
-positive integer `--max-tool-rounds` value with `--task` to choose a different
-limit for either normal or isolated autonomous execution. The model may use the
-available read-only workspace tools, request structured file
-changes, run the fixed Ruff and pytest commands, and inspect Git status and
-diff. Every file change and validation command remains default-deny and
-requires approval for that exact invocation.
+The controller limits DISCOVER to four read-only tool rounds. Use the optional
+positive integer `--max-tool-rounds` value with `--task` to configure the
+session default used by each EDIT or REPAIR send in direct or isolated
+execution. The model may inspect the workspace and request structured file
+changes. It cannot choose validation, verification, phase progression, or
+DONE.
+
+After a successful workspace action, the controller invokes
+`run_ruff_format`, `run_ruff_check`, and `run_pytest` against `"."` in that
+exact order. Failed validation enters a bounded REPAIR phase and reruns the
+complete sequence after another successful change. The controller then invokes
+Git status and diff inspection. Success requires a non-empty final
+tracked/staged diff and successful latest validation and Git evidence. Every
+file change and executable validation remains default-deny and requires
+approval for that exact invocation.
+
+Direct and isolated results show the same stable evidence block:
+
+```text
+Final phase: DONE
+Tool rounds: <count>
+Workspace change applied: yes
+Repair attempts: <count>
+Completion continuations: <count>
+Validation succeeded: yes
+Git status inspected: yes
+Git diff inspected: yes
+```
 
 `--show-tool-traces` displays each completed tool invocation and its redacted
 result while the task is running. Read file contents and absolute workspace
@@ -670,8 +691,9 @@ Only `y` or `yes` approves the fixed local worktree command.
 The isolated `AgentSession` receives workspace tools for the new worktree only,
 and source-relative context files are reloaded from the corresponding isolated
 paths. Every file change and validation command remains separately approved.
-The workflow requires successful Ruff and pytest evidence plus final Git status
-and diff inspection before commit planning can begin.
+Commit planning cannot begin unless the deterministic controller reaches DONE
+with successful Ruff format, Ruff check, pytest, Git status, and non-empty Git
+diff evidence.
 
 The exact `--commit-message`, ordered path set, and every complete diff are shown
 before a separate default-deny commit approval. A verified successful commit
@@ -736,10 +758,10 @@ Completed foundations:
 - [x] Supervised worktree isolation and approved exact local commits.
 - [x] Provider-independent structured recovery evidence for isolated commit and
   worktree lifecycle failures, using conservative read-only Git inspection.
-- [x] Supervised autonomous coding loop: receive one development prompt,
-  inspect the workspace, perform approved bounded changes, run Ruff and pytest,
-  inspect the final Git status and diff, report structured validation evidence,
-  and exit.
+- [x] Deterministic coding controller: bound DISCOVER and model-facing edit and
+  repair work, perform approved changes, run fixed Ruff and pytest validation,
+  require final Git status and non-empty diff evidence, and enter DONE only
+  from controller-owned gates.
 - [x] End-to-end isolated autonomous workflow: create an approved worktree,
   run controlled coding, require validation and Git inspection, create an
   approved exact local commit, and preserve the worktree and branch.
@@ -797,6 +819,10 @@ Agent Workbench does not yet provide:
 - Multi-agent orchestration.
 - MCP integration.
 - Concurrent worktree management, automatic approval, merge, or push.
+- DONE for tasks whose only changes are new untracked files; v1 requires a
+  non-empty tracked or staged Git diff.
+- Automated real-model benchmarks; the regression battery uses scripted
+  providers, while local-model benchmarking remains manual future work.
 - A navigable terminal workspace.
 - A VS Code extension.
 - Voice prompt input.

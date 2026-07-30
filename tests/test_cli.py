@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest.mock import call, Mock
 
 from agent_workbench.built_in_tools import create_built_in_tool_registry
+from agent_workbench.coding_loop import CodingPhase
 from agent_workbench.cli import (
     AUTONOMOUS_MAX_TOOL_ROUNDS,
     main,
@@ -1218,6 +1219,7 @@ def test_main_forwards_opt_in_tool_trace_configuration(monkeypatch) -> None:
 def test_main_forwards_tool_traces_to_autonomous_task(
     monkeypatch,
     tmp_path,
+    capsys,
 ) -> None:
     """Forward the trace observer to one autonomous coding task."""
 
@@ -1231,7 +1233,11 @@ def test_main_forwards_tool_traces_to_autonomous_task(
     session = Mock()
     result = Mock(
         assistant_summary="Task complete.",
+        final_phase=CodingPhase.DONE,
         tool_round_count=1,
+        workspace_change_applied=True,
+        repair_attempt_count=1,
+        completion_continuation_count=2,
         validation_succeeded=True,
         inspected_git_status=True,
         inspected_git_diff=True,
@@ -1281,6 +1287,18 @@ def test_main_forwards_tool_traces_to_autonomous_task(
     )
     assert callable(runner_mock.call_args.kwargs["tool_approval_handler"])
     assert runner_mock.call_args.kwargs["tool_round_observer"] is trace_mock
+    output = capsys.readouterr().out
+    evidence = (
+        "  Final phase: DONE\n"
+        "  Tool rounds: 1\n"
+        "  Workspace change applied: yes\n"
+        "  Repair attempts: 1\n"
+        "  Completion continuations: 2\n"
+        "  Validation succeeded: yes\n"
+        "  Git status inspected: yes\n"
+        "  Git diff inspected: yes\n"
+    )
+    assert evidence in output
 
 
 def test_main_forwards_custom_tool_round_limit_to_autonomous_session(
@@ -1448,7 +1466,11 @@ def test_main_routes_code_command_to_existing_autonomous_workflow(
     session = Mock()
     result = Mock(
         assistant_summary="Task complete.",
+        final_phase=CodingPhase.DONE,
         tool_round_count=1,
+        workspace_change_applied=True,
+        repair_attempt_count=0,
+        completion_continuation_count=0,
         validation_succeeded=True,
         inspected_git_status=True,
         inspected_git_diff=True,
