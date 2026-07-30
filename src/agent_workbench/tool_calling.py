@@ -19,6 +19,7 @@ type ToolRoundObserver = Callable[[ToolInteractionRound], None]
 MAX_TOOL_INVOCATIONS_PER_RESPONSE = 8
 _MAX_TOOL_BATCH_RECOVERIES = 1
 _MAX_REPEATED_TOOL_BATCH_RECOVERIES = 1
+_MAX_CONSECUTIVE_INSPECTION_ROUNDS = 6
 _REPEATED_INSPECTION_TOOL_NAMES = frozenset(
     {
         "inspect_git_diff",
@@ -35,6 +36,12 @@ _TOOL_BATCH_RECOVERY_INSTRUCTION = (
     "repeat the same tool with identical arguments in one response, and wait "
     "for the returned results before requesting more. If no tool call is "
     "needed, respond normally."
+)
+_INSPECTION_STREAK_RECOVERY_INSTRUCTION = (
+    "The previous completed rounds used only successful read-only inspection "
+    "tools without transitioning to another operation. Use the inspection "
+    "information already returned to perform the next necessary non-inspection "
+    "operation, or respond normally if no tool call is needed."
 )
 _REPEATED_TOOL_BATCH_RECOVERY_INSTRUCTION = (
     "The previous response repeated the same read-only inspection tool-call batch "
@@ -95,6 +102,34 @@ def _repeats_previous_inspection_batch(
             strict=True,
         )
     )
+
+
+def _is_successful_inspection_round(round_: ToolInteractionRound) -> bool:
+    """Return whether one completed round only inspected successfully."""
+
+    return (
+        bool(round_.response.tool_invocations)
+        and all(
+            invocation.tool_name in _REPEATED_INSPECTION_TOOL_NAMES
+            for invocation in round_.response.tool_invocations
+        )
+        and all(result.status == "success" for result in round_.results)
+    )
+
+
+def _count_trailing_successful_inspection_rounds(
+    completed_rounds: tuple[ToolInteractionRound, ...],
+) -> int:
+    """Count consecutive successful inspection-only rounds at history end."""
+
+    count = 0
+
+    for round_ in reversed(completed_rounds):
+        if not _is_successful_inspection_round(round_):
+            break
+        count += 1
+
+    return count
 
 
 def _without_inspection_tools(
@@ -163,9 +198,33 @@ def run_tool_calling_loop(
     executed_rounds = 0
     tool_batch_recoveries = 0
     repeated_tool_batch_recoveries = 0
+    consecutive_inspection_rounds = _count_trailing_successful_inspection_rounds(
+        completed_rounds
+    )
+    inspection_streak_recovery_pending = (
+        consecutive_inspection_rounds >= _MAX_CONSECUTIVE_INSPECTION_ROUNDS
+    )
+
+    if inspection_streak_recovery_pending:
+        current_request = _add_temporary_recovery_instruction(
+            request,
+            completed_rounds,
+            _INSPECTION_STREAK_RECOVERY_INSTRUCTION,
+            withhold_inspection_tools=True,
+        )
+        consecutive_inspection_rounds = 0
 
     while True:
         response = provider.complete(current_request)
+
+        if inspection_streak_recovery_pending and any(
+            invocation.tool_name in _REPEATED_INSPECTION_TOOL_NAMES
+            for invocation in response.tool_invocations
+        ):
+            raise CompletionError(
+                "The provider requested another read-only inspection tool "
+                "while inspection tools were withheld during recovery."
+            )
 
         if response.tool_invocations and _requires_tool_batch_recovery(response):
             if tool_batch_recoveries >= _MAX_TOOL_BATCH_RECOVERIES:
@@ -178,6 +237,7 @@ def run_tool_calling_loop(
                 request,
                 completed_rounds,
                 _TOOL_BATCH_RECOVERY_INSTRUCTION,
+                withhold_inspection_tools=(inspection_streak_recovery_pending),
             )
             continue
 
@@ -203,6 +263,8 @@ def run_tool_calling_loop(
             raise CompletionError(
                 "The maximum number of tool execution rounds was exceeded."
             )
+
+        inspection_streak_recovery_pending = False
 
         approval_required = tuple(
             invocation
@@ -247,6 +309,7 @@ def run_tool_calling_loop(
                     request,
                     tool_interactions=completed_rounds,
                 )
+                consecutive_inspection_rounds = 0
                 executed_rounds += 1
                 continue
 
@@ -279,8 +342,23 @@ def run_tool_calling_loop(
         if tool_round_observer is not None:
             tool_round_observer(completed_round)
 
-        current_request = replace(
-            request,
-            tool_interactions=completed_rounds,
-        )
+        if _is_successful_inspection_round(completed_round):
+            consecutive_inspection_rounds += 1
+        else:
+            consecutive_inspection_rounds = 0
+
+        if consecutive_inspection_rounds >= _MAX_CONSECUTIVE_INSPECTION_ROUNDS:
+            current_request = _add_temporary_recovery_instruction(
+                request,
+                completed_rounds,
+                _INSPECTION_STREAK_RECOVERY_INSTRUCTION,
+                withhold_inspection_tools=True,
+            )
+            inspection_streak_recovery_pending = True
+            consecutive_inspection_rounds = 0
+        else:
+            current_request = replace(
+                request,
+                tool_interactions=completed_rounds,
+            )
         executed_rounds += 1
