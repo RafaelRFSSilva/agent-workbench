@@ -79,6 +79,7 @@ class RuntimeConfiguration:
     provider_name: ProviderName
     model_name: str
     system_prompt: str | None = None
+    project_instructions: str | None = None
     agent_profile: AgentProfile | None = None
     context_documents: tuple[ContextDocument, ...] = ()
     generation_config: GenerationConfig = field(default_factory=GenerationConfig)
@@ -729,6 +730,11 @@ def resolve_runtime_configuration(
         provider_name=provider_name,
         model_name=model_name,
         system_prompt=system_prompt,
+        project_instructions=(
+            project_configuration.project_instructions
+            if project_configuration is not None and arguments.task_prompt is not None
+            else None
+        ),
         agent_profile=agent_profile,
         context_documents=context_documents,
         generation_config=generation_config,

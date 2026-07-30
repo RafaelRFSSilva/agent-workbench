@@ -104,6 +104,7 @@ def test_isolated_model_and_session_preserve_resolved_configuration(
         model_name="gpt-oss:20b",
         agent_profile=profile,
         system_prompt="Resolved prompt.",
+        project_instructions="Isolated project instructions.",
         enable_tools=True,
         show_tool_traces=True,
     )
@@ -126,7 +127,12 @@ def test_isolated_model_and_session_preserve_resolved_configuration(
     assert isolated.session.provider_name == "Ollama"
     assert isolated.session.model_name == "gpt-oss:20b"
     assert isolated.session.agent_profile is profile
-    assert isolated.session.system_prompt == "Resolved prompt."
+    assert isolated.session.system_prompt == (
+        "Resolved prompt.\n\n"
+        "<project_instructions>\n"
+        "Isolated project instructions.\n"
+        "</project_instructions>"
+    )
     assert isolated.session.max_tool_rounds == 4
     assert runtime.workspace_root == source
     assert runtime.enable_tools is True

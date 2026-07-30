@@ -157,7 +157,8 @@ def _main(
             project_configuration = discover_project_configuration(
                 arguments.workspace_root
                 if arguments.workspace_root is not None
-                else Path.cwd()
+                else Path.cwd(),
+                include_project_instructions=task_prompt is not None,
             )
             runtime_configuration = resolve_runtime_configuration(
                 arguments,

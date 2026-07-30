@@ -1219,6 +1219,53 @@ def test_max_tool_rounds_requires_autonomous_task() -> None:
         )
 
 
+def test_coding_runtime_preserves_system_context_and_project_instructions(
+    tmp_path: Path,
+) -> None:
+    """Carry validated project text separately from the existing system prompt."""
+
+    project = ProjectConfiguration(
+        project_root=tmp_path,
+        configuration_path=tmp_path / ".agent-workbench" / "config.toml",
+        configuration=ProjectCodingConfiguration(),
+        project_instructions="# Project\n\n- Be precise.\n",
+    )
+    arguments = CLIArguments(
+        provider_name="ollama",
+        model_name="test-model",
+        task_prompt="Fix the defect.",
+        system_prompt="Existing system prompt.",
+        workspace_root=tmp_path,
+        enable_actions=True,
+    )
+
+    runtime = resolve_runtime_configuration(
+        arguments,
+        project_configuration=project,
+    )
+
+    assert runtime.system_prompt == "Existing system prompt."
+    assert runtime.project_instructions == "# Project\n\n- Be precise.\n"
+
+
+def test_non_coding_runtime_does_not_apply_project_instructions(tmp_path: Path) -> None:
+    """Keep interactive runtime behavior unchanged for configured projects."""
+
+    project = ProjectConfiguration(
+        project_root=tmp_path,
+        configuration_path=tmp_path / ".agent-workbench" / "config.toml",
+        configuration=ProjectCodingConfiguration(),
+        project_instructions="Coding only.",
+    )
+
+    runtime = resolve_runtime_configuration(
+        CLIArguments(provider_name="ollama", model_name="test-model"),
+        project_configuration=project,
+    )
+
+    assert runtime.project_instructions is None
+
+
 def test_parse_cli_arguments_accepts_autonomous_task() -> None:
     """Parse and normalize one autonomous coding task."""
 

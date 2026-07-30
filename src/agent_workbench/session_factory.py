@@ -13,6 +13,28 @@ from agent_workbench.workspace import Workspace
 from agent_workbench.workspace_actions import register_workspace_action_tools
 from agent_workbench.workspace_tools import register_workspace_tools
 
+PROJECT_INSTRUCTIONS_OPENING_DELIMITER = "<project_instructions>"
+PROJECT_INSTRUCTIONS_CLOSING_DELIMITER = "</project_instructions>"
+
+
+def compose_system_prompt(
+    system_prompt: str | None,
+    project_instructions: str | None,
+) -> str | None:
+    """Append one delimited project-instructions section to system context."""
+
+    if project_instructions is None:
+        return system_prompt
+
+    project_section = (
+        f"{PROJECT_INSTRUCTIONS_OPENING_DELIMITER}\n"
+        f"{project_instructions}\n"
+        f"{PROJECT_INSTRUCTIONS_CLOSING_DELIMITER}"
+    )
+    if system_prompt is None:
+        return project_section
+    return f"{system_prompt}\n\n{project_section}"
+
 
 def create_agent_session(
     session_id: SessionId,
@@ -48,7 +70,10 @@ def create_agent_session(
         id=session_id,
         provider=provider,
         agent_profile=configuration.agent_profile,
-        system_prompt=configuration.system_prompt,
+        system_prompt=compose_system_prompt(
+            configuration.system_prompt,
+            configuration.project_instructions,
+        ),
         context_documents=tuple([*configuration.context_documents]),
         generation_config=configuration.generation_config,
         response_format=configuration.response_format,

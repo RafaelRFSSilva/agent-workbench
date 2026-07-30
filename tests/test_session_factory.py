@@ -103,6 +103,73 @@ def test_factory_forwards_resolved_configuration_without_rebuilding(
 
 
 @pytest.mark.parametrize(
+    ("system_prompt", "expected"),
+    [
+        (
+            "Existing instructions.",
+            "Existing instructions.\n\n"
+            "<project_instructions>\n"
+            "# Project\n\n- Keep patches focused.\n"
+            "\n</project_instructions>",
+        ),
+        (
+            None,
+            "<project_instructions>\n"
+            "# Project\n\n- Keep patches focused.\n"
+            "\n</project_instructions>",
+        ),
+    ],
+)
+def test_factory_composes_project_instructions_once_after_existing_context(
+    monkeypatch,
+    system_prompt: str | None,
+    expected: str,
+) -> None:
+    """Append one deterministic system-level project instruction section."""
+
+    monkeypatch.setattr(
+        "agent_workbench.session_factory.create_provider",
+        lambda _provider_name, _model_name: OllamaProvider("test-model"),
+    )
+    runtime = configuration(
+        system_prompt=system_prompt,
+        project_instructions="# Project\n\n- Keep patches focused.\n",
+    )
+
+    session = create_agent_session(SessionId("project-instructions"), runtime)
+
+    assert session.system_prompt == expected
+    assert session.system_prompt.count("<project_instructions>") == 1
+
+
+def test_factory_preserves_agent_profile_while_composing_its_system_context(
+    monkeypatch,
+) -> None:
+    """Keep profile identity and append project text after its complete prompt."""
+
+    monkeypatch.setattr(
+        "agent_workbench.session_factory.create_provider",
+        lambda _provider_name, _model_name: OllamaProvider("test-model"),
+    )
+    profile = AgentProfile("Developer", "Develops.", "Profile instructions.")
+    runtime = configuration(
+        agent_profile=profile,
+        system_prompt=profile.system_prompt,
+        project_instructions="Project instructions.",
+    )
+
+    session = create_agent_session(SessionId("profile-project"), runtime)
+
+    assert session.agent_profile is profile
+    assert session.system_prompt == (
+        "Profile instructions.\n\n"
+        "<project_instructions>\n"
+        "Project instructions.\n"
+        "</project_instructions>"
+    )
+
+
+@pytest.mark.parametrize(
     ("provider_name", "model_name"),
     [
         ("openai", "openai-model"),

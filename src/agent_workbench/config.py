@@ -2,6 +2,7 @@
 
 import json
 import os
+import stat
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,6 +23,9 @@ MODEL_ENV_VAR = "AGENT_WORKBENCH_MODEL"
 SUPPORTED_PROVIDERS = {"anthropic", "ollama", "openai"}
 PROJECT_CONFIG_RELATIVE_PATH = Path(".agent-workbench") / "config.toml"
 PROJECT_CONFIG_CONTEXT = ".agent-workbench/config.toml"
+PROJECT_INSTRUCTIONS_RELATIVE_PATH = Path(".agent-workbench") / "instructions.md"
+PROJECT_INSTRUCTIONS_CONTEXT = ".agent-workbench/instructions.md"
+MAX_PROJECT_INSTRUCTIONS_SIZE_BYTES = 100 * 1024
 PROJECT_CONFIG_SECTIONS = frozenset({"coding"})
 PROJECT_CODING_KEYS = frozenset(
     {
@@ -62,10 +66,13 @@ class ProjectConfiguration:
     project_root: Path
     configuration_path: Path
     configuration: ProjectCodingConfiguration
+    project_instructions: str | None = None
 
 
 def discover_project_configuration(
     start_path: Path,
+    *,
+    include_project_instructions: bool = False,
 ) -> ProjectConfiguration | None:
     """Find and load the nearest project configuration above one directory."""
 
@@ -98,12 +105,63 @@ def discover_project_configuration(
                 project_root=current,
                 configuration_path=configuration_path,
                 configuration=load_project_configuration(configuration_path),
+                project_instructions=(
+                    load_project_instructions(current)
+                    if include_project_instructions
+                    else None
+                ),
             )
 
         parent = current.parent
         if parent == current:
             return None
         current = parent
+
+
+def load_project_instructions(project_root: Path) -> str | None:
+    """Load optional strict UTF-8 coding instructions from one project root."""
+
+    instructions_path = project_root / PROJECT_INSTRUCTIONS_RELATIVE_PATH
+    try:
+        instructions_status = instructions_path.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    except (OSError, RuntimeError):
+        raise ConfigurationError(
+            f"Unable to inspect project instructions {PROJECT_INSTRUCTIONS_CONTEXT}."
+        ) from None
+
+    if not stat.S_ISREG(instructions_status.st_mode):
+        raise ConfigurationError(
+            f"Project instructions {PROJECT_INSTRUCTIONS_CONTEXT} "
+            "must be a regular readable file."
+        )
+
+    try:
+        with instructions_path.open("rb") as instructions_file:
+            content_bytes = instructions_file.read(
+                MAX_PROJECT_INSTRUCTIONS_SIZE_BYTES + 1
+            )
+    except (OSError, RuntimeError):
+        raise ConfigurationError(
+            f"Project instructions {PROJECT_INSTRUCTIONS_CONTEXT} "
+            "must be a regular readable file."
+        ) from None
+
+    if len(content_bytes) > MAX_PROJECT_INSTRUCTIONS_SIZE_BYTES:
+        raise ConfigurationError(
+            f"Project instructions {PROJECT_INSTRUCTIONS_CONTEXT} exceeds the "
+            f"{MAX_PROJECT_INSTRUCTIONS_SIZE_BYTES}-byte limit."
+        )
+
+    try:
+        content = content_bytes.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        raise ConfigurationError(
+            f"Project instructions {PROJECT_INSTRUCTIONS_CONTEXT} is not valid UTF-8."
+        ) from None
+
+    return content if content.strip() else None
 
 
 def load_project_configuration(

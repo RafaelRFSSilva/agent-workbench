@@ -1537,8 +1537,39 @@ def test_main_discovers_explicit_workspace_configuration_before_provider(
 
     main(["--workspace", str(tmp_path)])
 
-    discover_mock.assert_called_once_with(tmp_path)
+    discover_mock.assert_called_once_with(
+        tmp_path,
+        include_project_instructions=False,
+    )
     assert resolve_mock.call_args.kwargs["project_configuration"] is discovered
+
+
+def test_non_coding_cli_ignores_invalid_project_instructions(
+    monkeypatch,
+    tmp_path,
+    capsys,
+) -> None:
+    """Do not inspect or compose coding-only instructions for interactive use."""
+
+    configuration_path = tmp_path / PROJECT_CONFIG_RELATIVE_PATH
+    configuration_path.parent.mkdir()
+    configuration_path.write_text(EXPECTED_INITIALIZED_CONFIG, encoding="utf-8")
+    (configuration_path.parent / "instructions.md").write_bytes(b"invalid\xff")
+    monkeypatch.chdir(tmp_path)
+    provider = FakeProvider()
+    monkeypatch.setattr(
+        "agent_workbench.session_factory.create_provider",
+        lambda _provider_name, _model_name: provider,
+    )
+    run_cli_mock = Mock()
+    monkeypatch.setattr("agent_workbench.cli.run_cli", run_cli_mock)
+
+    main([])
+
+    session = run_cli_mock.call_args.args[0]
+    assert session.system_prompt == get_agent_profile("developer").system_prompt
+    assert "<project_instructions>" not in session.system_prompt
+    assert "Configuration error:" not in capsys.readouterr().out
 
 
 def test_init_creates_deterministic_loadable_project_configuration(
@@ -1578,6 +1609,7 @@ def test_init_creates_deterministic_loadable_project_configuration(
     assert loaded.enable_tools is True
     assert loaded.enable_actions is True
     assert loaded.isolated is False
+    assert not (configuration_path.parent / "instructions.md").exists()
     assert capsys.readouterr().out == ("Created .agent-workbench/config.toml\n")
     create_session_mock.assert_not_called()
 
@@ -1756,6 +1788,78 @@ def test_short_code_command_uses_detected_project_root_and_configuration(
     )
 
 
+def test_nested_direct_coding_sends_only_exact_root_instructions_as_system_context(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """Cover discovery through the provider request without instruction leakage."""
+
+    outer_configuration = tmp_path / PROJECT_CONFIG_RELATIVE_PATH
+    outer_configuration.parent.mkdir()
+    outer_configuration.write_text(EXPECTED_INITIALIZED_CONFIG, encoding="utf-8")
+    (outer_configuration.parent / "instructions.md").write_text(
+        "Outer instructions must not load.",
+        encoding="utf-8",
+    )
+    project = tmp_path / "workspace" / "project"
+    configuration_path = project / PROJECT_CONFIG_RELATIVE_PATH
+    configuration_path.parent.mkdir(parents=True)
+    configuration_path.write_text(EXPECTED_INITIALIZED_CONFIG, encoding="utf-8")
+    project_instructions = "# Project\n\n- Use the exact configured root.\n"
+    (configuration_path.parent / "instructions.md").write_text(
+        project_instructions,
+        encoding="utf-8",
+    )
+    (project / "AGENTS.md").write_text(
+        "AGENTS content must not load.",
+        encoding="utf-8",
+    )
+    sibling = tmp_path / "workspace" / "sibling" / ".agent-workbench"
+    sibling.mkdir(parents=True)
+    (sibling / "instructions.md").write_text(
+        "Sibling instructions must not load.",
+        encoding="utf-8",
+    )
+    nested = project / "src" / "package"
+    nested.mkdir(parents=True)
+    monkeypatch.chdir(nested)
+    provider = FakeProvider(["Captured."])
+    monkeypatch.setattr(
+        "agent_workbench.session_factory.create_provider",
+        lambda _provider_name, _model_name: provider,
+    )
+
+    task = "Fix the failing tests."
+
+    def run_task(session, prompt, **_kwargs):
+        assert prompt == task
+        response = session.send(prompt, allowed_tool_names=())
+        return Mock(assistant_summary=response.text)
+
+    monkeypatch.setattr("agent_workbench.cli.run_autonomous_coding_task", run_task)
+
+    main(
+        [
+            "code",
+            "--system-prompt",
+            "Existing system instructions.",
+            task,
+        ]
+    )
+
+    assert provider.requests[0].system_prompt == (
+        "Existing system instructions.\n\n"
+        "<project_instructions>\n"
+        f"{project_instructions}\n"
+        "</project_instructions>"
+    )
+    assert provider.requests[0].system_prompt.count(project_instructions) == 1
+    assert provider.requests[0].messages == [{"role": "user", "content": task}]
+    assert "Outer instructions" not in provider.requests[0].system_prompt
+    assert "Sibling instructions" not in provider.requests[0].system_prompt
+    assert "AGENTS content" not in provider.requests[0].system_prompt
+
+
 def test_invalid_project_configuration_prevents_provider_construction(
     monkeypatch,
     tmp_path,
@@ -1782,6 +1886,30 @@ def test_invalid_project_configuration_prevents_provider_construction(
     output = capsys.readouterr().out
     assert "Configuration error:" in output
     assert "[coding].api_key" in output
+    assert str(tmp_path) not in output
+
+
+def test_invalid_project_instructions_prevent_provider_construction(
+    monkeypatch,
+    tmp_path,
+    capsys,
+) -> None:
+    """Reject invalid project instructions before a session/provider is built."""
+
+    configuration_path = tmp_path / PROJECT_CONFIG_RELATIVE_PATH
+    configuration_path.parent.mkdir()
+    configuration_path.write_text(EXPECTED_INITIALIZED_CONFIG, encoding="utf-8")
+    (configuration_path.parent / "instructions.md").write_bytes(b"invalid\xff")
+    create_mock = Mock()
+    monkeypatch.setattr("agent_workbench.cli.load_environment", Mock())
+    monkeypatch.setattr("agent_workbench.cli.create_agent_session", create_mock)
+
+    main(["code", "--workspace", str(tmp_path), "Fix it."])
+
+    create_mock.assert_not_called()
+    output = capsys.readouterr().out
+    assert "Configuration error:" in output
+    assert "not valid UTF-8" in output
     assert str(tmp_path) not in output
 
 
