@@ -1578,6 +1578,7 @@ def test_init_creates_deterministic_loadable_project_configuration(
     assert loaded.enable_tools is True
     assert loaded.enable_actions is True
     assert loaded.isolated is False
+    assert not (configuration_path.parent / "instructions.md").exists()
     assert capsys.readouterr().out == ("Created .agent-workbench/config.toml\n")
     create_session_mock.assert_not_called()
 
@@ -1782,6 +1783,30 @@ def test_invalid_project_configuration_prevents_provider_construction(
     output = capsys.readouterr().out
     assert "Configuration error:" in output
     assert "[coding].api_key" in output
+    assert str(tmp_path) not in output
+
+
+def test_invalid_project_instructions_prevent_provider_construction(
+    monkeypatch,
+    tmp_path,
+    capsys,
+) -> None:
+    """Reject invalid project instructions before a session/provider is built."""
+
+    configuration_path = tmp_path / PROJECT_CONFIG_RELATIVE_PATH
+    configuration_path.parent.mkdir()
+    configuration_path.write_text(EXPECTED_INITIALIZED_CONFIG, encoding="utf-8")
+    (configuration_path.parent / "instructions.md").write_bytes(b"invalid\xff")
+    create_mock = Mock()
+    monkeypatch.setattr("agent_workbench.cli.load_environment", Mock())
+    monkeypatch.setattr("agent_workbench.cli.create_agent_session", create_mock)
+
+    main(["code", "--workspace", str(tmp_path), "Fix it."])
+
+    create_mock.assert_not_called()
+    output = capsys.readouterr().out
+    assert "Configuration error:" in output
+    assert "not valid UTF-8" in output
     assert str(tmp_path) not in output
 
 

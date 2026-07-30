@@ -9,6 +9,8 @@ from agent_workbench.config import (
     DEFAULT_PROVIDER_NAME,
     MODEL_ENV_VAR,
     PROJECT_CONFIG_RELATIVE_PATH,
+    PROJECT_INSTRUCTIONS_RELATIVE_PATH,
+    MAX_PROJECT_INSTRUCTIONS_SIZE_BYTES,
     PROVIDER_ENV_VAR,
     ProjectCodingConfiguration,
     create_project_configuration,
@@ -16,6 +18,7 @@ from agent_workbench.config import (
     get_model_name,
     get_provider_name,
     load_project_configuration,
+    load_project_instructions,
     load_environment,
 )
 from agent_workbench.errors import ConfigurationError
@@ -296,6 +299,112 @@ def test_project_configuration_is_discovered_from_root_and_nested_directory(
     assert nested_result.project_root == tmp_path.resolve()
     assert root_result.configuration_path == configuration_path.resolve()
     assert nested_result.configuration.provider == "ollama"
+
+
+def test_discovery_loads_instructions_from_the_exact_configuration_root(
+    tmp_path: Path,
+) -> None:
+    """Associate nested discovery only with the winning configuration root."""
+
+    _write_project_configuration(tmp_path, '[coding]\nmodel = "outer"\n')
+    (tmp_path / PROJECT_INSTRUCTIONS_RELATIVE_PATH).write_text(
+        "Outer instructions.",
+        encoding="utf-8",
+    )
+    project = tmp_path / "packages" / "inner"
+    _write_project_configuration(project, '[coding]\nmodel = "inner"\n')
+    instructions = "# Inner\n\n- Preserve this Markdown.\n"
+    (project / PROJECT_INSTRUCTIONS_RELATIVE_PATH).write_text(
+        instructions,
+        encoding="utf-8",
+    )
+    nested = project / "src" / "package"
+    nested.mkdir(parents=True)
+
+    result = discover_project_configuration(nested)
+
+    assert result is not None
+    assert result.project_root == project.resolve()
+    assert result.project_instructions == instructions
+
+
+def test_discovery_does_not_load_parent_instructions_or_agents_file(
+    tmp_path: Path,
+) -> None:
+    """Ignore unrelated instruction sources outside the configured root."""
+
+    parent_instructions = tmp_path / PROJECT_INSTRUCTIONS_RELATIVE_PATH
+    parent_instructions.parent.mkdir()
+    parent_instructions.write_text("Do not load parent.", encoding="utf-8")
+    project = tmp_path / "project"
+    _write_project_configuration(project, '[coding]\nmodel = "inner"\n')
+    (project / "AGENTS.md").write_text("Do not load AGENTS.", encoding="utf-8")
+
+    result = discover_project_configuration(project)
+
+    assert result is not None
+    assert result.project_instructions is None
+
+
+@pytest.mark.parametrize("content", [b"", b" \n\t"])
+def test_empty_project_instructions_contribute_nothing(
+    tmp_path: Path,
+    content: bytes,
+) -> None:
+    """Treat empty and whitespace-only project instruction files as absent."""
+
+    instructions_path = tmp_path / PROJECT_INSTRUCTIONS_RELATIVE_PATH
+    instructions_path.parent.mkdir()
+    instructions_path.write_bytes(content)
+
+    assert load_project_instructions(tmp_path) is None
+
+
+def test_project_instructions_accept_exact_size_limit(tmp_path: Path) -> None:
+    """Accept strict UTF-8 instructions exactly at the 100 KiB limit."""
+
+    instructions_path = tmp_path / PROJECT_INSTRUCTIONS_RELATIVE_PATH
+    instructions_path.parent.mkdir()
+    content = "a" * MAX_PROJECT_INSTRUCTIONS_SIZE_BYTES
+    instructions_path.write_text(content, encoding="utf-8")
+
+    assert load_project_instructions(tmp_path) == content
+
+
+@pytest.mark.parametrize(
+    ("contents", "expected"),
+    [
+        (b"a" * (100 * 1024 + 1), "exceeds the 102400-byte limit"),
+        (b"valid-prefix\xff", "not valid UTF-8"),
+    ],
+)
+def test_invalid_project_instruction_contents_are_rejected_without_paths(
+    tmp_path: Path,
+    contents: bytes,
+    expected: str,
+) -> None:
+    """Reject oversized and invalid UTF-8 instructions with portable errors."""
+
+    instructions_path = tmp_path / PROJECT_INSTRUCTIONS_RELATIVE_PATH
+    instructions_path.parent.mkdir()
+    instructions_path.write_bytes(contents)
+
+    with pytest.raises(ConfigurationError, match=expected) as raised:
+        load_project_instructions(tmp_path)
+
+    assert str(tmp_path) not in str(raised.value)
+
+
+def test_project_instructions_require_a_regular_file(tmp_path: Path) -> None:
+    """Reject a directory at the fixed instructions location without paths."""
+
+    instructions_path = tmp_path / PROJECT_INSTRUCTIONS_RELATIVE_PATH
+    instructions_path.mkdir(parents=True)
+
+    with pytest.raises(ConfigurationError, match="regular readable file") as raised:
+        load_project_instructions(tmp_path)
+
+    assert str(tmp_path) not in str(raised.value)
 
 
 def test_nearest_project_configuration_wins(tmp_path: Path) -> None:
