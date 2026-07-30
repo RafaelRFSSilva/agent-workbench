@@ -19,6 +19,7 @@ type ToolRoundObserver = Callable[[ToolInteractionRound], None]
 MAX_TOOL_INVOCATIONS_PER_RESPONSE = 8
 _MAX_TOOL_BATCH_RECOVERIES = 1
 _MAX_REPEATED_TOOL_BATCH_RECOVERIES = 1
+_MAX_WITHHELD_INSPECTION_RECOVERIES = 1
 _MAX_CONSECUTIVE_INSPECTION_ROUNDS = 6
 _REPEATED_INSPECTION_TOOL_NAMES = frozenset(
     {
@@ -42,6 +43,12 @@ _INSPECTION_STREAK_RECOVERY_INSTRUCTION = (
     "tools without transitioning to another operation. Use the inspection "
     "information already returned to perform the next necessary non-inspection "
     "operation, or respond normally if no tool call is needed."
+)
+_WITHHELD_INSPECTION_RECOVERY_INSTRUCTION = (
+    "The previous response requested a read-only inspection tool that was not "
+    "available during recovery. Do not request any read-only inspection tool. "
+    "Use the inspection information already returned to perform an available "
+    "non-inspection operation, or respond normally if no operation is needed."
 )
 _REPEATED_TOOL_BATCH_RECOVERY_INSTRUCTION = (
     "The previous response repeated the same read-only inspection tool-call batch "
@@ -198,14 +205,16 @@ def run_tool_calling_loop(
     executed_rounds = 0
     tool_batch_recoveries = 0
     repeated_tool_batch_recoveries = 0
+    withheld_inspection_recoveries = 0
     consecutive_inspection_rounds = _count_trailing_successful_inspection_rounds(
         completed_rounds
     )
-    inspection_streak_recovery_pending = (
+    inspection_tools_withheld = (
         consecutive_inspection_rounds >= _MAX_CONSECUTIVE_INSPECTION_ROUNDS
     )
 
-    if inspection_streak_recovery_pending:
+    if inspection_tools_withheld:
+        withheld_inspection_recoveries = 0
         current_request = _add_temporary_recovery_instruction(
             request,
             completed_rounds,
@@ -217,14 +226,34 @@ def run_tool_calling_loop(
     while True:
         response = provider.complete(current_request)
 
-        if inspection_streak_recovery_pending and any(
+        if inspection_tools_withheld and any(
             invocation.tool_name in _REPEATED_INSPECTION_TOOL_NAMES
             for invocation in response.tool_invocations
         ):
-            raise CompletionError(
-                "The provider requested another read-only inspection tool "
-                "while inspection tools were withheld during recovery."
+            if (
+                _repeats_previous_inspection_batch(response, completed_rounds)
+                and repeated_tool_batch_recoveries
+                >= _MAX_REPEATED_TOOL_BATCH_RECOVERIES
+            ):
+                raise CompletionError(
+                    "The provider repeatedly requested the same read-only "
+                    "inspection tool-call batch."
+                )
+
+            if withheld_inspection_recoveries >= _MAX_WITHHELD_INSPECTION_RECOVERIES:
+                raise CompletionError(
+                    "The provider repeatedly requested a read-only inspection "
+                    "tool while inspection tools were withheld during recovery."
+                )
+
+            withheld_inspection_recoveries += 1
+            current_request = _add_temporary_recovery_instruction(
+                request,
+                completed_rounds,
+                _WITHHELD_INSPECTION_RECOVERY_INSTRUCTION,
+                withhold_inspection_tools=True,
             )
+            continue
 
         if response.tool_invocations and _requires_tool_batch_recovery(response):
             if tool_batch_recoveries >= _MAX_TOOL_BATCH_RECOVERIES:
@@ -237,7 +266,7 @@ def run_tool_calling_loop(
                 request,
                 completed_rounds,
                 _TOOL_BATCH_RECOVERY_INSTRUCTION,
-                withhold_inspection_tools=(inspection_streak_recovery_pending),
+                withhold_inspection_tools=(inspection_tools_withheld),
             )
             continue
 
@@ -248,6 +277,8 @@ def run_tool_calling_loop(
                 )
 
             repeated_tool_batch_recoveries += 1
+            withheld_inspection_recoveries = 0
+            inspection_tools_withheld = True
             current_request = _add_temporary_recovery_instruction(
                 request,
                 completed_rounds,
@@ -264,7 +295,8 @@ def run_tool_calling_loop(
                 "The maximum number of tool execution rounds was exceeded."
             )
 
-        inspection_streak_recovery_pending = False
+        inspection_tools_withheld = False
+        withheld_inspection_recoveries = 0
 
         approval_required = tuple(
             invocation
@@ -354,7 +386,8 @@ def run_tool_calling_loop(
                 _INSPECTION_STREAK_RECOVERY_INSTRUCTION,
                 withhold_inspection_tools=True,
             )
-            inspection_streak_recovery_pending = True
+            inspection_tools_withheld = True
+            withheld_inspection_recoveries = 0
             consecutive_inspection_rounds = 0
         else:
             current_request = replace(

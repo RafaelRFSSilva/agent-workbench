@@ -1435,8 +1435,76 @@ def test_withholds_inspection_tools_after_six_inspection_only_rounds() -> None:
     assert request.tools == (read_file, calculator)
 
 
-def test_rejects_inspection_requested_while_streak_recovery_withholds_it() -> None:
-    """Fail before executing inspection ignored by the recovery provider."""
+def test_recovers_once_from_inspection_requested_while_tools_are_withheld() -> None:
+    """Give one corrective retry after a provider ignores withheld tools."""
+
+    read_executions: list[dict[str, object]] = []
+    calculator_executions: list[dict[str, object]] = []
+    read_file = create_read_file_definition()
+    calculator = create_calculator_definition()
+    registry = ToolRegistry()
+    registry.register(
+        read_file,
+        lambda arguments: read_executions.append(arguments) or {"content": "value"},
+    )
+    registry.register(
+        calculator,
+        lambda arguments: calculator_executions.append(arguments) or {"value": 4},
+    )
+    inspection_responses = [
+        create_tool_response(
+            ToolInvocation(
+                id=f"read-{index}",
+                tool_name="read_file",
+                arguments={"path": f"module-{index}.py"},
+            )
+        )
+        for index in range(6)
+    ]
+    withheld_inspection = create_tool_response(
+        ToolInvocation(
+            id="ignored-tools",
+            tool_name="read_file",
+            arguments={"path": "forbidden.py"},
+        )
+    )
+    calculator_response = create_tool_response(
+        ToolInvocation(
+            id="calculate",
+            tool_name="calculator",
+            arguments={"expression": "2 + 2"},
+        )
+    )
+    final_response = ChatResponse(text="Completed after bounded recovery.")
+    provider = FakeProvider(
+        [
+            *inspection_responses,
+            withheld_inspection,
+            calculator_response,
+            final_response,
+        ]
+    )
+    request = ChatRequest(messages=[], tools=(read_file, calculator))
+
+    result = run_tool_calling_loop(
+        provider,
+        request,
+        registry,
+        max_tool_rounds=7,
+    )
+
+    assert result is final_response
+    assert len(read_executions) == 6
+    assert calculator_executions == [{"expression": "2 + 2"}]
+    assert provider.requests[6].tools == (calculator,)
+    assert provider.requests[7].tools == (calculator,)
+    assert provider.requests[7].system_prompt is not None
+    assert "forbidden.py" not in provider.requests[7].system_prompt
+    assert provider.requests[8].tools is request.tools
+
+
+def test_rejects_second_inspection_requested_while_tools_are_withheld() -> None:
+    """Fail safely after one ignored-withholding recovery attempt."""
 
     executions: list[dict[str, object]] = []
     read_file = create_read_file_definition()
@@ -1453,13 +1521,27 @@ def test_rejects_inspection_requested_while_streak_recovery_withholds_it() -> No
                 arguments={"path": f"module-{index}.py"},
             )
         )
-        for index in range(7)
+        for index in range(6)
     ]
-    provider = FakeProvider(inspection_responses)
+    first_ignored = create_tool_response(
+        ToolInvocation(
+            id="ignored-first",
+            tool_name="read_file",
+            arguments={"path": "first-forbidden.py"},
+        )
+    )
+    second_ignored = create_tool_response(
+        ToolInvocation(
+            id="ignored-second",
+            tool_name="read_file",
+            arguments={"path": "second-forbidden.py"},
+        )
+    )
+    provider = FakeProvider([*inspection_responses, first_ignored, second_ignored])
 
     with pytest.raises(
         CompletionError,
-        match="inspection tools were withheld during recovery",
+        match="repeatedly requested a read-only inspection tool",
     ):
         run_tool_calling_loop(
             provider,
@@ -1468,9 +1550,83 @@ def test_rejects_inspection_requested_while_streak_recovery_withholds_it() -> No
             max_tool_rounds=7,
         )
 
-    assert len(provider.requests) == 7
+    assert len(provider.requests) == 8
     assert len(executions) == 6
     assert provider.requests[6].tools == ()
+    assert provider.requests[7].tools == ()
+    assert provider.requests[7].system_prompt is not None
+    assert "first-forbidden.py" not in provider.requests[7].system_prompt
+
+
+def test_repeated_batch_recovery_rejects_different_withheld_inspection() -> None:
+    """Enforce withheld tools even when the provider changes inspection args."""
+
+    read_executions: list[dict[str, object]] = []
+    calculator_executions: list[dict[str, object]] = []
+    read_file = create_read_file_definition()
+    calculator = create_calculator_definition()
+    registry = ToolRegistry()
+    registry.register(
+        read_file,
+        lambda arguments: read_executions.append(arguments) or {"content": "value"},
+    )
+    registry.register(
+        calculator,
+        lambda arguments: calculator_executions.append(arguments) or {"value": 4},
+    )
+    first_inspection = create_tool_response(
+        ToolInvocation(
+            id="read-first",
+            tool_name="read_file",
+            arguments={"path": "first.py"},
+        )
+    )
+    repeated_inspection = create_tool_response(
+        ToolInvocation(
+            id="read-repeat",
+            tool_name="read_file",
+            arguments={"path": "first.py"},
+        )
+    )
+    different_withheld_inspection = create_tool_response(
+        ToolInvocation(
+            id="read-different",
+            tool_name="read_file",
+            arguments={"path": "different.py"},
+        )
+    )
+    calculator_response = create_tool_response(
+        ToolInvocation(
+            id="calculate",
+            tool_name="calculator",
+            arguments={"expression": "2 + 2"},
+        )
+    )
+    final_response = ChatResponse(text="Completed.")
+    provider = FakeProvider(
+        [
+            first_inspection,
+            repeated_inspection,
+            different_withheld_inspection,
+            calculator_response,
+            final_response,
+        ]
+    )
+    request = ChatRequest(messages=[], tools=(read_file, calculator))
+
+    result = run_tool_calling_loop(
+        provider,
+        request,
+        registry,
+        max_tool_rounds=2,
+    )
+
+    assert result is final_response
+    assert read_executions == [{"path": "first.py"}]
+    assert calculator_executions == [{"expression": "2 + 2"}]
+    assert provider.requests[2].tools == (calculator,)
+    assert provider.requests[3].tools == (calculator,)
+    assert provider.requests[4].tools is request.tools
 
 
 def test_noninspection_round_resets_the_inspection_streak() -> None:
