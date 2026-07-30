@@ -9,6 +9,7 @@ from agent_workbench.coding_loop import (
     DEFAULT_AUTONOMOUS_MAX_TOOL_ROUNDS,
     DEFAULT_CODING_ACCEPTANCE_CRITERIA,
     AutonomousCodingResult,
+    CodingProgressObserver,
     CodingPhase,
     run_autonomous_coding_task,
 )
@@ -57,6 +58,7 @@ def run_isolated_autonomous_workflow(
     tool_approval_handler: ToolApprovalHandler,
     commit_approval_handler: IsolatedCommitApprovalHandler,
     tool_round_observer: ToolRoundObserver | None = None,
+    progress_event_observer: CodingProgressObserver | None = None,
     acceptance_criteria: Iterable[str] = DEFAULT_CODING_ACCEPTANCE_CRITERIA,
     max_tool_rounds: int = DEFAULT_AUTONOMOUS_MAX_TOOL_ROUNDS,
 ) -> IsolatedAutonomousWorkflowResult:
@@ -71,6 +73,7 @@ def run_isolated_autonomous_workflow(
         tool_approval_handler=tool_approval_handler,
         commit_approval_handler=commit_approval_handler,
         tool_round_observer=tool_round_observer,
+        progress_event_observer=progress_event_observer,
         acceptance_criteria=acceptance_criteria,
         max_tool_rounds=max_tool_rounds,
     )
@@ -97,6 +100,7 @@ def run_isolated_autonomous_workflow(
             task_spec.objective,
             tool_approval_handler=tool_approval_handler,
             tool_round_observer=tool_round_observer,
+            progress_event_observer=progress_event_observer,
             acceptance_criteria=task_spec.acceptance_criteria,
         )
     except (CompletionError, ConfigurationError) as exc:
@@ -151,6 +155,7 @@ def _validate_workflow_inputs(
     tool_approval_handler: object,
     commit_approval_handler: object,
     tool_round_observer: object,
+    progress_event_observer: object,
     acceptance_criteria: object,
     max_tool_rounds: object,
 ) -> TaskSpec:
@@ -185,6 +190,10 @@ def _validate_workflow_inputs(
     if tool_round_observer is not None and not callable(tool_round_observer):
         raise ConfigurationError(
             "isolated autonomous coding tool round observer must be callable."
+        )
+    if progress_event_observer is not None and not callable(progress_event_observer):
+        raise ConfigurationError(
+            "isolated autonomous coding progress event observer must be callable."
         )
     if (
         isinstance(max_tool_rounds, bool)

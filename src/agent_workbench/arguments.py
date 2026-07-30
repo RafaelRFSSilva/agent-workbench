@@ -55,6 +55,7 @@ class CLIArguments:
     workspace_root: Path | None = None
     enable_actions: bool = False
     show_tool_traces: bool = False
+    show_assistant_summary: bool = False
     worktree_path: Path | None = None
     worktree_branch: str | None = None
 
@@ -74,6 +75,7 @@ class RuntimeConfiguration:
     workspace_root: Path | None = None
     enable_actions: bool = False
     show_tool_traces: bool = False
+    show_assistant_summary: bool = False
     max_tool_rounds: int = DEFAULT_AUTONOMOUS_MAX_TOOL_ROUNDS
     worktree_path: Path | None = None
     worktree_branch: str | None = None
@@ -382,6 +384,11 @@ def parse_cli_arguments(
         action="store_true",
         help="Display completed tool calls and results during the session.",
     )
+    parser.add_argument(
+        "--show-assistant-summary",
+        action="store_true",
+        help="Display the model's complete final autonomous coding summary.",
+    )
 
     parser.add_argument(
         "--worktree-path",
@@ -412,6 +419,7 @@ def parse_cli_arguments(
         or parsed_arguments.workspace is not None
         or parsed_arguments.enable_actions
         or parsed_arguments.show_tool_traces
+        or parsed_arguments.show_assistant_summary
         or parsed_arguments.worktree_path is not None
         or parsed_arguments.worktree_branch is not None
         or parsed_arguments.task is not None
@@ -444,6 +452,7 @@ def parse_cli_arguments(
         workspace_root=parsed_arguments.workspace,
         enable_actions=parsed_arguments.enable_actions,
         show_tool_traces=parsed_arguments.show_tool_traces,
+        show_assistant_summary=parsed_arguments.show_assistant_summary,
         worktree_path=parsed_arguments.worktree_path,
         worktree_branch=parsed_arguments.worktree_branch,
         task_prompt=parsed_arguments.task,
@@ -543,6 +552,7 @@ def resolve_runtime_configuration(
         workspace_root=arguments.workspace_root,
         enable_actions=arguments.enable_actions,
         show_tool_traces=arguments.show_tool_traces,
+        show_assistant_summary=arguments.show_assistant_summary,
         max_tool_rounds=(
             arguments.max_tool_rounds
             if arguments.max_tool_rounds is not None

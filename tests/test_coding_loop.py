@@ -18,6 +18,8 @@ from agent_workbench.coding_loop import (
     MAX_ACTION_FAILURE_EVIDENCE_ITEMS,
     MAX_REPAIR_VALIDATION_EVIDENCE_CHARACTERS,
     MAX_REPAIR_VALIDATION_FIELD_CHARACTERS,
+    CodingProgressEvent,
+    CodingProgressKind,
     CodingPhase,
     CodingWorkflowLimits,
     _sanitize_prompt_text,
@@ -236,11 +238,13 @@ def test_controller_runs_discover_edit_validate_verify_and_done(
             ChatResponse(text="Corrected the add implementation."),
         ]
     )
+    progress = []
 
     result = run_autonomous_coding_task(
         create_session(repository, provider),
         "Correct the add implementation.",
         tool_approval_handler=approve,
+        progress_event_observer=progress.append,
     )
 
     assert result.final_phase is CodingPhase.DONE
@@ -271,6 +275,36 @@ def test_controller_runs_discover_edit_validate_verify_and_done(
     assert result.inspected_git_diff_after_change is True
     assert result.assistant_summary == "Corrected the add implementation."
     assert run_git(repository, "status", "--short").stdout == " M module.py\n"
+    assert [event.kind for event in progress] == [
+        CodingProgressKind.PHASE_STARTED,
+        CodingProgressKind.PHASE_COMPLETED,
+        CodingProgressKind.PHASE_STARTED,
+        CodingProgressKind.WORKSPACE_CHANGED,
+        CodingProgressKind.PHASE_STARTED,
+        CodingProgressKind.VALIDATION_RESULT,
+        CodingProgressKind.VALIDATION_RESULT,
+        CodingProgressKind.VALIDATION_RESULT,
+        CodingProgressKind.PHASE_STARTED,
+        CodingProgressKind.CHANGED_PATH_COUNT,
+        CodingProgressKind.DONE,
+    ]
+    assert [event.phase for event in progress] == [
+        CodingPhase.DISCOVER,
+        CodingPhase.DISCOVER,
+        CodingPhase.EDIT,
+        CodingPhase.EDIT,
+        CodingPhase.VALIDATE,
+        CodingPhase.VALIDATE,
+        CodingPhase.VALIDATE,
+        CodingPhase.VALIDATE,
+        CodingPhase.VERIFY,
+        CodingPhase.VERIFY,
+        CodingPhase.DONE,
+    ]
+    assert progress[3].path == "module.py"
+    assert progress[5].tool_name == "run_ruff_format"
+    assert progress[7].validation_summary == "1 passed"
+    assert progress[9].changed_path_count == 1
 
     discover_tools = {tool.name for tool in provider.requests[0].tools}
     assert {
@@ -430,10 +464,12 @@ def test_non_python_change_skips_formatter_but_runs_project_checks(
         ]
     )
 
+    progress = []
     result = run_autonomous_coding_task(
         create_session(repository, provider),
         "Update the documentation.",
         tool_approval_handler=approve,
+        progress_event_observer=progress.append,
     )
 
     assert result.validation_runs[0].tool_name == "run_ruff_format"
@@ -445,6 +481,117 @@ def test_non_python_change_skips_formatter_but_runs_project_checks(
         "run_pytest",
     )
     assert result.validation_succeeded is True
+    format_event = next(
+        event for event in progress if event.tool_name == "run_ruff_format"
+    )
+    assert format_event.skipped is True
+    assert format_event.validation_summary is None
+
+
+def test_failed_controlled_action_emits_bounded_typed_progress(
+    tmp_path: Path,
+) -> None:
+    """Report one safe action failure without parsing assistant prose."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            tool_response(
+                "stale",
+                "apply_text_replacement",
+                {
+                    "path": "module.py",
+                    "expected_text": "missing text",
+                    "replacement_text": "replacement",
+                    "expected_file_sha256": "0" * 64,
+                },
+            ),
+            ChatResponse(text="I claim this worked."),
+            ChatResponse(text="Still complete."),
+            ChatResponse(text="No change needed."),
+        ]
+    )
+    progress: list[CodingProgressEvent] = []
+
+    with pytest.raises(CompletionError):
+        run_autonomous_coding_task(
+            create_session(repository, provider),
+            "Attempt a stale edit.",
+            tool_approval_handler=approve,
+            progress_event_observer=progress.append,
+        )
+
+    failure = next(
+        event for event in progress if event.kind is CodingProgressKind.ACTION_FAILED
+    )
+    assert failure.phase is CodingPhase.EDIT
+    assert failure.path == "module.py"
+    assert failure.reason == (
+        "Approval preview failed for apply_text_replacement: "
+        "apply_text_replacement expected_file_sha256 does not match the current file."
+    )
+    terminal = progress[-1]
+    assert terminal.kind is CodingProgressKind.TERMINAL_FAILURE
+    assert terminal.workspace_preserved is True
+    assert terminal.repair_attempt == 0
+    assert (
+        sum(
+            event.kind is CodingProgressKind.PHASE_STARTED
+            and event.phase is CodingPhase.EDIT
+            for event in progress
+        )
+        == 1
+    )
+
+
+def test_validation_failure_emits_repair_attempt_and_safe_pytest_summary(
+    tmp_path: Path,
+) -> None:
+    """Expose controller-owned repair progress and bounded pytest counts."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    original = (repository / "module.py").read_text(encoding="utf-8")
+    multiplied = original.replace("left - right", "left * right")
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            replacement_response(
+                "bad-edit",
+                expected_content=original,
+                expected_text="return left - right",
+                replacement_text="return left * right",
+            ),
+            ChatResponse(text="Edit complete."),
+            replacement_response(
+                "repair",
+                expected_content=multiplied,
+                expected_text="return left * right",
+                replacement_text="return left + right",
+            ),
+            ChatResponse(text="Repair complete."),
+        ]
+    )
+    progress: list[CodingProgressEvent] = []
+
+    run_autonomous_coding_task(
+        create_session(repository, provider),
+        "Correct the add implementation.",
+        tool_approval_handler=approve,
+        progress_event_observer=progress.append,
+    )
+
+    pytest_events = [event for event in progress if event.tool_name == "run_pytest"]
+    assert [event.validation_summary for event in pytest_events] == [
+        "1 failed",
+        "1 passed",
+    ]
+    repair = next(
+        event for event in progress if event.kind is CodingProgressKind.REPAIR_STARTED
+    )
+    assert repair.phase is CodingPhase.REPAIR
+    assert repair.repair_attempt == 1
+    assert repair.max_repair_attempts == 2
 
 
 def test_formatter_created_unexpected_path_fails_before_done(

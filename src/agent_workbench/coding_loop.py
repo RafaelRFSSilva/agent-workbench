@@ -42,6 +42,7 @@ MAX_ACTION_FAILURE_EVIDENCE_ITEM_CHARACTERS = 400
 MAX_ACTION_FAILURE_EVIDENCE_CHARACTERS = 2_000
 MAX_REPAIR_VALIDATION_FIELD_CHARACTERS = 4_000
 MAX_REPAIR_VALIDATION_EVIDENCE_CHARACTERS = 12_000
+MAX_PROGRESS_REASON_CHARACTERS = 400
 
 _READ_ONLY_TOOL_NAMES = frozenset(
     {
@@ -149,6 +150,42 @@ class CodingPhase(StrEnum):
     REPAIR = "REPAIR"
     VERIFY = "VERIFY"
     DONE = "DONE"
+
+
+class CodingProgressKind(StrEnum):
+    """Identify one provider-independent controller progress event."""
+
+    PHASE_STARTED = "phase_started"
+    PHASE_COMPLETED = "phase_completed"
+    WORKSPACE_CHANGED = "workspace_changed"
+    ACTION_FAILED = "action_failed"
+    VALIDATION_RESULT = "validation_result"
+    REPAIR_STARTED = "repair_started"
+    CHANGED_PATH_COUNT = "changed_path_count"
+    DONE = "done"
+    TERMINAL_FAILURE = "terminal_failure"
+
+
+@dataclass(frozen=True, slots=True)
+class CodingProgressEvent:
+    """Store one typed safe autonomous coding progress update."""
+
+    phase: CodingPhase
+    kind: CodingProgressKind
+    path: str | None = None
+    reason: str | None = None
+    tool_name: str | None = None
+    result_status: str | None = None
+    exit_code: int | None = None
+    validation_summary: str | None = None
+    repair_attempt: int = 0
+    max_repair_attempts: int = 0
+    changed_path_count: int | None = None
+    skipped: bool = False
+    workspace_preserved: bool = False
+
+
+type CodingProgressObserver = Callable[[CodingProgressEvent], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -293,6 +330,7 @@ class _WorkflowState:
     baseline_changed_paths: tuple[str, ...] = ()
     baseline_unsafe_changed_path_count: int = 0
     skipped_validation_runs: list[ValidationRun] = field(default_factory=list)
+    progress_event_observer: CodingProgressObserver | None = None
 
 
 def run_autonomous_coding_task(
@@ -301,6 +339,7 @@ def run_autonomous_coding_task(
     *,
     tool_approval_handler: ToolApprovalHandler,
     tool_round_observer: ToolRoundObserver | None = None,
+    progress_event_observer: CodingProgressObserver | None = None,
     acceptance_criteria: Iterable[str] = DEFAULT_CODING_ACCEPTANCE_CRITERIA,
     limits: CodingWorkflowLimits = DEFAULT_CODING_WORKFLOW_LIMITS,
 ) -> AutonomousCodingResult:
@@ -311,10 +350,15 @@ def run_autonomous_coding_task(
         prompt=prompt,
         tool_approval_handler=tool_approval_handler,
         tool_round_observer=tool_round_observer,
+        progress_event_observer=progress_event_observer,
         acceptance_criteria=acceptance_criteria,
         limits=limits,
     )
-    state = _WorkflowState(task_spec=task_spec, limits=limits)
+    state = _WorkflowState(
+        task_spec=task_spec,
+        limits=limits,
+        progress_event_observer=progress_event_observer,
+    )
     try:
         (
             state.baseline_changed_paths,
@@ -330,6 +374,7 @@ def run_autonomous_coding_task(
     def observe_tool_round(round_: ToolInteractionRound) -> None:
         state.rounds.append(round_)
         _capture_action_failure_evidence(state, round_)
+        _emit_action_progress(state, round_)
         if tool_round_observer is not None:
             tool_round_observer(round_)
 
@@ -340,12 +385,33 @@ def run_autonomous_coding_task(
             state.approved_action_ids.add(request.invocation.id)
         return decision
 
+    _emit_progress(
+        state,
+        CodingProgressEvent(
+            phase=CodingPhase.DISCOVER,
+            kind=CodingProgressKind.PHASE_STARTED,
+        ),
+    )
     _run_discover_phase(
         session,
         state,
         available_tools,
         observe_tool_round,
         handle_tool_approval,
+    )
+    _emit_progress(
+        state,
+        CodingProgressEvent(
+            phase=CodingPhase.DISCOVER,
+            kind=CodingProgressKind.PHASE_COMPLETED,
+        ),
+    )
+    _emit_progress(
+        state,
+        CodingProgressEvent(
+            phase=CodingPhase.EDIT,
+            kind=CodingProgressKind.PHASE_STARTED,
+        ),
     )
     _run_model_change_phase(
         session,
@@ -358,6 +424,7 @@ def run_autonomous_coding_task(
     )
 
     state.phase = CodingPhase.VALIDATE
+    _emit_validation_start(state)
     validation_results = _run_validation_phase(
         registry,
         state,
@@ -374,6 +441,15 @@ def run_autonomous_coding_task(
             )
 
         state.repair_attempt_count += 1
+        _emit_progress(
+            state,
+            CodingProgressEvent(
+                phase=CodingPhase.REPAIR,
+                kind=CodingProgressKind.REPAIR_STARTED,
+                repair_attempt=state.repair_attempt_count,
+                max_repair_attempts=limits.repair_attempts,
+            ),
+        )
         changed = _run_model_change_phase(
             session,
             state,
@@ -394,6 +470,7 @@ def run_autonomous_coding_task(
             continue
 
         state.phase = CodingPhase.VALIDATE
+        _emit_validation_start(state)
         validation_results = _run_validation_phase(
             registry,
             state,
@@ -403,6 +480,13 @@ def run_autonomous_coding_task(
         failed_validations = _failed_validations(validation_results)
 
     state.phase = CodingPhase.VERIFY
+    _emit_progress(
+        state,
+        CodingProgressEvent(
+            phase=CodingPhase.VERIFY,
+            kind=CodingProgressKind.PHASE_STARTED,
+        ),
+    )
     verification_results = _run_verify_phase(
         registry,
         state,
@@ -416,6 +500,18 @@ def run_autonomous_coding_task(
         status_result,
         phase=CodingPhase.VERIFY,
         context="before DONE",
+    )
+    final_changed_paths, _ = _changed_path_evidence(status_result)
+    task_changed_path_count = len(
+        set(final_changed_paths).intersection(_approved_workspace_paths(state))
+    )
+    _emit_progress(
+        state,
+        CodingProgressEvent(
+            phase=CodingPhase.VERIFY,
+            kind=CodingProgressKind.CHANGED_PATH_COUNT,
+            changed_path_count=task_changed_path_count,
+        ),
     )
 
     result = _build_result(state, final_phase=CodingPhase.DONE)
@@ -440,6 +536,13 @@ def run_autonomous_coding_task(
             CodingPhase.VERIFY,
             "final Git inspection evidence is incomplete or unsuccessful",
         )
+    _emit_progress(
+        state,
+        CodingProgressEvent(
+            phase=CodingPhase.DONE,
+            kind=CodingProgressKind.DONE,
+        ),
+    )
     return result
 
 
@@ -449,6 +552,7 @@ def _validate_inputs(
     prompt: object,
     tool_approval_handler: object,
     tool_round_observer: object,
+    progress_event_observer: object,
     acceptance_criteria: object,
     limits: object,
 ) -> tuple[TaskSpec, ToolRegistry, frozenset[str]]:
@@ -463,6 +567,10 @@ def _validate_inputs(
     if tool_round_observer is not None and not callable(tool_round_observer):
         raise ConfigurationError(
             "autonomous coding tool round observer must be callable."
+        )
+    if progress_event_observer is not None and not callable(progress_event_observer):
+        raise ConfigurationError(
+            "autonomous coding progress event observer must be callable."
         )
     if not isinstance(limits, CodingWorkflowLimits):
         raise ConfigurationError(
@@ -667,6 +775,7 @@ def _run_validation_phase(
             )
         )
         results.append(("run_ruff_format", skipped))
+        _emit_validation_result(state, "run_ruff_format", skipped, skipped=True)
     else:
         for path in format_targets:
             result = _run_validation_tool(
@@ -678,6 +787,7 @@ def _run_validation_phase(
                 approval_handler,
             )
             results.append(("run_ruff_format", result))
+            _emit_validation_result(state, "run_ruff_format", result)
             _require_no_unexpected_changed_paths(
                 state,
                 _inspect_changed_paths_result(registry, state),
@@ -695,7 +805,143 @@ def _run_validation_phase(
             approval_handler,
         )
         results.append((tool_name, result))
+        _emit_validation_result(state, tool_name, result)
     return tuple(results)
+
+
+def _emit_validation_start(state: _WorkflowState) -> None:
+    """Emit one stable validation phase transition."""
+
+    _emit_progress(
+        state,
+        CodingProgressEvent(
+            phase=CodingPhase.VALIDATE,
+            kind=CodingProgressKind.PHASE_STARTED,
+            repair_attempt=state.repair_attempt_count,
+            max_repair_attempts=state.limits.repair_attempts,
+        ),
+    )
+
+
+def _emit_validation_result(
+    state: _WorkflowState,
+    tool_name: str,
+    result: ToolResult,
+    *,
+    skipped: bool = False,
+) -> None:
+    """Emit one typed validation outcome from structured tool evidence."""
+
+    _emit_progress(
+        state,
+        CodingProgressEvent(
+            phase=CodingPhase.VALIDATE,
+            kind=CodingProgressKind.VALIDATION_RESULT,
+            tool_name=tool_name,
+            result_status=str(result.status),
+            exit_code=None if skipped else _validation_exit_code(result.output),
+            validation_summary=(
+                _pytest_progress_summary(result.output)
+                if tool_name == "run_pytest"
+                else None
+            ),
+            repair_attempt=state.repair_attempt_count,
+            max_repair_attempts=state.limits.repair_attempts,
+            skipped=skipped,
+        ),
+    )
+
+
+def _pytest_progress_summary(output: object) -> str | None:
+    """Extract only fixed pytest outcome counts from bounded command output."""
+
+    if not isinstance(output, dict):
+        return None
+    stdout = output.get("stdout")
+    if not isinstance(stdout, str):
+        return None
+    summary_pattern = re.compile(
+        r"(?<!\w)(\d+) "
+        r"(failed|passed|skipped|xfailed|xpassed|error|errors|deselected|warnings?)"
+        r"(?!\w)"
+    )
+    for line in reversed(stdout.splitlines()):
+        counts = summary_pattern.findall(line)
+        if counts:
+            return ", ".join(f"{count} {label}" for count, label in counts)[:200]
+    return None
+
+
+def _emit_action_progress(
+    state: _WorkflowState,
+    round_: ToolInteractionRound,
+) -> None:
+    """Emit safe successful and failed controlled-action evidence."""
+
+    if state.phase not in {CodingPhase.EDIT, CodingPhase.REPAIR}:
+        return
+    for invocation, result in zip(
+        round_.response.tool_invocations,
+        round_.results,
+        strict=True,
+    ):
+        if invocation.tool_name not in _WORKSPACE_CHANGE_TOOL_NAMES:
+            continue
+        event_fields = {
+            "phase": state.phase,
+            "repair_attempt": (
+                state.repair_attempt_count if state.phase is CodingPhase.REPAIR else 0
+            ),
+            "max_repair_attempts": state.limits.repair_attempts,
+        }
+        if (
+            invocation.id in state.approved_action_ids
+            and result.status == "success"
+            and _workspace_change_result_applied(
+                invocation.tool_name,
+                invocation.arguments,
+                result.output,
+            )
+        ):
+            for path in sorted(_changed_paths_from_workspace_result(result.output)):
+                if _is_safe_prompt_path(path):
+                    _emit_progress(
+                        state,
+                        CodingProgressEvent(
+                            kind=CodingProgressKind.WORKSPACE_CHANGED,
+                            path=path,
+                            **event_fields,
+                        ),
+                    )
+            continue
+        if result.status != "error":
+            continue
+        evidence = _bounded_action_failure_evidence(
+            invocation.tool_name,
+            invocation.arguments,
+            result.error,
+            phase=state.phase,
+            attempt_number=state.current_action_attempt_number,
+        )
+        _emit_progress(
+            state,
+            CodingProgressEvent(
+                kind=CodingProgressKind.ACTION_FAILED,
+                path=evidence.path,
+                reason=evidence.error_message,
+                **event_fields,
+            ),
+        )
+
+
+def _emit_progress(
+    state: _WorkflowState,
+    event: CodingProgressEvent,
+) -> None:
+    """Notify the optional application-owned progress observer."""
+
+    if state.progress_event_observer is not None:
+        state.progress_event_observer(event)
 
 
 def _run_validation_tool(
@@ -1794,6 +2040,20 @@ def _workflow_failure(
 ) -> CompletionError:
     """Return one phase-specific terminal error with current attempt counts."""
 
+    progress_reason = " ".join(_sanitize_prompt_text(reason).split())[
+        :MAX_PROGRESS_REASON_CHARACTERS
+    ]
+    _emit_progress(
+        state,
+        CodingProgressEvent(
+            phase=phase,
+            kind=CodingProgressKind.TERMINAL_FAILURE,
+            reason=progress_reason.rstrip("."),
+            repair_attempt=state.repair_attempt_count,
+            max_repair_attempts=state.limits.repair_attempts,
+            workspace_preserved=True,
+        ),
+    )
     return CompletionError(
         f"Deterministic coding failed in phase {phase.value}: {reason}. "
         f"repair_attempts={state.repair_attempt_count}, "

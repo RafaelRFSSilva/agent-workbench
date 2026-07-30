@@ -4,9 +4,14 @@ from pathlib import Path
 from unittest.mock import call, Mock
 
 from agent_workbench.built_in_tools import create_built_in_tool_registry
-from agent_workbench.coding_loop import CodingPhase
+from agent_workbench.coding_loop import (
+    CodingPhase,
+    CodingProgressEvent,
+    CodingProgressKind,
+)
 from agent_workbench.cli import (
     AUTONOMOUS_MAX_TOOL_ROUNDS,
+    _display_coding_progress,
     main,
     run_cli as run_session_cli,
 )
@@ -1287,18 +1292,8 @@ def test_main_forwards_tool_traces_to_autonomous_task(
     )
     assert callable(runner_mock.call_args.kwargs["tool_approval_handler"])
     assert runner_mock.call_args.kwargs["tool_round_observer"] is trace_mock
-    output = capsys.readouterr().out
-    evidence = (
-        "  Final phase: DONE\n"
-        "  Tool rounds: 1\n"
-        "  Workspace change applied: yes\n"
-        "  Repair attempts: 1\n"
-        "  Completion continuations: 2\n"
-        "  Validation succeeded: yes\n"
-        "  Git status inspected: yes\n"
-        "  Git diff inspected: yes\n"
-    )
-    assert evidence in output
+    assert callable(runner_mock.call_args.kwargs["progress_event_observer"])
+    assert capsys.readouterr().out == ""
 
 
 def test_main_forwards_custom_tool_round_limit_to_autonomous_session(
@@ -1519,4 +1514,366 @@ def test_main_routes_code_command_to_existing_autonomous_workflow(
         "Fix the defect.",
     )
     assert callable(runner_mock.call_args.kwargs["tool_approval_handler"])
-    assert callable(runner_mock.call_args.kwargs["tool_round_observer"])
+    assert runner_mock.call_args.kwargs["tool_round_observer"] is None
+    assert callable(runner_mock.call_args.kwargs["progress_event_observer"])
+
+
+def test_default_autonomous_output_is_concise_stable_and_hides_model_prose(
+    monkeypatch,
+    tmp_path,
+    capsys,
+) -> None:
+    """Render controller evidence without raw internals or assistant prose."""
+
+    configuration = RuntimeConfiguration(
+        provider_name="ollama",
+        model_name="test-model",
+        workspace_root=tmp_path,
+        enable_actions=True,
+    )
+    session = Mock()
+
+    def run_task(_session, _prompt, **kwargs):
+        observer = kwargs["progress_event_observer"]
+        for event in (
+            CodingProgressEvent(
+                phase=CodingPhase.DISCOVER,
+                kind=CodingProgressKind.PHASE_STARTED,
+            ),
+            CodingProgressEvent(
+                phase=CodingPhase.DISCOVER,
+                kind=CodingProgressKind.PHASE_COMPLETED,
+            ),
+            CodingProgressEvent(
+                phase=CodingPhase.EDIT,
+                kind=CodingProgressKind.PHASE_STARTED,
+            ),
+            CodingProgressEvent(
+                phase=CodingPhase.EDIT,
+                kind=CodingProgressKind.WORKSPACE_CHANGED,
+                path="src/calculator.py",
+            ),
+            CodingProgressEvent(
+                phase=CodingPhase.VALIDATE,
+                kind=CodingProgressKind.PHASE_STARTED,
+            ),
+            CodingProgressEvent(
+                phase=CodingPhase.VALIDATE,
+                kind=CodingProgressKind.VALIDATION_RESULT,
+                tool_name="run_ruff_format",
+                result_status="success",
+                exit_code=0,
+            ),
+            CodingProgressEvent(
+                phase=CodingPhase.VALIDATE,
+                kind=CodingProgressKind.VALIDATION_RESULT,
+                tool_name="run_ruff_check",
+                result_status="success",
+                exit_code=0,
+            ),
+            CodingProgressEvent(
+                phase=CodingPhase.VALIDATE,
+                kind=CodingProgressKind.VALIDATION_RESULT,
+                tool_name="run_pytest",
+                result_status="success",
+                exit_code=0,
+                validation_summary="5 passed",
+            ),
+            CodingProgressEvent(
+                phase=CodingPhase.VERIFY,
+                kind=CodingProgressKind.PHASE_STARTED,
+            ),
+            CodingProgressEvent(
+                phase=CodingPhase.VERIFY,
+                kind=CodingProgressKind.CHANGED_PATH_COUNT,
+                changed_path_count=1,
+            ),
+            CodingProgressEvent(
+                phase=CodingPhase.DONE,
+                kind=CodingProgressKind.DONE,
+            ),
+        ):
+            observer(event)
+        return Mock(
+            assistant_summary=(
+                "Long provider completion with SHA "
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef "
+                'and {"tool_call":"private"}'
+            )
+        )
+
+    monkeypatch.setattr("agent_workbench.cli.load_environment", Mock())
+    monkeypatch.setattr(
+        "agent_workbench.cli.resolve_runtime_configuration",
+        Mock(return_value=configuration),
+    )
+    monkeypatch.setattr(
+        "agent_workbench.cli.create_agent_session",
+        Mock(return_value=session),
+    )
+    monkeypatch.setattr("agent_workbench.cli.run_autonomous_coding_task", run_task)
+
+    main(
+        [
+            "code",
+            "--workspace",
+            str(tmp_path),
+            "--enable-actions",
+            "--task",
+            "Fix the defect.",
+        ]
+    )
+
+    assert capsys.readouterr().out == (
+        "[DISCOVER] Inspecting workspace\n"
+        "[DISCOVER] Inspection complete\n"
+        "[EDIT] Applying controlled workspace changes\n"
+        "[EDIT] Changed src/calculator.py\n"
+        "[VALIDATE] Running controller-owned validation\n"
+        "[VALIDATE] Ruff format passed\n"
+        "[VALIDATE] Ruff check passed\n"
+        "[VALIDATE] Pytest passed: 5 passed\n"
+        "[VERIFY] Inspecting final workspace changes\n"
+        "[VERIFY] 1 changed file\n"
+        "[DONE] Task completed successfully\n"
+    )
+
+
+def test_progress_renderer_covers_repair_skip_plural_and_terminal_failure(
+    capsys,
+) -> None:
+    """Keep exceptional progress concise, stable, and recovery-oriented."""
+
+    for event in (
+        CodingProgressEvent(
+            phase=CodingPhase.VALIDATE,
+            kind=CodingProgressKind.VALIDATION_RESULT,
+            tool_name="run_ruff_format",
+            result_status="success",
+            skipped=True,
+        ),
+        CodingProgressEvent(
+            phase=CodingPhase.REPAIR,
+            kind=CodingProgressKind.REPAIR_STARTED,
+            repair_attempt=1,
+            max_repair_attempts=2,
+        ),
+        CodingProgressEvent(
+            phase=CodingPhase.REPAIR,
+            kind=CodingProgressKind.WORKSPACE_CHANGED,
+            path="module.py",
+            repair_attempt=1,
+            max_repair_attempts=2,
+        ),
+        CodingProgressEvent(
+            phase=CodingPhase.VERIFY,
+            kind=CodingProgressKind.CHANGED_PATH_COUNT,
+            changed_path_count=2,
+        ),
+        CodingProgressEvent(
+            phase=CodingPhase.VERIFY,
+            kind=CodingProgressKind.TERMINAL_FAILURE,
+            reason="unexpected changed paths before DONE: unrelated.py",
+            repair_attempt=1,
+            max_repair_attempts=2,
+            workspace_preserved=True,
+        ),
+    ):
+        _display_coding_progress(event)
+
+    assert capsys.readouterr().out == (
+        "[VALIDATE] Ruff format skipped: no approved changed Python files\n"
+        "[REPAIR 1/2] Resolving validation failures\n"
+        "[REPAIR 1/2] Changed module.py\n"
+        "[VERIFY] 2 changed files\n"
+        "[FAILED] VERIFY: unexpected changed paths before DONE: unrelated.py; "
+        "repair attempts 1/2; workspace preserved for manual recovery\n"
+    )
+
+
+def test_complete_assistant_summary_is_explicitly_opt_in(
+    monkeypatch,
+    tmp_path,
+    capsys,
+) -> None:
+    """Display complete model prose only when the dedicated flag is enabled."""
+
+    configuration = RuntimeConfiguration(
+        provider_name="ollama",
+        model_name="test-model",
+        workspace_root=tmp_path,
+        enable_actions=True,
+        show_assistant_summary=True,
+    )
+    session = Mock()
+
+    def run_task(_session, _prompt, **kwargs):
+        kwargs["progress_event_observer"](
+            CodingProgressEvent(
+                phase=CodingPhase.DONE,
+                kind=CodingProgressKind.DONE,
+            )
+        )
+        return Mock(assistant_summary="Complete provider summary.")
+
+    monkeypatch.setattr("agent_workbench.cli.load_environment", Mock())
+    monkeypatch.setattr(
+        "agent_workbench.cli.resolve_runtime_configuration",
+        Mock(return_value=configuration),
+    )
+    monkeypatch.setattr(
+        "agent_workbench.cli.create_agent_session",
+        Mock(return_value=session),
+    )
+    monkeypatch.setattr("agent_workbench.cli.run_autonomous_coding_task", run_task)
+
+    main(
+        [
+            "code",
+            "--workspace",
+            str(tmp_path),
+            "--enable-actions",
+            "--show-assistant-summary",
+            "--task",
+            "Fix the defect.",
+        ]
+    )
+
+    assert capsys.readouterr().out == (
+        "[DONE] Task completed successfully\n"
+        "\nAssistant summary:\n"
+        "Complete provider summary.\n"
+    )
+
+
+def test_terminal_failure_progress_is_not_duplicated_by_cli_error(
+    monkeypatch,
+    tmp_path,
+    capsys,
+) -> None:
+    """Print one clear terminal failure with attempts and preservation state."""
+
+    configuration = RuntimeConfiguration(
+        provider_name="ollama",
+        model_name="test-model",
+        workspace_root=tmp_path,
+        enable_actions=True,
+    )
+
+    def fail_task(_session, _prompt, **kwargs):
+        kwargs["progress_event_observer"](
+            CodingProgressEvent(
+                phase=CodingPhase.VALIDATE,
+                kind=CodingProgressKind.TERMINAL_FAILURE,
+                reason="unexpected changed paths after run_ruff_format: unrelated.py",
+                repair_attempt=1,
+                max_repair_attempts=2,
+                workspace_preserved=True,
+            )
+        )
+        raise CompletionError("Internal duplicate must stay hidden.")
+
+    monkeypatch.setattr("agent_workbench.cli.load_environment", Mock())
+    monkeypatch.setattr(
+        "agent_workbench.cli.resolve_runtime_configuration",
+        Mock(return_value=configuration),
+    )
+    monkeypatch.setattr(
+        "agent_workbench.cli.create_agent_session",
+        Mock(return_value=Mock()),
+    )
+    monkeypatch.setattr("agent_workbench.cli.run_autonomous_coding_task", fail_task)
+
+    main(
+        [
+            "code",
+            "--workspace",
+            str(tmp_path),
+            "--enable-actions",
+            "--task",
+            "Fix the defect.",
+        ]
+    )
+
+    assert capsys.readouterr().out == (
+        "[FAILED] VALIDATE: unexpected changed paths after run_ruff_format: "
+        "unrelated.py; repair attempts 1/2; "
+        "workspace preserved for manual recovery\n"
+    )
+
+
+def test_isolated_autonomous_output_preserves_progress_order_without_hashes(
+    monkeypatch,
+    tmp_path,
+    capsys,
+) -> None:
+    """Use the same coding progress before concise isolated commit evidence."""
+
+    target = tmp_path / "isolated"
+    configuration = RuntimeConfiguration(
+        provider_name="ollama",
+        model_name="test-model",
+        workspace_root=tmp_path,
+        enable_actions=True,
+        worktree_path=target,
+        worktree_branch="agent/fix",
+    )
+
+    def run_isolated(*_args, **kwargs):
+        observer = kwargs["progress_event_observer"]
+        observer(
+            CodingProgressEvent(
+                phase=CodingPhase.DISCOVER,
+                kind=CodingProgressKind.PHASE_STARTED,
+            )
+        )
+        observer(
+            CodingProgressEvent(
+                phase=CodingPhase.DONE,
+                kind=CodingProgressKind.DONE,
+            )
+        )
+        return Mock(
+            coding_result=Mock(assistant_summary="Hidden long completion."),
+            commit_result=Mock(
+                branch_name="agent/fix",
+                new_head="a" * 40,
+                operation_count=1,
+            ),
+            final_worktree_state=Mock(clean=True),
+        )
+
+    monkeypatch.setattr("agent_workbench.cli.load_environment", Mock())
+    monkeypatch.setattr(
+        "agent_workbench.cli.resolve_runtime_configuration",
+        Mock(return_value=configuration),
+    )
+    monkeypatch.setattr(
+        "agent_workbench.cli.run_isolated_autonomous_workflow",
+        run_isolated,
+    )
+
+    main(
+        [
+            "code",
+            "--workspace",
+            str(tmp_path),
+            "--worktree-path",
+            str(target),
+            "--worktree-branch",
+            "agent/fix",
+            "--enable-actions",
+            "--task",
+            "Fix the defect.",
+            "--commit-message",
+            "fix: defect",
+        ]
+    )
+
+    assert capsys.readouterr().out == (
+        "[DISCOVER] Inspecting workspace\n"
+        "[DONE] Task completed successfully\n"
+        "[ISOLATED] Created local commit on agent/fix with 1 changed file\n"
+        "[ISOLATED] Worktree clean; primary workspace unchanged; "
+        "worktree and local branch preserved\n"
+    )
