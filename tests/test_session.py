@@ -279,6 +279,21 @@ def test_direct_send_forwards_exact_configuration_and_commits_history() -> None:
     assert session.status is SessionStatus.READY
 
 
+def test_direct_session_send_remains_free_of_coding_controller_prompts() -> None:
+    """Keep ordinary AgentSession behavior independent from REPAIR orchestration."""
+
+    provider = FakeProvider([ChatResponse(text="Ordinary response.")])
+    session = AgentSession(id=SessionId("ordinary"), provider=provider)
+
+    result = session.send("Handle this ordinary request.")
+
+    assert result.text == "Ordinary response."
+    assert provider.requests[0].messages == [
+        {"role": "user", "content": "Handle this ordinary request."}
+    ]
+    assert "REPAIR" not in provider.requests[0].messages[0]["content"]
+
+
 def test_profile_does_not_implicitly_replace_current_system_prompt_semantics() -> None:
     """Keep profile metadata separate when no configured prompt is supplied."""
 

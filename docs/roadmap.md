@@ -381,7 +381,12 @@ without coordination.
   failed Git inspection, and empty final diffs before commit planning.
 - [x] Add scripted-provider regression scenarios backed by real temporary Git
   repositories.
-- [ ] Add controlled patch application.
+- [x] Add controlled patch application.
+- [x] Add an existing-file-only SHA-guarded whole-file rewrite action.
+- [x] Preserve bounded sanitized workspace-action failure evidence across EDIT
+  and REPAIR sends.
+- [x] Present every failed validation with explicit bounded stdout and stderr
+  evidence and dynamic runtime requirements during REPAIR.
 - [ ] Add conflict detection.
 - [ ] Add review-before-apply workflows.
 - [ ] Add deletion, rename, copy, and mode-changing commits.
@@ -608,9 +613,12 @@ The provider-independent deterministic coding workflow is complete.
 
 The application now owns phase progression, invokes fixed Python validation and
 Git verification itself, requires a real workspace action and non-empty final
-diff, and bounds discovery, edit continuations, and repair attempts. Scripted
-providers and real temporary Git repositories cover representative success and
-failure paths without calling Ollama or paid/cloud providers.
+diff, and bounds discovery, action failures, edit continuations, repair
+evidence, and repair attempts. Existing-file whole rewrites use a latest-read
+SHA guard, and repair prompts preserve every safe validation failure and
+dynamic runtime requirement. Scripted providers and real temporary Git
+repositories cover representative success and failure paths without calling
+Ollama or paid/cloud providers.
 
 The next implementation milestone is:
 

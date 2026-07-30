@@ -15,6 +15,8 @@ from agent_workbench.coding_loop import (
     MAX_ACTION_FAILURE_EVIDENCE_CHARACTERS,
     MAX_ACTION_FAILURE_EVIDENCE_ITEM_CHARACTERS,
     MAX_ACTION_FAILURE_EVIDENCE_ITEMS,
+    MAX_REPAIR_VALIDATION_EVIDENCE_CHARACTERS,
+    MAX_REPAIR_VALIDATION_FIELD_CHARACTERS,
     CodingPhase,
     CodingWorkflowLimits,
     run_autonomous_coding_task,
@@ -523,11 +525,13 @@ def test_stale_patch_failure_reaches_next_edit_prompt_and_clears_after_rewrite(
     assert "SECRET-CONTENT" not in continuation
     assert "/home/private" not in continuation
 
-    repair_prompts = [
-        request.messages[-1]["content"]
-        for request in provider.requests
-        if "Current phase: REPAIR" in request.messages[-1]["content"]
-    ]
+    repair_prompts = list(
+        dict.fromkeys(
+            request.messages[-1]["content"]
+            for request in provider.requests
+            if "Current phase: REPAIR" in request.messages[-1]["content"]
+        )
+    )
     assert repair_prompts
     assert all(
         "expected content does not match" not in prompt for prompt in repair_prompts
@@ -940,9 +944,258 @@ def test_failed_validation_enters_repair_and_revalidates(
     assert "must-not-enter-repair-evidence" not in repair_prompt
     assert "Current phase: REPAIR" in repair_prompt
     assert "Repair attempt: 1/2" in repair_prompt
-    assert "run_pytest: status=success, exit_code=1" in repair_prompt
+    assert "tool_name=run_pytest" in repair_prompt
+    assert "result_status=success" in repair_prompt
+    assert "exit_code=1" in repair_prompt
     assert "Current changed-file paths: module.py" in repair_prompt
     assert "requires another successful controlled workspace change" in repair_prompt
+
+
+def test_repair_prompt_preserves_all_safe_failure_and_runtime_evidence(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Present every safe pytest assertion and dynamic runtime requirement."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    original = "def add(left: int, right: int) -> int:\n    return left - right\n"
+    multiplied = "def add(left: int, right: int) -> int:\n    return left * right\n"
+    corrected = "def add(left: int, right: int) -> int:\n    return left + right\n"
+    dynamic_value = "RUNTIME7Q2M9"
+    pytest_runs = 0
+
+    def validation(_workspace, tool_name, _arguments):
+        nonlocal pytest_runs
+        if tool_name != "run_pytest":
+            return {
+                "exit_code": 0,
+                "stdout": "",
+                "stderr": "",
+            }
+        pytest_runs += 1
+        if pytest_runs == 1:
+            return {
+                "exit_code": 1,
+                "stdout": (
+                    "FAILED test_first - AssertionError: expected 3, got 2\n"
+                    "FAILED test_second - AssertionError: feature flag missing\n"
+                    f"generated_token_identifier={dynamic_value}\n"
+                    "dynamic runtime requirement: use the generated value above\n"
+                    "PASSWORD=credential-must-be-redacted\n"
+                    "failure loaded from /home/private/project/test_module.py\n"
+                ),
+                "stderr": (
+                    "safe stderr assertion detail\n"
+                    "API_KEY=credential-must-also-be-redacted\n"
+                    ".env contains private configuration\n"
+                ),
+            }
+        return {
+            "exit_code": 0,
+            "stdout": "all repaired\n",
+            "stderr": "",
+        }
+
+    monkeypatch.setattr(
+        "agent_workbench.validation_tools.run_validation",
+        validation,
+    )
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            rewrite_response(
+                "bad-edit",
+                expected_content=original,
+                replacement_content=multiplied,
+            ),
+            ChatResponse(text="Initial edit applied."),
+            rewrite_response(
+                "repair",
+                expected_content=multiplied,
+                replacement_content=corrected,
+            ),
+            ChatResponse(text="Repair applied."),
+        ]
+    )
+
+    result = run_autonomous_coding_task(
+        create_session(repository, provider),
+        "Correct the add implementation.",
+        tool_approval_handler=approve,
+    )
+
+    repair_prompt = next(
+        request.messages[-1]["content"]
+        for request in provider.requests
+        if "Current phase: REPAIR" in request.messages[-1]["content"]
+    )
+    assert "Validation failure 1:" in repair_prompt
+    assert "tool_name=run_pytest" in repair_prompt
+    assert "result_status=success" in repair_prompt
+    assert "exit_code=1" in repair_prompt
+    assert "stdout_excerpt:" in repair_prompt
+    assert "stderr_excerpt:" in repair_prompt
+    assert "FAILED test_first - AssertionError: expected 3, got 2" in repair_prompt
+    assert "FAILED test_second - AssertionError: feature flag missing" in repair_prompt
+    assert f"generated_token_identifier={dynamic_value}" in repair_prompt
+    assert "dynamic runtime requirement: use the generated value above" in repair_prompt
+    assert "safe stderr assertion detail" in repair_prompt
+    assert "credential-must-be-redacted" not in repair_prompt
+    assert "credential-must-also-be-redacted" not in repair_prompt
+    assert ".env contains private configuration" not in repair_prompt
+    assert "/home/private" not in repair_prompt
+    assert "[redacted sensitive content]" in repair_prompt
+    assert "resolve every listed validation failure" in repair_prompt
+    assert "Do not ignore dynamic runtime requirements" in repair_prompt
+    assert "Apply another successful controlled workspace change" in repair_prompt
+    assert "Do not call Ruff or pytest directly" in repair_prompt
+    assert "latest file SHA" in repair_prompt
+    assert "apply_file_rewrite" in repair_prompt
+    assert "controller will run the full validation sequence afterward" in repair_prompt
+    assert "Current changed-file paths: module.py" in repair_prompt
+    assert result.repair_attempt_count == 1
+    assert result.final_phase is CodingPhase.DONE
+
+
+def test_repair_validation_output_is_deterministically_bounded(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Apply named per-field and combined bounds without dropping metadata."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    original = "def add(left: int, right: int) -> int:\n    return left - right\n"
+    multiplied = "def add(left: int, right: int) -> int:\n    return left * right\n"
+    corrected = "def add(left: int, right: int) -> int:\n    return left + right\n"
+    pytest_runs = 0
+    oversized_stdout = "STDOUT-START\n" + ("x" * 20_000) + "\nSTDOUT-TAIL"
+    oversized_stderr = "STDERR-START\n" + ("y" * 20_000) + "\nSTDERR-TAIL"
+
+    def validation(_workspace, tool_name, _arguments):
+        nonlocal pytest_runs
+        if tool_name != "run_pytest":
+            return {"exit_code": 0, "stdout": "", "stderr": ""}
+        pytest_runs += 1
+        if pytest_runs == 1:
+            return {
+                "exit_code": 1,
+                "stdout": oversized_stdout,
+                "stderr": oversized_stderr,
+            }
+        return {"exit_code": 0, "stdout": "passed\n", "stderr": ""}
+
+    monkeypatch.setattr(
+        "agent_workbench.validation_tools.run_validation",
+        validation,
+    )
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            rewrite_response(
+                "bad-edit",
+                expected_content=original,
+                replacement_content=multiplied,
+            ),
+            ChatResponse(text="Initial edit applied."),
+            ChatResponse(text="Repair is not complete."),
+            rewrite_response(
+                "repair",
+                expected_content=multiplied,
+                replacement_content=corrected,
+            ),
+            ChatResponse(text="Repair applied."),
+        ]
+    )
+
+    result = run_autonomous_coding_task(
+        create_session(repository, provider),
+        "Correct the add implementation.",
+        tool_approval_handler=approve,
+    )
+
+    repair_prompts = list(
+        dict.fromkeys(
+            request.messages[-1]["content"]
+            for request in provider.requests
+            if "Current phase: REPAIR" in request.messages[-1]["content"]
+        )
+    )
+    assert len(repair_prompts) == 2
+    evidence_blocks = [
+        prompt.split("Failed validation evidence:\n", 1)[1].split(
+            "\nCurrent changed-file paths:",
+            1,
+        )[0]
+        for prompt in repair_prompts
+    ]
+    assert evidence_blocks[0] == evidence_blocks[1]
+    assert len(evidence_blocks[0]) <= MAX_REPAIR_VALIDATION_EVIDENCE_CHARACTERS
+    assert evidence_blocks[0].count("[truncated]") == 2
+    assert "STDOUT-START" in evidence_blocks[0]
+    assert "STDERR-START" in evidence_blocks[0]
+    assert "STDOUT-TAIL" not in evidence_blocks[0]
+    assert "STDERR-TAIL" not in evidence_blocks[0]
+    stdout_excerpt = (
+        evidence_blocks[0]
+        .split("stdout_excerpt:\n", 1)[1]
+        .split(
+            "\nstderr_excerpt:",
+            1,
+        )[0]
+    )
+    stderr_excerpt = evidence_blocks[0].split("stderr_excerpt:\n", 1)[1]
+    assert len(stdout_excerpt) <= MAX_REPAIR_VALIDATION_FIELD_CHARACTERS
+    assert len(stderr_excerpt) <= MAX_REPAIR_VALIDATION_FIELD_CHARACTERS
+    assert result.final_phase is CodingPhase.DONE
+
+
+def test_second_repair_resolves_every_failure_and_reaches_done(
+    tmp_path: Path,
+) -> None:
+    """Revalidate after an incomplete first repair and accept a complete second."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    original = "def add(left: int, right: int) -> int:\n    return left - right\n"
+    multiplied = "def add(left: int, right: int) -> int:\n    return left * right\n"
+    divided = "def add(left: int, right: int) -> int:\n    return left / right\n"
+    corrected = "def add(left: int, right: int) -> int:\n    return left + right\n"
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            rewrite_response(
+                "bad-edit",
+                expected_content=original,
+                replacement_content=multiplied,
+            ),
+            ChatResponse(text="Initial edit applied."),
+            rewrite_response(
+                "incomplete-repair",
+                expected_content=multiplied,
+                replacement_content=divided,
+            ),
+            ChatResponse(text="First repair applied."),
+            rewrite_response(
+                "complete-repair",
+                expected_content=divided,
+                replacement_content=corrected,
+            ),
+            ChatResponse(text="Second repair applied."),
+        ]
+    )
+
+    result = run_autonomous_coding_task(
+        create_session(repository, provider),
+        "Correct the add implementation.",
+        tool_approval_handler=approve,
+    )
+
+    pytest_runs = [
+        run.exit_code for run in result.validation_runs if run.tool_name == "run_pytest"
+    ]
+    assert pytest_runs == [1, 1, 0]
+    assert result.repair_attempt_count == 2
+    assert result.final_phase is CodingPhase.DONE
+    assert (repository / "module.py").read_text(encoding="utf-8") == corrected
 
 
 def test_repeated_validation_failure_stops_at_repair_limit(
