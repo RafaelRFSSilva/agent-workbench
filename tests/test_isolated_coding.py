@@ -90,6 +90,7 @@ def coding_result(
     inspected_git_status: bool = True,
     inspected_git_diff: bool = True,
     git_inspection_after_change: bool = True,
+    approved_workspace_paths: tuple[str, ...] = ("module.py",),
 ) -> AutonomousCodingResult:
     """Create one deterministic autonomous coding outcome."""
 
@@ -149,6 +150,7 @@ def coding_result(
         last_workspace_change_sequence_index=change_index,
         latest_git_status_sequence_index=(git_offset if inspected_git_status else None),
         latest_git_diff_sequence_index=(git_offset + 1 if inspected_git_diff else None),
+        approved_workspace_paths=approved_workspace_paths,
     )
 
 
@@ -262,6 +264,155 @@ def test_runs_isolated_task_and_creates_verified_local_commit(
         run_git(target, "log", "-1", "--pretty=%s").stdout.strip()
         == "fix: correct add implementation"
     )
+
+
+def test_commits_exact_new_files_after_untracked_verification(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Commit only the two safe created files accepted by deterministic gates."""
+
+    source = create_repository(tmp_path / "source")
+    target = tmp_path / "isolated"
+    captured = {}
+
+    def create_isolated(_session_id, _runtime, worktree, *, max_tool_rounds):
+        assert max_tool_rounds == 16
+        captured["worktree"] = worktree
+        return SimpleNamespace(worktree=worktree, session=object())
+
+    def run_coding(_session, _prompt, **_kwargs):
+        worktree = captured["worktree"]
+        (worktree.worktree_path / "created_module.py").write_text(
+            "def multiply(left: int, right: int) -> int:\n    return left * right\n",
+            encoding="utf-8",
+        )
+        (worktree.worktree_path / "test_created_module.py").write_text(
+            "from created_module import multiply\n"
+            "\n"
+            "\n"
+            "def test_multiply() -> None:\n"
+            "    assert multiply(2, 3) == 6\n",
+            encoding="utf-8",
+        )
+        return coding_result(
+            approved_workspace_paths=(
+                "created_module.py",
+                "test_created_module.py",
+            )
+        )
+
+    monkeypatch.setattr(
+        "agent_workbench.isolated_coding.create_isolated_agent_session",
+        create_isolated,
+    )
+    monkeypatch.setattr(
+        "agent_workbench.isolated_coding.run_autonomous_coding_task",
+        run_coding,
+    )
+
+    result = run_isolated_autonomous_workflow(
+        SessionId("isolated-new-files"),
+        configuration(source),
+        "agent/new-files",
+        target,
+        "Create a multiplication module and focused test.",
+        "feat: add multiplication module",
+        worktree_approval_handler=approve,
+        tool_approval_handler=approve,
+        commit_approval_handler=approve,
+    )
+
+    assert result.commit_result.paths == (
+        "created_module.py",
+        "test_created_module.py",
+    )
+    assert run_git(target, "show", "--format=", "--name-only", "HEAD").stdout == (
+        "created_module.py\ntest_created_module.py\n"
+    )
+    assert run_git(target, "status", "--short").stdout == ""
+    assert run_git(target, "ls-files", "--others", "--exclude-standard").stdout == ""
+    assert run_git(source, "status", "--short").stdout == ""
+    assert not (source / "created_module.py").exists()
+    assert not (source / "test_created_module.py").exists()
+
+
+def test_rejects_unrelated_untracked_file_before_commit_mutation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Preserve every path when worktree changes exceed approved action paths."""
+
+    source = create_repository(tmp_path / "source")
+    target = tmp_path / "isolated"
+    original_head = run_git(source, "rev-parse", "HEAD").stdout.strip()
+    captured = {}
+
+    def create_isolated(_session_id, _runtime, worktree, *, max_tool_rounds):
+        assert max_tool_rounds == 16
+        captured["worktree"] = worktree
+        return SimpleNamespace(worktree=worktree, session=object())
+
+    def run_coding(_session, _prompt, **_kwargs):
+        worktree = captured["worktree"]
+        for path in (
+            "created_module.py",
+            "test_created_module.py",
+            "unrelated-notes.txt",
+        ):
+            (worktree.worktree_path / path).write_text(
+                f"{path}\n",
+                encoding="utf-8",
+            )
+        return coding_result(
+            approved_workspace_paths=(
+                "created_module.py",
+                "test_created_module.py",
+            )
+        )
+
+    commit_approval = Mock(
+        side_effect=AssertionError("commit approval must not be requested")
+    )
+    monkeypatch.setattr(
+        "agent_workbench.isolated_coding.create_isolated_agent_session",
+        create_isolated,
+    )
+    monkeypatch.setattr(
+        "agent_workbench.isolated_coding.run_autonomous_coding_task",
+        run_coding,
+    )
+
+    with pytest.raises(
+        CompletionError,
+        match=(
+            r"Isolated commit planning failed: isolated commit contains a "
+            r"changed path outside the successful approved workspace actions"
+        ),
+    ):
+        run_isolated_autonomous_workflow(
+            SessionId("isolated-unrelated-file"),
+            configuration(source),
+            "agent/unrelated-file",
+            target,
+            "Create a multiplication module and focused test.",
+            "feat: add multiplication module",
+            worktree_approval_handler=approve,
+            tool_approval_handler=approve,
+            commit_approval_handler=commit_approval,
+        )
+
+    assert not commit_approval.called
+    assert run_git(target, "diff", "--cached", "--name-only").stdout == ""
+    assert run_git(target, "status", "--short").stdout == (
+        "?? created_module.py\n?? test_created_module.py\n?? unrelated-notes.txt\n"
+    )
+    assert (target / "unrelated-notes.txt").read_text(encoding="utf-8") == (
+        "unrelated-notes.txt\n"
+    )
+    assert run_git(target, "log", "-1", "--pretty=%s").stdout.strip() == "initial"
+    assert run_git(source, "rev-parse", "HEAD").stdout.strip() == original_head
+    assert run_git(source, "status", "--short").stdout == ""
 
 
 @pytest.mark.parametrize(

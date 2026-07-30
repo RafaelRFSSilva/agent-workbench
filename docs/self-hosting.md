@@ -31,13 +31,15 @@ repository-lifecycle changes.
    separately. The target is always `"."` in v1.
 9. Require controller-owned DONE evidence: successful latest Ruff format, Ruff
    check, and pytest results, successful Git status and complete diff
-   inspection, and a non-empty final tracked/staged diff.
-10. Review the immutable commit preview, exact CLI-supplied message, exact path
+   inspection, and non-empty tracked, staged, or safe untracked diff evidence.
+10. Require the final Git path set to equal the effective paths produced by
+    successful approved workspace actions.
+11. Review the immutable commit preview, exact CLI-supplied message, exact path
     set, and every complete diff.
-11. Approve the isolated local commit once.
-12. Require the workflow to verify the new commit and a clean isolated worktree.
-13. Preserve the worktree, local branch, and commit for external review.
-14. Push and create a Pull Request manually only after external review.
+12. Approve the isolated local commit once.
+13. Require the workflow to verify the new commit and a clean isolated worktree.
+14. Preserve the worktree, local branch, and commit for external review.
+15. Push and create a Pull Request manually only after external review.
 
 Every DISCOVER, EDIT, and REPAIR prompt, including continuations, receives the
 original ordered acceptance criteria. The controller carries bounded sanitized
@@ -193,6 +195,8 @@ paths, or unrelated repository content.
 - **Incomplete rollback:** stop and manually inspect every path listed in the
   error. Do not assume the workspace returned to its original state.
 - **Commit denied or stale before staging:** no new staging or commit occurs.
+- **Unexpected final path:** commit planning fails before preview, approval, or
+  staging. Preserve every tracked and untracked path for manual inspection.
 - **Staging or commit failure:** the isolated index may be partially or fully
   staged. Do not reset or unstage automatically; inspect `HEAD`, the branch,
   index, worktree, and exact relative paths.
@@ -209,18 +213,26 @@ The implemented regression battery uses scripted providers and real temporary
 Git repositories. It deterministically proves phase progression, edit
 continuations (including maximum-tool-round recovery), bounded cross-phase
 discovery evidence, ordered acceptance criteria, validation-driven repair, the
-repair limit, false completion rejection, and the final diff gate. Automated
-tests do not call Ollama or any paid/cloud provider.
+repair limit, false completion rejection, generated-directory filtering,
+read-only untracked Git evidence, untracked-only DONE, isolated new-file
+commits, and the final diff gate. Automated tests do not call Ollama or any
+paid/cloud provider.
 
-Those tests validate controller behavior, not local-model capability. Manual
-benchmarks of this deterministic workflow with `gpt-oss:20b` or another real
-local model remain future evaluation work. Record model name, task fixture,
-approval decisions, phase counters, validation results, and final diff when
-such a benchmark is run.
+Those tests validate controller behavior, not local-model capability. A prior
+manual benchmark with `qwen3-coder:30b` through Ollama exercised the earlier
+deterministic workflow and exposed the traversal and untracked-file limitations
+addressed here. Record model name, task fixture, approval decisions, phase
+counters, validation results, and final diff for future benchmark runs.
 
-V1 uses the existing tracked/staged Git diff inspection. A task that creates
-only new untracked files cannot reach DONE; include a tracked-file change or
-wait for a future diff contract that represents untracked contents.
+V1 can reach DONE for tasks composed only of safe untracked UTF-8 regular files.
+Git inspection does not stage them: it renders at most 64 files, reads at most
+32 KiB per file, and caps combined untracked diff evidence at 64 KiB. The
+complete compact, sorted-key UTF-8 JSON result is limited to 100 KiB. Binary,
+unsupported, unreadable, oversized, sensitive, ignored, and limit-exceeding
+files are omitted with metadata whose detailed form has a 16 KiB budget and
+collapses to deterministic reason counts when needed. Omission metadata alone
+cannot satisfy VERIFY and requires manual review. No post-hardening real-model
+benchmark has passed yet.
 
 ## Tasks suitable for `gpt-oss:20b`
 

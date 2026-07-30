@@ -105,7 +105,11 @@ def run_isolated_autonomous_workflow(
     _require_commit_gates(coding_result)
 
     try:
-        commit_plan = plan_isolated_commit(worktree, commit_message)
+        commit_plan = plan_isolated_commit(
+            worktree,
+            commit_message,
+            expected_paths=coding_result.approved_workspace_paths,
+        )
     except (CompletionError, ConfigurationError) as exc:
         raise _preserved_failure("Isolated commit planning", exc) from None
 

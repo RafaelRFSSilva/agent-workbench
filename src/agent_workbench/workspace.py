@@ -6,6 +6,29 @@ from pathlib import Path
 from agent_workbench.errors import ConfigurationError, WorkspacePathError
 
 
+DEFAULT_IGNORED_TRAVERSAL_DIRECTORY_NAMES = frozenset(
+    {
+        ".git",
+        ".venv",
+        "venv",
+        "__pycache__",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".mypy_cache",
+        ".tox",
+        ".nox",
+        "node_modules",
+        "dist",
+        "build",
+        ".next",
+        ".turbo",
+        "coverage",
+        "htmlcov",
+    }
+)
+"""Directory names omitted from recursive repository inspection."""
+
+
 @dataclass(frozen=True, slots=True)
 class Workspace:
     """Resolve existing paths within one authorized workspace root."""
@@ -58,3 +81,15 @@ class Workspace:
             ) from None
 
         return canonical_path
+
+    def is_ignored_traversal_path(self, path: Path) -> bool:
+        """Return whether a contained path enters an ignored directory."""
+
+        try:
+            relative_path = path.relative_to(self.root)
+        except ValueError:
+            return True
+        return any(
+            part in DEFAULT_IGNORED_TRAVERSAL_DIRECTORY_NAMES
+            for part in relative_path.parts
+        )

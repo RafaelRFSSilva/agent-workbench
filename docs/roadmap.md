@@ -167,6 +167,10 @@ requiring every file to be attached manually.
 - [x] Add bounded Python `search_symbols` using non-executing standard-library
   AST parsing, lexical symbol kinds, async metadata, and deterministic results.
 - [x] Add fixed-command `inspect_git_status` and `inspect_git_diff`.
+- [x] Centralize generated-directory filtering across recursive file, text, and
+  symbol traversal.
+- [x] Add bounded read-only safe untracked-file evidence to Git diff
+  inspection.
 - [x] Add file and output size limits.
 - [x] Add opt-in visible tool traces outside conversation history.
 

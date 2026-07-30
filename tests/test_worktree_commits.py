@@ -329,6 +329,35 @@ def test_plan_rejects_every_preexisting_staged_state(
     assert index_bytes(worktree) == before
 
 
+def test_plan_rejects_changes_outside_expected_paths_before_index_mutation(
+    tmp_path: Path,
+) -> None:
+    """Compare the complete worktree path set with the controller allowlist."""
+
+    _, handle = create_isolated_worktree(tmp_path)
+    worktree = handle.worktree_path
+    (worktree / "tracked.txt").write_text("approved\n", encoding="utf-8")
+    (worktree / "unrelated.txt").write_text("unrelated\n", encoding="utf-8")
+    before_index = index_bytes(worktree)
+
+    with pytest.raises(
+        ConfigurationError,
+        match="outside the successful approved workspace actions",
+    ):
+        plan_isolated_commit(
+            handle,
+            "fix: expected paths",
+            expected_paths=("tracked.txt",),
+        )
+
+    assert index_bytes(worktree) == before_index
+    assert run_git(worktree, "diff", "--cached", "--name-only").stdout == ""
+    assert run_git(worktree, "status", "--short").stdout == (
+        " M tracked.txt\n?? unrelated.txt\n"
+    )
+    assert run_git(worktree, "log", "-1", "--pretty=%s").stdout.strip() == "initial"
+
+
 @pytest.mark.parametrize(
     "change_kind",
     [
