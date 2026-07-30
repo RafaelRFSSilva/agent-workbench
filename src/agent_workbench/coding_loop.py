@@ -100,8 +100,6 @@ _VALIDATION_ASSIGNMENT_PATTERN = re.compile(
     (?P<name>[a-z][a-z0-9_-]{1,127})
     ["']?
     \s*[:=]
-    \s*
-    (?P<value>.+)
     """
 )
 _VALIDATION_CREDENTIAL_NAME_PATTERN = re.compile(
@@ -1475,11 +1473,10 @@ def _validation_output_line_is_sensitive(line: str) -> bool:
         or _VALIDATION_OBVIOUS_SECRET_VALUE_PATTERN.search(line)
     ):
         return True
-    assignment = _VALIDATION_ASSIGNMENT_PATTERN.search(line)
-    return (
-        assignment is not None
-        and _VALIDATION_CREDENTIAL_NAME_PATTERN.fullmatch(assignment.group("name"))
+    return any(
+        _VALIDATION_CREDENTIAL_NAME_PATTERN.fullmatch(assignment.group("name"))
         is not None
+        for assignment in _VALIDATION_ASSIGNMENT_PATTERN.finditer(line)
     )
 
 

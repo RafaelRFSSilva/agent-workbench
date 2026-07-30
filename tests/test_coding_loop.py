@@ -1048,6 +1048,7 @@ def test_repair_prompt_preserves_all_safe_failure_and_runtime_evidence(
                     f'REPAIR_TOKEN = "{dynamic_value}"\n'
                     f"generated_token_identifier={dynamic_value}\n"
                     "dynamic runtime requirement: use the generated value above\n"
+                    "status=failed OPENAI_API_KEY=mixed-credential-must-be-redacted\n"
                     "PASSWORD=credential-must-be-redacted\n"
                     "failure loaded from /home/private/project/test_module.py\n"
                 ),
@@ -1108,6 +1109,8 @@ def test_repair_prompt_preserves_all_safe_failure_and_runtime_evidence(
     assert f"generated_token_identifier={dynamic_value}" in repair_prompt
     assert "dynamic runtime requirement: use the generated value above" in repair_prompt
     assert "safe stderr assertion detail" in repair_prompt
+    assert "mixed-credential-must-be-redacted" not in repair_prompt
+    assert "status=failed OPENAI_API_KEY" not in repair_prompt
     assert "credential-must-be-redacted" not in repair_prompt
     assert "credential-must-also-be-redacted" not in repair_prompt
     assert ".env contains private configuration" not in repair_prompt
@@ -1177,6 +1180,35 @@ def test_validation_output_sanitizer_redacts_credentials(
     assert "safe suffix" in sanitized
     assert secret_value not in sanitized
     assert "[redacted sensitive content]" in sanitized
+
+
+@pytest.mark.parametrize(
+    ("sensitive_line", "secret_value"),
+    [
+        ("status=failed OPENAI_API_KEY=openai-secret", "openai-secret"),
+        (
+            "generated_token_identifier=RUNTIME7Q2M9 DB_PASSWORD=db-secret",
+            "db-secret",
+        ),
+        ('{"status":"failed","GITHUB_TOKEN":"github-secret"}', "github-secret"),
+        ('{"safe":"value","AWS_SESSION_TOKEN":"aws-secret"}', "aws-secret"),
+        ("note=safe, AWS_SECRET_ACCESS_KEY=aws-secret", "aws-secret"),
+        ("safe=true AUTH_TOKEN=auth-secret", "auth-secret"),
+        ("safe: true, Authorization: Bearer bearer-secret", "bearer-secret"),
+    ],
+)
+def test_validation_output_sanitizer_redacts_mixed_assignments(
+    sensitive_line: str,
+    secret_value: str,
+) -> None:
+    """Inspect later assignments even when a safe field appears first."""
+
+    first = _sanitize_validation_output(sensitive_line)
+    second = _sanitize_validation_output(sensitive_line)
+
+    assert first == second
+    assert first == "[redacted sensitive content]"
+    assert secret_value not in first
 
 
 def test_validation_output_sanitizer_preserves_safe_dynamic_requirements() -> None:
