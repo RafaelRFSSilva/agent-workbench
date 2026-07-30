@@ -850,9 +850,9 @@ The CLI keeps tools opt-in. `--enable-tools` registers the safe synchronous
 calculator, while `--workspace PATH` authorizes the read-only `list_files`,
 `read_file`, `search_text`, `search_symbols`, `inspect_git_status`, and
 `inspect_git_diff` tools for one root. `--enable-actions` requires that
-workspace and appends `apply_file_patch`, `apply_text_replacement`,
-`apply_workspace_changes`, `run_ruff_format`, `run_ruff_check`, and
-`run_pytest`. The calculator, when
+workspace and appends `apply_file_patch`, `apply_file_rewrite`,
+`apply_text_replacement`, `apply_workspace_changes`, `run_ruff_format`,
+`run_ruff_check`, and `run_pytest`. The calculator, when
 enabled, remains first. Without a tool option or workspace, no registry is
 created.
 `--show-tool-traces` adds an optional callback for completed provider-independent
@@ -933,6 +933,18 @@ The preview contains the complete deterministic unified diff and bounded
 metadata. Execution validates again after approval; existing files use a
 same-directory temporary file and atomic replacement with portable permission
 preservation, while new files use exclusive creation.
+
+`apply_file_rewrite` provides a whole-file optimistic update without requiring
+caller-supplied expected content. It accepts only an existing contained UTF-8
+regular file, the 64-character lowercase SHA-256 from the latest `read_file`,
+and complete replacement content. Preview reads and hashes the file internally
+and shows its complete deterministic diff. Execution repeats the hash check
+after approval, then reuses the exact-content post-check, same-directory
+temporary file, atomic replacement, permission preservation, and existing
+file, diff, and changed-line limits. Controller guidance requires a complete
+latest `read_file`, prohibits constructing a rewrite from a partial line-range
+read, and requires `replacement_content` to contain the complete resulting
+file. It cannot create files.
 
 `apply_text_replacement` performs a smaller optimistic update for existing
 UTF-8 files. It requires an exact non-empty literal fragment, replacement
@@ -1343,13 +1355,37 @@ work is restricted to:
   character, and combined character limits prevent tool output from becoming
   unbounded. A normal completion also contributes a bounded sanitized
   discovery summary.
-* `EDIT`: read-only tools plus controlled patch, replacement, and transaction
-  actions. Its prompt carries the explicit discovery evidence even when the
-  DISCOVER send exhausted its round limit and its conversation turn was rolled
-  back.
+* `EDIT`: read-only tools plus controlled patch, SHA-guarded rewrite, literal
+  replacement, and transaction actions. Its prompt carries the explicit
+  discovery evidence even when the DISCOVER send exhausted its round limit and
+  its conversation turn was rolled back.
 * `REPAIR`: the same tools as EDIT, with the original objective, failed
-  validation names and exit codes, bounded redacted output, safe changed paths,
-  and current counters repeated in every prompt.
+  validation tool names, statuses, exit codes, independently bounded sanitized
+  stdout and stderr excerpts, safe changed paths, current action-failure
+  evidence, and current counters repeated in every prompt.
+
+Controlled-action preview and execution failures are retained as typed
+evidence containing only tool name, one safe relative path when available, a
+sanitized error summary, phase, and attempt. Current guidance is capped at
+eight items, 400 characters per item, and 2,000 combined characters. Expected
+and replacement contents, diffs, absolute paths, and sensitive data are never
+copied into this state. A later successful action clears obsolete guidance for
+its changed path while the original immutable tool results remain available
+for final reporting.
+
+Generic model-facing text—including objectives, acceptance criteria, discovery
+summaries, and action-failure evidence—uses a conservative sensitive-line
+sanitizer. Validation stdout and stderr use a separate sanitizer that redacts
+known credential assignments, authorization bearer values, obvious secret
+values, `.env` variants, and absolute paths without hiding a line solely
+because an unrelated test identifier contains `token`.
+
+Each validation stream excerpt is capped at 4,000 characters, and the complete
+formatted failed-validation evidence is capped at 12,000 characters with fair
+deterministic allocation and explicit truncation markers. The prompt instructs
+the model to resolve every listed failure and dynamic runtime requirement,
+make another controlled change, perform a complete file read before
+`apply_file_rewrite`, and leave Ruff and pytest execution to the controller.
 
 The controller invokes `run_ruff_format`, `run_ruff_check`, and `run_pytest`
 against `"."` in that exact order through the registered preview, explicit

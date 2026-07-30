@@ -485,9 +485,9 @@ access the network, or use MCP.
 
 Controlled actions are disabled by default. `--enable-actions` requires an
 explicit `--workspace PATH` and adds `apply_file_patch`,
-`apply_text_replacement`, `apply_workspace_changes`, `run_ruff_format`,
-`run_ruff_check`, and
-`run_pytest` after the read-only tools:
+`apply_file_rewrite`, `apply_text_replacement`, `apply_workspace_changes`,
+`run_ruff_format`, `run_ruff_check`, and `run_pytest` after the read-only
+tools:
 
 ```bash
 uv run agent-workbench \
@@ -510,6 +510,25 @@ It compares the complete expected content, shows the complete unified diff,
 and revalidates after approval. Existing files are replaced atomically while
 preserving portable permission bits; new files use exclusive creation in an
 existing directory.
+
+`apply_file_rewrite` performs one approved whole-file replacement for an
+existing UTF-8 regular file without caller-supplied expected content:
+
+```json
+{
+  "path": "relative/path.py",
+  "expected_file_sha256": "sha256 from the latest complete read_file result",
+  "replacement_content": "complete replacement content"
+}
+```
+
+Agent Workbench reads the current file internally, requires the exact lowercase
+SHA-256, constructs and displays the complete deterministic diff, verifies the
+file again after approval, and atomically replaces it while preserving exact
+permissions. Before invoking it, call `read_file` for the complete file; never
+construct `replacement_content` from a partial line-range read. It cannot
+create files and retains the 100 KiB file, 500 changed-line, and 64 KiB
+complete-preview limits.
 
 `apply_text_replacement` performs one approved exact literal replacement in an
 existing UTF-8 file without requiring the model to resend the complete file:
@@ -588,9 +607,9 @@ approval.
 
 With `--workspace` and `--enable-actions`, tool order is `list_files`,
 `read_file`, `search_text`, `search_symbols`, `inspect_git_status`,
-`inspect_git_diff`, `apply_file_patch`, `apply_text_replacement`,
-`apply_workspace_changes`, `run_ruff_format`, `run_ruff_check`, then
-`run_pytest`. With
+`inspect_git_diff`, `apply_file_patch`, `apply_file_rewrite`,
+`apply_text_replacement`, `apply_workspace_changes`, `run_ruff_format`,
+`run_ruff_check`, then `run_pytest`. With
 `--enable-tools`, `calculator` comes first and the remaining order is
 unchanged.
 
@@ -598,9 +617,10 @@ Example request:
 
 ```text
 Inspect the relevant files. Prefer apply_text_replacement for small exact
-edits to existing files, using the SHA-256 returned by read_file. For changes
-that must succeed together, request one apply_workspace_changes transaction
-with complete expected and replacement
+edits to existing files, using a short literal copied from the latest read.
+Use apply_file_rewrite with the latest read_file SHA for a whole-file
+replacement. For changes that must succeed together, request one
+apply_workspace_changes transaction with complete expected and replacement
 content for every file. Request approval before every write or validation
 action, run Ruff and pytest, inspect the final Git status and diff, and
 summarize the result. Do not commit or push.
@@ -640,8 +660,15 @@ DONE.
 After a successful workspace action, the controller invokes
 `run_ruff_format`, `run_ruff_check`, and `run_pytest` against `"."` in that
 exact order. Failed validation enters a bounded REPAIR phase and reruns the
-complete sequence after another successful change. The controller then invokes
-Git status and diff inspection. Success requires a non-empty final
+complete sequence after another successful change. Every failed validation is
+represented with its tool name, status, exit code, and bounded sanitized stdout
+and stderr excerpts. Safe action failures also survive across later EDIT and
+REPAIR sends so the model can reread stale targets instead of repeating an
+invalid request. Generic prompt text uses conservative line redaction;
+validation output uses a separate credential-aware boundary that preserves
+safe generated runtime requirements. The controller then invokes Git status
+and diff inspection.
+Success requires a non-empty final
 tracked, staged, or safe untracked diff and successful latest validation and
 Git evidence. Omission metadata alone does not satisfy verification. Every file
 change and executable validation remains default-deny and requires approval

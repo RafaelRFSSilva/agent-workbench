@@ -1,7 +1,7 @@
 """Run one externally controlled deterministic coding workflow."""
 
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import PurePosixPath
@@ -37,7 +37,11 @@ MAX_DISCOVERY_EVIDENCE_ITEMS = 12
 MAX_DISCOVERY_EVIDENCE_ITEM_CHARACTERS = 800
 MAX_DISCOVERY_EVIDENCE_CHARACTERS = 4_000
 MAX_DISCOVERY_SUMMARY_CHARACTERS = 1_000
-MAX_REPAIR_OUTPUT_CHARACTERS = 4_000
+MAX_ACTION_FAILURE_EVIDENCE_ITEMS = 8
+MAX_ACTION_FAILURE_EVIDENCE_ITEM_CHARACTERS = 400
+MAX_ACTION_FAILURE_EVIDENCE_CHARACTERS = 2_000
+MAX_REPAIR_VALIDATION_FIELD_CHARACTERS = 4_000
+MAX_REPAIR_VALIDATION_EVIDENCE_CHARACTERS = 12_000
 
 _READ_ONLY_TOOL_NAMES = frozenset(
     {
@@ -57,6 +61,7 @@ _VALIDATION_TOOL_NAMES = (
 _WORKSPACE_CHANGE_TOOL_NAMES = frozenset(
     {
         "apply_file_patch",
+        "apply_file_rewrite",
         "apply_text_replacement",
         "apply_workspace_changes",
     }
@@ -78,9 +83,60 @@ _MAXIMUM_ROUNDS_CHANGE_SUMMARY = (
     "A successful workspace change was applied before the model-facing "
     "phase exhausted its tool-round budget."
 )
+_COMPLETE_FILE_REWRITE_GUIDANCE = (
+    "Before apply_file_rewrite, call read_file for the complete file. Do not "
+    "construct a whole-file rewrite from a partial line-range read. Use the "
+    "latest file SHA from that complete latest read. replacement_content must "
+    "contain the complete resulting file."
+)
 _ABSOLUTE_PATH_PATTERN = re.compile(r"(?<![\w.])/(?:[^\s\x00]+)")
-_SENSITIVE_LINE_PATTERN = re.compile(
+_GENERIC_SENSITIVE_LINE_PATTERN = re.compile(
     r"(?i)(?:^|[^a-z])(?:api[_-]?key|password|secret|token|\.env)(?:[^a-z]|$)"
+)
+_VALIDATION_ASSIGNMENT_PATTERN = re.compile(
+    r"""(?ix)
+    (?:^|[\s{,])
+    ["']?
+    (?P<name>[a-z][a-z0-9_-]{1,127})
+    ["']?
+    \s*[:=]
+    """
+)
+_VALIDATION_CREDENTIAL_NAME_PATTERN = re.compile(
+    r"""(?ix)^
+    (?:
+        (?:[a-z0-9]+[_-])*api[_-]?key
+        | (?:[a-z0-9]+[_-])*password
+        | (?:[a-z0-9]+[_-])*(?:secret[_-]access[_-]key|secret)
+        | (?:aws[_-])?access[_-]key[_-]id
+        | (?:aws[_-]session|github|gitlab|openai|stripe)[_-]token
+        | slack(?:[_-](?:app|bot|user))?[_-]token
+        | access[_-]token
+        | auth[_-]token
+        | authorization
+        | token
+    )
+    $"""
+)
+_VALIDATION_AUTHORIZATION_BEARER_PATTERN = re.compile(
+    r"(?i)\bauthorization\s*:?\s+bearer\s+\S+"
+)
+_VALIDATION_BEARER_VALUE_PATTERN = re.compile(
+    r"(?i)(?:^|[\s:=])bearer\s+[a-z0-9._~+/\-=]{8,}"
+)
+_VALIDATION_ENV_REFERENCE_PATTERN = re.compile(
+    r"(?i)(?<![a-z0-9_])\.env(?:\.[a-z0-9_-]+)*(?![a-z0-9_-])"
+)
+_VALIDATION_OBVIOUS_SECRET_VALUE_PATTERN = re.compile(
+    r"""(?ix)
+    (?:^|[\s"'=:(])
+    (?:
+        sk-[a-z0-9_-]{12,}
+        | gh[pousr]_[a-z0-9_]{12,}
+        | AKIA[A-Z0-9]{12,}
+    )
+    (?:$|[\s"',)])
+    """
 )
 
 
@@ -139,6 +195,28 @@ class _DiscoveryEvidence:
     tool_name: str
     paths: tuple[str, ...]
     metadata: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _ActionFailureEvidence:
+    """Store one bounded safe controlled-action failure summary."""
+
+    tool_name: str
+    path: str | None
+    error_message: str
+    phase: CodingPhase
+    attempt_number: int
+
+
+@dataclass(frozen=True, slots=True)
+class _ValidationFailureEvidence:
+    """Store one explicit bounded sanitized validation failure."""
+
+    tool_name: str
+    result_status: str
+    exit_code: int | None
+    stdout_excerpt: str
+    stderr_excerpt: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,11 +280,13 @@ class _WorkflowState:
     approved_action_names: list[str] = field(default_factory=list)
     approved_action_ids: set[str] = field(default_factory=set)
     discovery_evidence: list[_DiscoveryEvidence] = field(default_factory=list)
+    action_failure_evidence: list[_ActionFailureEvidence] = field(default_factory=list)
     discovery_summary: str = ""
     assistant_summary: str = ""
     repair_attempt_count: int = 0
     completion_continuation_count: int = 0
     controller_invocation_count: int = 0
+    current_action_attempt_number: int = 0
 
 
 def run_autonomous_coding_task(
@@ -232,6 +312,7 @@ def run_autonomous_coding_task(
 
     def observe_tool_round(round_: ToolInteractionRound) -> None:
         state.rounds.append(round_)
+        _capture_action_failure_evidence(state, round_)
         if tool_round_observer is not None:
             tool_round_observer(round_)
 
@@ -460,6 +541,11 @@ def _run_model_change_phase(
     )
 
     while True:
+        state.current_action_attempt_number = (
+            state.repair_attempt_count
+            if phase is CodingPhase.REPAIR
+            else local_continuations + 1
+        )
         call_start = len(state.rounds)
         prompt = (
             _build_repair_prompt(state, failed_validations, outstanding)
@@ -821,6 +907,18 @@ def _build_phase_prompt(
         _sanitize_prompt_text(criterion)
         for criterion in state.task_spec.acceptance_criteria
     )
+    action_failure_section = ""
+    if state.action_failure_evidence:
+        action_failure_section = (
+            "\n\nAction failure evidence:\n"
+            f"{_numbered_lines(_format_action_failure_evidence(item) for item in state.action_failure_evidence)}\n\n"
+            "Action failure recovery:\n"
+            "The previous action did not change the workspace. The model must "
+            "reread the target before trying again. "
+            f"{_COMPLETE_FILE_REWRITE_GUIDANCE} For a small exact change, you "
+            "may use apply_text_replacement with a short literal snippet copied "
+            "exactly from the latest file."
+        )
     return (
         "Continue one externally controlled deterministic coding workflow.\n\n"
         f"Original objective:\n{_sanitize_prompt_text(state.task_spec.objective)}\n\n"
@@ -828,7 +926,8 @@ def _build_phase_prompt(
         f"{acceptance_criteria}\n\n"
         f"Current phase: {state.phase.value}\n\n"
         "Completed phase evidence:\n"
-        f"{_numbered_lines(completed)}\n\n"
+        f"{_numbered_lines(completed)}"
+        f"{action_failure_section}\n\n"
         "Outstanding requirements:\n"
         f"{_numbered_lines(outstanding)}\n\n"
         "Current attempt counters:\n"
@@ -846,21 +945,8 @@ def _build_repair_prompt(
 ) -> str:
     """Build one bounded repair prompt with fresh explicit failure evidence."""
 
-    failure_lines = []
-    for tool_name, result in failed_validations:
-        exit_code = _validation_exit_code(result.output)
-        failure_lines.append(
-            f"{tool_name}: status={result.status}, "
-            f"exit_code={exit_code if exit_code is not None else 'unavailable'}"
-        )
-        output = result.output
-        if isinstance(output, dict):
-            for stream_name in ("stdout", "stderr"):
-                stream = output.get(stream_name)
-                if isinstance(stream, str) and stream:
-                    failure_lines.append(
-                        f"{tool_name} {stream_name}: {_sanitize_repair_output(stream)}"
-                    )
+    failure_evidence = _bounded_validation_failure_evidence(failed_validations)
+    formatted_failures = _format_validation_failure_evidence(failure_evidence)
 
     changed_paths = _safe_changed_paths(state.rounds)
     path_evidence = ", ".join(changed_paths) if changed_paths else "unavailable"
@@ -870,11 +956,115 @@ def _build_repair_prompt(
         f"Repair attempt: {state.repair_attempt_count}/"
         f"{state.limits.repair_attempts}\n"
         "Failed validation evidence:\n"
-        f"{_numbered_lines(failure_lines)}\n"
+        f"{formatted_failures}\n"
         f"Current changed-file paths: {path_evidence}\n"
+        "Repair requirements:\n"
+        "- You must resolve every listed validation failure.\n"
+        "- Do not ignore dynamic runtime requirements in validation output.\n"
+        "- Apply another successful controlled workspace change.\n"
+        "- Do not call Ruff or pytest directly because the controller owns "
+        "validation.\n"
+        f"- {_COMPLETE_FILE_REWRITE_GUIDANCE}\n"
+        "- The controller will run the full validation sequence afterward.\n"
         "This repair attempt requires another successful controlled workspace "
         "change before validation can run again."
     )
+
+
+def _bounded_validation_failure_evidence(
+    failed_validations: tuple[tuple[str, ToolResult], ...],
+) -> tuple[_ValidationFailureEvidence, ...]:
+    """Build fair per-stream excerpts within one combined prompt budget."""
+
+    evidence = []
+    raw_streams: list[tuple[int, str, str]] = []
+    for index, (tool_name, result) in enumerate(failed_validations):
+        stdout = ""
+        stderr = ""
+        if isinstance(result.output, dict):
+            raw_stdout = result.output.get("stdout")
+            raw_stderr = result.output.get("stderr")
+            if isinstance(raw_stdout, str):
+                stdout = _sanitize_validation_output(raw_stdout)
+            if isinstance(raw_stderr, str):
+                stderr = _sanitize_validation_output(raw_stderr)
+        if not stderr and result.error:
+            stderr = _sanitize_validation_output(result.error)
+
+        evidence.append(
+            _ValidationFailureEvidence(
+                tool_name=tool_name,
+                result_status=str(result.status),
+                exit_code=_validation_exit_code(result.output),
+                stdout_excerpt="",
+                stderr_excerpt="",
+            )
+        )
+        if stdout:
+            raw_streams.append((index, "stdout", stdout))
+        if stderr:
+            raw_streams.append((index, "stderr", stderr))
+
+    base_length = len(_format_validation_failure_evidence(tuple(evidence)))
+    remaining = max(
+        0,
+        MAX_REPAIR_VALIDATION_EVIDENCE_CHARACTERS - base_length,
+    )
+    for stream_index, (evidence_index, stream_name, stream) in enumerate(raw_streams):
+        remaining_streams = len(raw_streams) - stream_index
+        limit = min(
+            MAX_REPAIR_VALIDATION_FIELD_CHARACTERS,
+            remaining // remaining_streams,
+        )
+        excerpt = _truncate_repair_field(stream, limit)
+        current = evidence[evidence_index]
+        evidence[evidence_index] = _ValidationFailureEvidence(
+            tool_name=current.tool_name,
+            result_status=current.result_status,
+            exit_code=current.exit_code,
+            stdout_excerpt=(
+                excerpt if stream_name == "stdout" else current.stdout_excerpt
+            ),
+            stderr_excerpt=(
+                excerpt if stream_name == "stderr" else current.stderr_excerpt
+            ),
+        )
+        remaining -= len(excerpt)
+    return tuple(evidence)
+
+
+def _truncate_repair_field(value: str, limit: int) -> str:
+    """Truncate one sanitized validation stream with a deterministic marker."""
+
+    if len(value) <= limit:
+        return value
+    marker = "\n[truncated]"
+    if limit <= len(marker):
+        return marker[:limit]
+    return value[: limit - len(marker)] + marker
+
+
+def _format_validation_failure_evidence(
+    evidence: tuple[_ValidationFailureEvidence, ...],
+) -> str:
+    """Render every validation failure with all required explicit fields."""
+
+    if not evidence:
+        return "None."
+    records = []
+    for index, item in enumerate(evidence, start=1):
+        exit_code = str(item.exit_code) if item.exit_code is not None else "unavailable"
+        records.append(
+            f"Validation failure {index}:\n"
+            f"tool_name={item.tool_name}\n"
+            f"result_status={item.result_status}\n"
+            f"exit_code={exit_code}\n"
+            "stdout_excerpt:\n"
+            f"{item.stdout_excerpt or '[empty]'}\n"
+            "stderr_excerpt:\n"
+            f"{item.stderr_excerpt or '[empty]'}"
+        )
+    return "\n\n".join(records)
 
 
 def _completed_evidence_lines(state: _WorkflowState) -> tuple[str, ...]:
@@ -943,6 +1133,133 @@ def _capture_discovery_evidence(
                 continue
             state.discovery_evidence.append(evidence)
             combined_characters += len(formatted)
+
+
+def _capture_action_failure_evidence(
+    state: _WorkflowState,
+    round_: ToolInteractionRound,
+) -> None:
+    """Retain only bounded safe failures for controlled workspace actions."""
+
+    if state.phase not in {CodingPhase.EDIT, CodingPhase.REPAIR}:
+        return
+
+    for invocation, result in zip(
+        round_.response.tool_invocations,
+        round_.results,
+        strict=True,
+    ):
+        if invocation.tool_name not in _WORKSPACE_CHANGE_TOOL_NAMES:
+            continue
+        if result.status == "success" and _workspace_change_result_applied(
+            invocation.tool_name,
+            invocation.arguments,
+            result.output,
+        ):
+            _clear_obsolete_action_failure_evidence(state, result.output)
+            continue
+        if result.status != "error":
+            continue
+
+        evidence = _bounded_action_failure_evidence(
+            invocation.tool_name,
+            invocation.arguments,
+            result.error,
+            phase=state.phase,
+            attempt_number=state.current_action_attempt_number,
+        )
+        state.action_failure_evidence.append(evidence)
+        while (
+            len(state.action_failure_evidence) > MAX_ACTION_FAILURE_EVIDENCE_ITEMS
+            or sum(
+                len(_format_action_failure_evidence(item))
+                for item in state.action_failure_evidence
+            )
+            > MAX_ACTION_FAILURE_EVIDENCE_CHARACTERS
+        ):
+            state.action_failure_evidence.pop(0)
+
+
+def _bounded_action_failure_evidence(
+    tool_name: str,
+    arguments: object,
+    error: str | None,
+    *,
+    phase: CodingPhase,
+    attempt_number: int,
+) -> _ActionFailureEvidence:
+    """Build one sanitized failure item within its exact character budget."""
+
+    path = _safe_action_failure_path(arguments)
+    message = " ".join(
+        _sanitize_prompt_text(error or "Controlled workspace action failed.").split()
+    )
+    placeholder = _ActionFailureEvidence(
+        tool_name=tool_name,
+        path=path,
+        error_message="",
+        phase=phase,
+        attempt_number=attempt_number,
+    )
+    available = max(
+        0,
+        MAX_ACTION_FAILURE_EVIDENCE_ITEM_CHARACTERS
+        - len(_format_action_failure_evidence(placeholder)),
+    )
+    return _ActionFailureEvidence(
+        tool_name=tool_name,
+        path=path,
+        error_message=message[:available],
+        phase=phase,
+        attempt_number=attempt_number,
+    )
+
+
+def _safe_action_failure_path(arguments: object) -> str | None:
+    """Extract one bounded workspace-relative action path when unambiguous."""
+
+    if not isinstance(arguments, dict):
+        return None
+    candidate = arguments.get("path")
+    if candidate is None:
+        changes = arguments.get("changes")
+        if isinstance(changes, list) and len(changes) == 1:
+            change = changes[0]
+            if isinstance(change, dict):
+                candidate = change.get("path")
+    if (
+        not isinstance(candidate, str)
+        or not _is_safe_prompt_path(candidate)
+        or len(candidate) > MAX_ACTION_FAILURE_EVIDENCE_ITEM_CHARACTERS // 2
+    ):
+        return None
+    return candidate
+
+
+def _clear_obsolete_action_failure_evidence(
+    state: _WorkflowState,
+    output: object,
+) -> None:
+    """Clear current guidance for paths changed successfully afterward."""
+
+    changed_paths = set(_changed_paths_from_workspace_result(output))
+    if not changed_paths:
+        return
+    state.action_failure_evidence = [
+        evidence
+        for evidence in state.action_failure_evidence
+        if evidence.path not in changed_paths
+    ]
+
+
+def _format_action_failure_evidence(evidence: _ActionFailureEvidence) -> str:
+    """Format one already bounded controlled-action failure item."""
+
+    path = evidence.path if evidence.path is not None else "unavailable"
+    return (
+        f"tool={evidence.tool_name}, path={path}, phase={evidence.phase.value}, "
+        f"attempt={evidence.attempt_number}, error={evidence.error_message}"
+    )
 
 
 def _bounded_discovery_evidence(
@@ -1100,12 +1417,6 @@ def _is_safe_prompt_path(path: str) -> bool:
     )
 
 
-def _sanitize_repair_output(output: str) -> str:
-    """Bound and redact validation output before placing it in a repair prompt."""
-
-    return _sanitize_prompt_text(output)[:MAX_REPAIR_OUTPUT_CHARACTERS]
-
-
 def _bounded_prompt_summary(text: str) -> str:
     """Return one sanitized single-line bounded model summary."""
 
@@ -1114,15 +1425,59 @@ def _bounded_prompt_summary(text: str) -> str:
 
 
 def _sanitize_prompt_text(text: str) -> str:
-    """Redact sensitive lines and absolute paths from model-facing text."""
+    """Conservatively redact generic non-validation model-facing text."""
+
+    return _sanitize_model_facing_lines(
+        text,
+        _generic_prompt_line_is_sensitive,
+    )
+
+
+def _sanitize_validation_output(text: str) -> str:
+    """Redact validation credentials while preserving safe runtime identifiers."""
+
+    return _sanitize_model_facing_lines(
+        text,
+        _validation_output_line_is_sensitive,
+    )
+
+
+def _sanitize_model_facing_lines(
+    text: str,
+    sensitive_line: Callable[[str], bool],
+) -> str:
+    """Apply one explicit line policy and the shared absolute-path boundary."""
 
     safe_lines = []
     for line in text.splitlines():
-        if _SENSITIVE_LINE_PATTERN.search(line):
+        if sensitive_line(line):
             safe_lines.append("[redacted sensitive content]")
         else:
             safe_lines.append(_ABSOLUTE_PATH_PATTERN.sub("[absolute-path]", line))
     return "\n".join(safe_lines)
+
+
+def _generic_prompt_line_is_sensitive(line: str) -> bool:
+    """Preserve the conservative generic sensitive-line policy."""
+
+    return _GENERIC_SENSITIVE_LINE_PATTERN.search(line) is not None
+
+
+def _validation_output_line_is_sensitive(line: str) -> bool:
+    """Identify credentials without treating every token identifier as secret."""
+
+    if (
+        _VALIDATION_ENV_REFERENCE_PATTERN.search(line)
+        or _VALIDATION_AUTHORIZATION_BEARER_PATTERN.search(line)
+        or _VALIDATION_BEARER_VALUE_PATTERN.search(line)
+        or _VALIDATION_OBVIOUS_SECRET_VALUE_PATTERN.search(line)
+    ):
+        return True
+    return any(
+        _VALIDATION_CREDENTIAL_NAME_PATTERN.fullmatch(assignment.group("name"))
+        is not None
+        for assignment in _VALIDATION_ASSIGNMENT_PATTERN.finditer(line)
+    )
 
 
 def _workspace_change_result_applied(

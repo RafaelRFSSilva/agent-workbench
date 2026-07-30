@@ -444,6 +444,7 @@ def _prompt_for_tool_approval(
 
     if tool_name in {
         "apply_file_patch",
+        "apply_file_rewrite",
         "apply_text_replacement",
     } and isinstance(preview, dict):
         print(f"  Path: {preview.get('path', '[unavailable]')}")
@@ -584,6 +585,17 @@ def _trace_arguments(invocation) -> object:
     """Return safe trace arguments with patch contents replaced by byte counts."""
 
     arguments = invocation.arguments
+    if invocation.tool_name == "apply_file_rewrite":
+        return {
+            "path": arguments.get("path"),
+            "replacement_content_bytes": _utf8_byte_count(
+                arguments.get("replacement_content"),
+            ),
+            "expected_file_sha256_present": isinstance(
+                arguments.get("expected_file_sha256"),
+                str,
+            ),
+        }
     if invocation.tool_name == "apply_text_replacement":
         return {
             "path": arguments.get("path"),

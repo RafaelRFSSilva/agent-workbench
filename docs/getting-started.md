@@ -602,14 +602,15 @@ uv run agent-workbench \
 six read-only workspace tools:
 
 1. `apply_file_patch`
-2. `apply_text_replacement`
-3. `apply_workspace_changes`
-4. `run_ruff_format`
-5. `run_ruff_check`
-6. `run_pytest`
+2. `apply_file_rewrite`
+3. `apply_text_replacement`
+4. `apply_workspace_changes`
+5. `run_ruff_format`
+6. `run_ruff_check`
+7. `run_pytest`
 
 When the calculator is also enabled it remains first, followed by the six
-read-only tools and these six actions.
+read-only tools and these seven actions.
 
 Every action displays an informed preview and asks:
 
@@ -633,6 +634,14 @@ symlinks and never target `.git`.
 Patch content and existing files are limited to 100 KiB, one patch may change
 at most 500 removed/added lines, and the complete preview must fit within
 64 KiB without truncation.
+
+Use `apply_file_rewrite` for a whole-file replacement of an existing file.
+First call `read_file` for the complete file; do not construct the replacement
+from a partial line-range read. Pass the SHA-256 from that complete latest read
+and the complete resulting file as `replacement_content`. The action cannot
+create a file. It internally verifies the SHA, shows the complete diff,
+revalidates after approval, atomically replaces the file, and preserves its
+permissions.
 
 Use `apply_text_replacement` for a small exact edit to an existing file after
 reading that file. Its closed input shape is:
@@ -708,11 +717,12 @@ Suggested request:
 
 ```text
 Inspect the relevant files. Prefer apply_text_replacement for small exact
-edits to existing files, using the SHA-256 returned by read_file. For changes
-that must succeed together, request one apply_workspace_changes transaction
-with complete expected and replacement content for every file. Request
-approval before every write or validation action, run Ruff and pytest, inspect
-the final Git status and diff, and
+edits to existing files. Before a whole-file change, call read_file for the
+complete file, then use apply_file_rewrite with that complete read's SHA and
+the complete resulting file. For changes that must succeed together, request
+one apply_workspace_changes transaction with complete expected and replacement
+content for every file. Request approval before every write or validation
+action, run Ruff and pytest, inspect the final Git status and diff, and
 summarize the result. Do not commit or push.
 ```
 

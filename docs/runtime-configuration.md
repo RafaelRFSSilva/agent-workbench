@@ -751,9 +751,11 @@ asynchronous definitions through `is_async` while accepting only `any`,
 `class`, `function`, or `method` as its `kind`.
 
 `--enable-actions` is a separate default-false authorization and requires the
-workspace root. It appends `apply_file_patch`, `apply_text_replacement`,
-`apply_workspace_changes`, `run_ruff_format`, `run_ruff_check`, and
-`run_pytest` in that order. It does
+workspace root. It appends `apply_file_patch`, `apply_file_rewrite`,
+`apply_text_replacement`, `apply_workspace_changes`, `run_ruff_format`,
+`run_ruff_check`, and `run_pytest` in that order. `apply_file_patch` may create
+a file, `apply_file_rewrite` replaces only an existing complete file, and
+`apply_text_replacement` performs a short exact literal edit. Authorization does
 not store approval callbacks or terminal functions in
 `RuntimeConfiguration`; the CLI owns the default-deny, one-use approval
 prompt. Interactive setup keeps actions false without asking another

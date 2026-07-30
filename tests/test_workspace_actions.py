@@ -19,6 +19,7 @@ from agent_workbench.tools import (
 from agent_workbench.workspace import Workspace
 from agent_workbench.workspace_actions import (
     APPLY_FILE_PATCH_DEFINITION,
+    APPLY_FILE_REWRITE_DEFINITION,
     APPLY_TEXT_REPLACEMENT_DEFINITION,
     APPLY_WORKSPACE_CHANGES_DEFINITION,
     MAX_CHANGED_LINES,
@@ -30,9 +31,11 @@ from agent_workbench.workspace_actions import (
     MAX_TRANSACTION_FILES,
     MAX_TRANSACTION_REPLACEMENT_BYTES,
     apply_file_patch,
+    apply_file_rewrite,
     apply_text_replacement,
     apply_workspace_changes,
     preview_file_patch,
+    preview_file_rewrite,
     preview_text_replacement,
     preview_workspace_changes,
     register_workspace_action_tools,
@@ -103,6 +106,26 @@ def text_replacement_arguments(
     if occurrences is not None:
         arguments["expected_occurrences"] = occurrences
     return arguments
+
+
+def file_rewrite_arguments(
+    *,
+    path: str = "module.py",
+    file_content: str = "value = 1\n",
+    replacement: str = "value = 2\n",
+    expected_sha256: str | None = None,
+) -> dict[str, object]:
+    """Create one valid SHA-guarded whole-file rewrite mapping."""
+
+    return {
+        "path": path,
+        "expected_file_sha256": (
+            expected_sha256
+            if expected_sha256 is not None
+            else hashlib.sha256(file_content.encode("utf-8")).hexdigest()
+        ),
+        "replacement_content": replacement,
+    }
 
 
 def transaction_arguments(
@@ -209,6 +232,7 @@ def test_registration_preserves_existing_tools_and_exact_definition(
     assert registry.definitions == (
         existing,
         APPLY_FILE_PATCH_DEFINITION,
+        APPLY_FILE_REWRITE_DEFINITION,
         APPLY_TEXT_REPLACEMENT_DEFINITION,
         APPLY_WORKSPACE_CHANGES_DEFINITION,
     )
@@ -233,6 +257,31 @@ def test_registration_preserves_existing_tools_and_exact_definition(
             id="patch",
             tool_name="apply_file_patch",
             arguments=patch_arguments(),
+        )
+    )
+    assert APPLY_FILE_REWRITE_DEFINITION.name == "apply_file_rewrite"
+    assert APPLY_FILE_REWRITE_DEFINITION.input_schema == {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string"},
+            "expected_file_sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$",
+            },
+            "replacement_content": {"type": "string"},
+        },
+        "required": [
+            "path",
+            "expected_file_sha256",
+            "replacement_content",
+        ],
+        "additionalProperties": False,
+    }
+    assert registry.requires_approval(
+        ToolInvocation(
+            id="rewrite",
+            tool_name="apply_file_rewrite",
+            arguments=file_rewrite_arguments(),
         )
     )
     assert APPLY_TEXT_REPLACEMENT_DEFINITION.name == "apply_text_replacement"
@@ -313,6 +362,227 @@ def test_existing_file_preview_is_complete_deterministic_and_non_mutating(
     )
     assert str(root) not in first["diff"]
     assert target.read_text(encoding="utf-8") == "value = 1\n"
+
+
+def test_file_rewrite_preview_and_apply_use_sha_without_expected_content(
+    tmp_path: Path,
+) -> None:
+    """Preview the complete diff and atomically rewrite one existing file."""
+
+    root, workspace = create_workspace(tmp_path)
+    target = root / "module.py"
+    target.write_text("value = 1\n", encoding="utf-8")
+    arguments = file_rewrite_arguments()
+
+    preview = preview_file_rewrite(workspace, arguments)
+
+    assert preview == {
+        "path": "module.py",
+        "operation": "update",
+        "old_size_bytes": 10,
+        "new_size_bytes": 10,
+        "changed_lines": 2,
+        "diff": (
+            "--- a/module.py\n+++ b/module.py\n@@ -1 +1 @@\n-value = 1\n+value = 2\n"
+        ),
+    }
+    assert "expected_content" not in arguments
+    assert target.read_text(encoding="utf-8") == "value = 1\n"
+
+    result = apply_file_rewrite(workspace, arguments)
+
+    assert result == {
+        "path": "module.py",
+        "operation": "update",
+        "old_size_bytes": 10,
+        "new_size_bytes": 10,
+        "changed_lines": 2,
+    }
+    assert target.read_text(encoding="utf-8") == "value = 2\n"
+
+
+def test_file_rewrite_rejects_stale_sha_without_mutation(tmp_path: Path) -> None:
+    """Reject stale optimistic state before preview or execution."""
+
+    root, workspace = create_workspace(tmp_path)
+    target = root / "module.py"
+    target.write_text("value = 1\n", encoding="utf-8")
+    arguments = file_rewrite_arguments(expected_sha256="0" * 64)
+
+    with pytest.raises(ValueError, match="expected_file_sha256 does not match"):
+        preview_file_rewrite(workspace, arguments)
+    with pytest.raises(ValueError, match="expected_file_sha256 does not match"):
+        apply_file_rewrite(workspace, arguments)
+
+    assert target.read_text(encoding="utf-8") == "value = 1\n"
+
+
+def test_file_rewrite_rechecks_sha_after_approval(tmp_path: Path) -> None:
+    """Reject a concurrent mutation between complete preview and execution."""
+
+    root, workspace = create_workspace(tmp_path)
+    target = root / "module.py"
+    target.write_text("value = 1\n", encoding="utf-8")
+    registry = ToolRegistry()
+    register_workspace_action_tools(registry, workspace)
+    provider = FakeProvider(
+        [
+            ChatResponse(
+                tool_invocations=(
+                    ToolInvocation(
+                        id="rewrite",
+                        tool_name="apply_file_rewrite",
+                        arguments=file_rewrite_arguments(),
+                    ),
+                )
+            ),
+            ChatResponse(text="Handled failure."),
+        ]
+    )
+
+    def approve_after_change(_request):
+        target.write_text("concurrent = True\n", encoding="utf-8")
+        return ToolApprovalDecision.APPROVE
+
+    run_tool_calling_loop(
+        provider,
+        ChatRequest(messages=[]),
+        registry,
+        max_tool_rounds=1,
+        tool_approval_handler=approve_after_change,
+    )
+
+    assert target.read_text(encoding="utf-8") == "concurrent = True\n"
+
+
+def test_file_rewrite_preserves_exact_permissions(tmp_path: Path) -> None:
+    """Preserve the existing regular file mode across atomic replacement."""
+
+    root, workspace = create_workspace(tmp_path)
+    target = root / "module.py"
+    target.write_text("value = 1\n", encoding="utf-8")
+    target.chmod(0o751)
+
+    apply_file_rewrite(workspace, file_rewrite_arguments())
+
+    assert stat.S_IMODE(target.stat().st_mode) == 0o751
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/tmp/outside.py",
+        "../outside.py",
+        ".git/config",
+        "missing/module.py",
+        "missing.py",
+    ],
+)
+def test_file_rewrite_rejects_unsafe_and_missing_paths(
+    tmp_path: Path,
+    path: str,
+) -> None:
+    """Allow only existing contained regular-file targets."""
+
+    root, workspace = create_workspace(tmp_path)
+    (root / "module.py").write_text("value = 1\n", encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        preview_file_rewrite(
+            workspace,
+            file_rewrite_arguments(path=path),
+        )
+
+    assert (root / "module.py").read_text(encoding="utf-8") == "value = 1\n"
+
+
+def test_file_rewrite_rejects_symlinks_without_mutation(tmp_path: Path) -> None:
+    """Never follow a symlink target or parent for whole-file rewrites."""
+
+    root, workspace = create_workspace(tmp_path)
+    target = root / "module.py"
+    target.write_text("value = 1\n", encoding="utf-8")
+    (root / "linked.py").symlink_to(target)
+
+    with pytest.raises(ValueError, match="symlink"):
+        preview_file_rewrite(
+            workspace,
+            file_rewrite_arguments(path="linked.py"),
+        )
+
+    assert target.read_text(encoding="utf-8") == "value = 1\n"
+
+
+@pytest.mark.parametrize(
+    "sha256",
+    [
+        "",
+        "0" * 63,
+        "0" * 65,
+        "G" * 64,
+        "A" * 64,
+        1,
+    ],
+)
+def test_file_rewrite_rejects_invalid_sha(tmp_path: Path, sha256: object) -> None:
+    """Require exactly 64 lowercase hexadecimal digest characters."""
+
+    root, workspace = create_workspace(tmp_path)
+    target = root / "module.py"
+    target.write_text("value = 1\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="64 lowercase hexadecimal"):
+        preview_file_rewrite(
+            workspace,
+            file_rewrite_arguments(expected_sha256=sha256),  # type: ignore[arg-type]
+        )
+
+    assert target.read_text(encoding="utf-8") == "value = 1\n"
+
+
+def test_file_rewrite_preserves_utf8_nul_size_changed_line_and_diff_limits(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Reuse every bounded content and complete-preview boundary."""
+
+    root, workspace = create_workspace(tmp_path)
+    target = root / "module.py"
+    target.write_text("value = 1\n", encoding="utf-8")
+    digest = hashlib.sha256(b"value = 1\n").hexdigest()
+
+    for replacement in (
+        "\ud800",
+        "bad\0content",
+        "x" * (MAX_PATCH_CONTENT_BYTES + 1),
+        "".join("x\n" for _ in range(MAX_CHANGED_LINES + 1)),
+    ):
+        with pytest.raises(ValueError):
+            preview_file_rewrite(
+                workspace,
+                file_rewrite_arguments(
+                    replacement=replacement,
+                    expected_sha256=digest,
+                ),
+            )
+        assert target.read_text(encoding="utf-8") == "value = 1\n"
+
+    target.write_bytes(b"\xff")
+    with pytest.raises(ValueError, match="valid UTF-8"):
+        preview_file_rewrite(
+            workspace,
+            file_rewrite_arguments(
+                file_content="",
+                expected_sha256=hashlib.sha256(b"\xff").hexdigest(),
+            ),
+        )
+    target.write_text("value = 1\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "agent_workbench.workspace_actions.MAX_PATCH_PREVIEW_BYTES",
+        8,
+    )
+    with pytest.raises(ValueError, match="preview"):
+        preview_file_rewrite(workspace, file_rewrite_arguments())
 
 
 def test_new_file_preview_uses_dev_null_without_creating_file(
@@ -1110,6 +1380,7 @@ def test_transaction_registration_uses_exact_closed_nested_schema(
 
     assert registry.definitions == (
         APPLY_FILE_PATCH_DEFINITION,
+        APPLY_FILE_REWRITE_DEFINITION,
         APPLY_TEXT_REPLACEMENT_DEFINITION,
         APPLY_WORKSPACE_CHANGES_DEFINITION,
     )

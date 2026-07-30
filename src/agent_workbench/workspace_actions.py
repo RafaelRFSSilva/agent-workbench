@@ -65,6 +65,30 @@ APPLY_FILE_PATCH_DEFINITION = ToolDefinition(
     },
 )
 
+APPLY_FILE_REWRITE_DEFINITION = ToolDefinition(
+    name="apply_file_rewrite",
+    description=(
+        "Rewrite one existing UTF-8 file using the SHA-256 digest from read_file."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "path": {"type": "string"},
+            "expected_file_sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$",
+            },
+            "replacement_content": {"type": "string"},
+        },
+        "required": [
+            "path",
+            "expected_file_sha256",
+            "replacement_content",
+        ],
+        "additionalProperties": False,
+    },
+)
+
 APPLY_TEXT_REPLACEMENT_DEFINITION = ToolDefinition(
     name="apply_text_replacement",
     description=(
@@ -233,6 +257,15 @@ def register_workspace_action_tools(
         approval_preview=lambda arguments: preview_file_patch(workspace, arguments),
     )
     registry.register(
+        APPLY_FILE_REWRITE_DEFINITION,
+        lambda arguments: apply_file_rewrite(workspace, arguments),
+        requires_approval=True,
+        approval_preview=lambda arguments: preview_file_rewrite(
+            workspace,
+            arguments,
+        ),
+    )
+    registry.register(
         APPLY_TEXT_REPLACEMENT_DEFINITION,
         lambda arguments: apply_text_replacement(workspace, arguments),
         requires_approval=True,
@@ -289,6 +322,30 @@ def apply_file_patch(
     else:
         _replace_file_atomically(workspace, patch)
 
+    return patch.metadata()
+
+
+def preview_file_rewrite(
+    workspace: Workspace,
+    arguments: object,
+) -> JSONObject:
+    """Validate one SHA-guarded rewrite and return its complete approval preview."""
+
+    patch = _prepare_file_rewrite(workspace, arguments)
+    return {
+        **patch.metadata(),
+        "diff": patch.diff,
+    }
+
+
+def apply_file_rewrite(
+    workspace: Workspace,
+    arguments: object,
+) -> JSONObject:
+    """Revalidate and atomically rewrite one existing file by current SHA."""
+
+    patch = _prepare_file_rewrite(workspace, arguments)
+    _replace_file_atomically(workspace, patch)
     return patch.metadata()
 
 
@@ -548,6 +605,71 @@ def _prepare_text_replacement(
     )
 
 
+def _prepare_file_rewrite(
+    workspace: Workspace,
+    arguments: object,
+) -> _PreparedPatch:
+    """Read, SHA-check, and prepare one complete existing-file replacement."""
+
+    path, expected_file_sha256, replacement_content = _get_file_rewrite_arguments(
+        arguments
+    )
+    try:
+        replacement_bytes = _encode_patch_content(
+            "replacement_content",
+            replacement_content,
+        )
+        target, relative_path, target_status = _resolve_write_target(workspace, path)
+    except ValueError as exc:
+        raise _as_file_rewrite_error(exc) from None
+    if target_status is None:
+        raise ValueError("apply_file_rewrite target does not exist.")
+
+    try:
+        old_bytes = _read_existing_file(target, target_status)
+    except ValueError as exc:
+        raise _as_file_rewrite_error(exc) from None
+    if hashlib.sha256(old_bytes).hexdigest() != expected_file_sha256:
+        raise ValueError(
+            "apply_file_rewrite expected_file_sha256 does not match the current file."
+        )
+
+    try:
+        old_content = old_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError("apply_file_rewrite requires valid UTF-8.") from None
+
+    changed_lines = _count_changed_lines(old_content, replacement_content)
+    if changed_lines > MAX_CHANGED_LINES:
+        raise ValueError(
+            f"file rewrite exceeds the {MAX_CHANGED_LINES}-changed-line limit."
+        )
+    diff = _create_unified_diff(
+        relative_path,
+        old_content,
+        replacement_content,
+        operation="update",
+    )
+    if len(diff.encode("utf-8")) > MAX_PATCH_PREVIEW_BYTES:
+        raise ValueError(
+            "complete file rewrite preview exceeds the "
+            f"{MAX_PATCH_PREVIEW_BYTES}-byte limit."
+        )
+
+    return _PreparedPatch(
+        target=target,
+        relative_path=relative_path,
+        operation="update",
+        expected_content=old_content,
+        replacement_content=replacement_content,
+        old_size_bytes=len(old_bytes),
+        new_size_bytes=len(replacement_bytes),
+        changed_lines=changed_lines,
+        diff=diff,
+        existing_mode=stat.S_IMODE(target_status.st_mode),
+    )
+
+
 def _prepare_workspace_change_plan(
     workspace: Workspace,
     arguments: object,
@@ -707,6 +829,43 @@ def _get_text_replacement_arguments(
     )
 
 
+def _get_file_rewrite_arguments(
+    arguments: object,
+) -> tuple[str, str, str]:
+    """Validate one closed SHA-guarded whole-file rewrite argument object."""
+
+    required = {
+        "path",
+        "expected_file_sha256",
+        "replacement_content",
+    }
+    if not isinstance(arguments, dict) or set(arguments) != required:
+        raise ValueError(
+            "apply_file_rewrite requires path, expected_file_sha256, "
+            "and replacement_content."
+        )
+
+    path = arguments["path"]
+    expected_file_sha256 = arguments["expected_file_sha256"]
+    replacement_content = arguments["replacement_content"]
+    if not isinstance(path, str):
+        raise ValueError("apply_file_rewrite path must be a string.")
+    if (
+        not isinstance(expected_file_sha256, str)
+        or len(expected_file_sha256) != 64
+        or any(
+            character not in "0123456789abcdef" for character in expected_file_sha256
+        )
+    ):
+        raise ValueError(
+            "apply_file_rewrite expected_file_sha256 must contain "
+            "64 lowercase hexadecimal characters."
+        )
+    if not isinstance(replacement_content, str):
+        raise ValueError("apply_file_rewrite replacement_content must be a string.")
+    return path, expected_file_sha256, replacement_content
+
+
 def _get_patch_arguments(
     arguments: object,
     *,
@@ -773,6 +932,16 @@ def _as_text_replacement_error(error: ValueError) -> ValueError:
     patch_prefix = "apply_file_patch"
     if message.startswith(patch_prefix):
         message = "apply_text_replacement" + message[len(patch_prefix) :]
+    return ValueError(message)
+
+
+def _as_file_rewrite_error(error: ValueError) -> ValueError:
+    """Rewrite shared patch diagnostics for the whole-file rewrite action."""
+
+    message = str(error)
+    patch_prefix = "apply_file_patch"
+    if message.startswith(patch_prefix):
+        message = "apply_file_rewrite" + message[len(patch_prefix) :]
     return ValueError(message)
 
 

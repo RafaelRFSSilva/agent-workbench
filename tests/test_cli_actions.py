@@ -136,6 +136,33 @@ def test_text_replacement_approval_renders_occurrence_count_and_complete_diff(
     assert "+new" in output
 
 
+def test_file_rewrite_approval_renders_complete_diff(monkeypatch, capsys) -> None:
+    """Render whole-file rewrite metadata and its complete diff."""
+
+    monkeypatch.setattr("builtins.input", lambda _prompt: "y")
+
+    decision = _prompt_for_tool_approval(
+        approval_request(
+            "apply_file_rewrite",
+            {
+                "path": "module.py",
+                "operation": "update",
+                "old_size_bytes": 4,
+                "new_size_bytes": 4,
+                "changed_lines": 2,
+                "diff": "--- a/module.py\n+++ b/module.py\n-old\n+new\n",
+            },
+        )
+    )
+
+    output = capsys.readouterr().out
+    assert decision is ToolApprovalDecision.APPROVE
+    assert "Action approval required: apply_file_rewrite" in output
+    assert "Path: module.py" in output
+    assert "Complete diff:" in output
+    assert "+new" in output
+
+
 @pytest.mark.parametrize("failure", [EOFError(), KeyboardInterrupt()])
 def test_cli_approval_input_interruption_denies(
     monkeypatch,
@@ -689,6 +716,45 @@ def test_text_replacement_trace_redacts_fragments_but_keeps_safe_metadata(
     assert '"expected_file_sha256_present":true' in output
     assert '"occurrences_replaced":1' in output
     assert "0000000000000000" not in output
+
+
+def test_file_rewrite_trace_redacts_content_but_keeps_safe_metadata(capsys) -> None:
+    """Never expose replacement content or the exact digest in normal traces."""
+
+    invocation = ToolInvocation(
+        id="rewrite",
+        tool_name="apply_file_rewrite",
+        arguments={
+            "path": "module.py",
+            "expected_file_sha256": "0" * 64,
+            "replacement_content": "SECRET-NEW",
+        },
+    )
+    round_ = ToolInteractionRound(
+        response=ChatResponse(tool_invocations=(invocation,)),
+        results=(
+            ToolResult(
+                invocation_id="rewrite",
+                status="success",
+                output={
+                    "path": "module.py",
+                    "operation": "update",
+                    "old_size_bytes": 10,
+                    "new_size_bytes": 10,
+                    "changed_lines": 2,
+                },
+            ),
+        ),
+    )
+
+    _display_tool_round(round_)
+
+    output = capsys.readouterr().out
+    assert "SECRET-NEW" not in output
+    assert "0000000000000000" not in output
+    assert '"path":"module.py"' in output
+    assert '"replacement_content_bytes":10' in output
+    assert '"expected_file_sha256_present":true' in output
 
 
 def test_main_forwards_action_mode_only_when_enabled(

@@ -23,9 +23,12 @@ repository-lifecycle changes.
 4. Launch the complete isolated autonomous workflow.
 5. Let the bounded read-only DISCOVER phase inspect repository and named files.
 6. Prefer `apply_text_replacement` for each small exact edit to an existing
-   file, using the SHA-256 returned by `read_file`. Use one
-   `apply_workspace_changes` transaction when several file changes must succeed
-   together or when creation or complete-content replacement is required.
+   file, using a short literal copied exactly from the latest file. Use
+   `apply_file_rewrite` only after calling `read_file` for the complete file;
+   use that complete latest read's SHA-256 and send the complete resulting
+   file. Never construct a whole-file rewrite from a partial line-range read.
+   Use one `apply_workspace_changes` transaction when several file changes
+   must succeed together or when creation is required.
 7. Review every complete action preview and diff.
 8. Approve the controller-invoked Ruff format, Ruff check, and pytest sequence
    separately. The target is always `"."` in v1.
@@ -50,6 +53,15 @@ tool-round budget, a successful approved change can still advance to
 validation. Without a change, the controller consumes one of the existing two
 bounded completion continuations and states the exhaustion reason. Unrelated
 completion errors remain terminal.
+
+Failed controlled actions are carried into later EDIT and REPAIR prompts as
+bounded safe evidence. The model is told that the workspace did not change and
+must reread the target. Failed validation enters REPAIR with every failed tool
+name, status, exit code, and bounded sanitized stdout and stderr excerpt.
+Assertion details and dynamic runtime requirements remain visible unless they
+match a credential, `.env`, or private-path boundary. Generic objectives,
+summaries, discovery, and action failures retain a separate, more conservative
+sensitive-line boundary.
 
 ## Recommended launch command
 
@@ -100,9 +112,12 @@ Use the existing test conventions:
 2. Add or update focused tests together with the smallest implementation
    change when the objective requires them.
 3. Prefer apply_text_replacement for small exact edits to existing files,
-   using the SHA-256 returned by read_file. Use one apply_workspace_changes
-   transaction when several changes must succeed together or complete-content
-   replacement is necessary.
+   using a short literal copied exactly from the latest file. Use
+   apply_file_rewrite only after read_file returns the complete file. Use the
+   SHA from that complete latest read, and send the complete resulting file as
+   replacement_content. Never base a whole-file rewrite on a partial line-range
+   read. Use one apply_workspace_changes transaction when several changes must
+   succeed together.
 4. Wait for operator approval before every write action.
 5. Implement only the smallest correct change.
 6. Do not restart broad discovery during EDIT or REPAIR.
@@ -111,8 +126,9 @@ Request at most one effectful tool per response. Wait for approval before
 every effectful action. Do not request validation or Git verification tools:
 the controller withholds them during model-facing phases and invokes them
 itself in the fixed order Ruff format, Ruff check, pytest, Git status, Git
-diff. If validation fails, use the bounded REPAIR evidence to make another
-controlled change. Do not weaken tests or validation. Do not independently
+diff. If validation fails, resolve every listed failure and dynamic runtime
+requirement in the bounded REPAIR evidence, then make another controlled
+change. Do not weaken tests or validation. Do not independently
 request Git commit, push, merge, branch deletion, reset, restore, clean, or
 stash. Do not use multiple effectful actions in one response.
 
@@ -134,6 +150,8 @@ private paths, or `.env` values in the task prompt or commit message.
 
 ### Workspace change approval
 
+- For `apply_file_rewrite`, the path is an intended existing file, the SHA came
+  from the latest read, and the complete replacement diff is exact.
 - For `apply_text_replacement`, the path is allowed, the expected literal
   fragment is sufficiently specific, the expected occurrence count is correct,
   and the complete diff contains only the intended edit.
@@ -213,10 +231,11 @@ The implemented regression battery uses scripted providers and real temporary
 Git repositories. It deterministically proves phase progression, edit
 continuations (including maximum-tool-round recovery), bounded cross-phase
 discovery evidence, ordered acceptance criteria, validation-driven repair, the
-repair limit, false completion rejection, generated-directory filtering,
-read-only untracked Git evidence, untracked-only DONE, isolated new-file
-commits, and the final diff gate. Automated tests do not call Ollama or any
-paid/cloud provider.
+repair limit, bounded cross-send action failures, simultaneous assertion and
+dynamic runtime evidence, SHA-guarded whole-file repair, false completion
+rejection, generated-directory filtering, read-only untracked Git evidence,
+untracked-only DONE, isolated new-file commits, and the final diff gate.
+Automated tests do not call Ollama or any paid/cloud provider.
 
 Those tests validate controller behavior, not local-model capability. A prior
 manual benchmark with `qwen3-coder:30b` through Ollama exercised the earlier
