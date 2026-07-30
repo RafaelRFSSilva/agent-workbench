@@ -184,6 +184,7 @@ def run_tool_calling_loop(
     request: ChatRequest,
     registry: ToolRegistry,
     max_tool_rounds: int,
+    allowed_tool_names: frozenset[str] | None = None,
     tool_round_observer: ToolRoundObserver | None = None,
     tool_approval_handler: ToolApprovalHandler | None = None,
     recover_approval_preview_errors: bool = False,
@@ -301,7 +302,10 @@ def run_tool_calling_loop(
         approval_required = tuple(
             invocation
             for invocation in response.tool_invocations
-            if registry.requires_approval(invocation)
+            if (
+                allowed_tool_names is None or invocation.tool_name in allowed_tool_names
+            )
+            and registry.requires_approval(invocation)
         )
 
         if approval_required:
@@ -360,7 +364,21 @@ def run_tool_calling_loop(
                 raise CompletionError("Tool approval decision is invalid.")
 
         results = tuple(
-            registry.execute(invocation) for invocation in response.tool_invocations
+            (
+                registry.execute(invocation)
+                if (
+                    allowed_tool_names is None
+                    or invocation.tool_name in allowed_tool_names
+                )
+                else ToolResult(
+                    invocation_id=invocation.id,
+                    status="error",
+                    error=(
+                        f"Tool '{invocation.tool_name}' is not allowed for this send."
+                    ),
+                )
+            )
+            for invocation in response.tool_invocations
         )
         completed_round = ToolInteractionRound(
             response=response,

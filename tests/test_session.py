@@ -23,7 +23,7 @@ from agent_workbench.session import AgentSession, SessionId, SessionStatus
 from agent_workbench.structured_outputs import JSONResponseFormat
 from agent_workbench.tasks import TaskSpec
 from agent_workbench.tool_registry import ToolRegistry
-from agent_workbench.tools import ToolDefinition, ToolInvocation
+from agent_workbench.tools import ToolDefinition, ToolInvocation, ToolResult
 
 type ProviderOutcome = ChatResponse | Exception | Callable[[ChatRequest], ChatResponse]
 
@@ -366,6 +366,120 @@ def test_tool_send_executes_round_forwards_observer_and_commits_final_text() -> 
     )
     assert session.status is SessionStatus.READY
     assert registry.definitions == (definition,)
+
+
+def test_send_exposes_only_allowed_tools_for_one_call() -> None:
+    """Filter provider-visible tools without changing the configured registry."""
+
+    calculator = calculator_definition()
+    withheld = ToolDefinition(
+        name="withheld",
+        description="A tool withheld from this phase.",
+        input_schema={
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+    )
+    registry = ToolRegistry()
+    executions = []
+    registry.register(
+        calculator,
+        lambda arguments: executions.append(arguments) or {"result": 4},
+    )
+    registry.register(withheld, lambda arguments: {"unexpected": True})
+    provider = FakeProvider([tool_response(), ChatResponse(text="Done.")])
+    session = AgentSession(
+        id=SessionId("session-1"),
+        provider=provider,
+        tool_registry=registry,
+    )
+
+    session.send("Calculate.", allowed_tool_names={"calculator"})
+
+    assert provider.requests[0].tools == (calculator,)
+    assert executions == [{"expression": "2 + 2"}]
+    assert registry.definitions == (calculator, withheld)
+
+
+def test_disallowed_tool_invocation_is_observed_and_never_executes() -> None:
+    """Return safe phase evidence when a provider requests a withheld tool."""
+
+    executions = []
+    registry = ToolRegistry()
+    registry.register(
+        calculator_definition(),
+        lambda arguments: executions.append(arguments) or {"result": 4},
+    )
+    requested = tool_response()
+    observed: list[ToolInteractionRound] = []
+    provider = FakeProvider([requested, ChatResponse(text="Unavailable.")])
+    session = AgentSession(
+        id=SessionId("session-1"),
+        provider=provider,
+        tool_registry=registry,
+    )
+
+    result = session.send(
+        "Do not calculate.",
+        allowed_tool_names=set(),
+        tool_round_observer=observed.append,
+    )
+
+    assert result.text == "Unavailable."
+    assert provider.requests[0].tools == ()
+    assert executions == []
+    assert observed == [
+        ToolInteractionRound(
+            response=requested,
+            results=(
+                ToolResult(
+                    invocation_id="call-1",
+                    status="error",
+                    error="Tool 'calculator' is not allowed for this send.",
+                ),
+            ),
+        )
+    ]
+
+
+def test_per_send_tool_round_limit_preserves_default_and_later_sends() -> None:
+    """Keep a one-call round limit from mutating the session configuration."""
+
+    executions = []
+    registry = ToolRegistry()
+    registry.register(
+        calculator_definition(),
+        lambda arguments: executions.append(arguments) or {"result": 4},
+    )
+    provider = FakeProvider(
+        [
+            tool_response("limited-1"),
+            tool_response("limited-2"),
+            tool_response("normal-1"),
+            tool_response("normal-2"),
+            ChatResponse(text="Completed normally."),
+        ]
+    )
+    session = AgentSession(
+        id=SessionId("session-1"),
+        provider=provider,
+        tool_registry=registry,
+        max_tool_rounds=3,
+    )
+
+    with pytest.raises(CompletionError, match="maximum number"):
+        session.send("Limited.", max_tool_rounds=1)
+
+    result = session.send("Normal.")
+
+    assert result.text == "Completed normally."
+    assert session.max_tool_rounds == 3
+    assert len(executions) == 3
+    assert session.messages == (
+        {"role": "user", "content": "Normal."},
+        {"role": "assistant", "content": "Completed normally."},
+    )
 
 
 def test_handler_error_remains_a_tool_result_and_can_complete() -> None:
