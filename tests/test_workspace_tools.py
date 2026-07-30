@@ -9,7 +9,10 @@ import pytest
 from agent_workbench.errors import ToolArgumentError, WorkspacePathError
 from agent_workbench.tool_registry import ToolRegistry
 from agent_workbench.tools import ToolDefinition, ToolInvocation
-from agent_workbench.workspace import Workspace
+from agent_workbench.workspace import (
+    DEFAULT_IGNORED_TRAVERSAL_DIRECTORY_NAMES,
+    Workspace,
+)
 from agent_workbench.workspace_tools import (
     MAX_DIRECTORY_ENTRIES,
     MAX_FILE_SIZE_BYTES,
@@ -310,6 +313,43 @@ def test_lists_recursive_entries_in_complete_path_order(tmp_path: Path) -> None:
         "alpha/beta",
     ]
     assert result["entries"][0]["type"] == "directory"
+
+
+def test_recursive_listing_and_search_skip_generated_directories(
+    tmp_path: Path,
+) -> None:
+    """Omit ignored children while preserving source order and explicit reads."""
+
+    root, workspace = create_workspace(tmp_path)
+    alpha = root / "alpha"
+    alpha.mkdir()
+    (alpha / "source.txt").write_text("needle alpha\n", encoding="utf-8")
+    (root / "zeta.txt").write_text("needle zeta\n", encoding="utf-8")
+    for directory_name in DEFAULT_IGNORED_TRAVERSAL_DIRECTORY_NAMES:
+        ignored = root / directory_name
+        ignored.mkdir()
+        (ignored / "ignored.txt").write_text(
+            f"needle {directory_name}\n",
+            encoding="utf-8",
+        )
+
+    listed = list_workspace_files(workspace, {"path": ".", "depth": 2})
+    searched = search_workspace_text(workspace, {"query": "needle"})
+    explicitly_read = read_workspace_file(
+        workspace,
+        {"path": ".venv/ignored.txt"},
+    )
+
+    assert [entry["path"] for entry in listed["entries"]] == [
+        "alpha",
+        "alpha/source.txt",
+        "zeta.txt",
+    ]
+    assert [match["path"] for match in searched["matches"]] == [
+        "alpha/source.txt",
+        "zeta.txt",
+    ]
+    assert explicitly_read["content"] == "needle .venv\n"
 
 
 def test_lists_through_the_maximum_depth(tmp_path: Path) -> None:

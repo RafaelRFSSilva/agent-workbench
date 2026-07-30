@@ -5,7 +5,10 @@ from pathlib import Path
 import pytest
 
 from agent_workbench.errors import ConfigurationError, WorkspacePathError
-from agent_workbench.workspace import Workspace
+from agent_workbench.workspace import (
+    DEFAULT_IGNORED_TRAVERSAL_DIRECTORY_NAMES,
+    Workspace,
+)
 
 
 def create_workspace(tmp_path: Path) -> tuple[Path, Workspace]:
@@ -15,6 +18,31 @@ def create_workspace(tmp_path: Path) -> tuple[Path, Workspace]:
     root.mkdir()
 
     return root, Workspace(root)
+
+
+def test_default_traversal_directory_policy_is_centralized_and_immutable() -> None:
+    """Define one exact immutable policy for recursive repository inspection."""
+
+    assert DEFAULT_IGNORED_TRAVERSAL_DIRECTORY_NAMES == frozenset(
+        {
+            ".git",
+            ".venv",
+            "venv",
+            "__pycache__",
+            ".pytest_cache",
+            ".ruff_cache",
+            ".mypy_cache",
+            ".tox",
+            ".nox",
+            "node_modules",
+            "dist",
+            "build",
+            ".next",
+            ".turbo",
+            "coverage",
+            "htmlcov",
+        }
+    )
 
 
 def test_workspace_uses_a_canonical_absolute_root(tmp_path: Path) -> None:

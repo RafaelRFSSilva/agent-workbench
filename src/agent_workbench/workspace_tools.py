@@ -154,6 +154,8 @@ def list_workspace_files(
             raise ValueError("Unable to list workspace directory.") from None
 
         for child in children:
+            if child.is_dir() and workspace.is_ignored_traversal_path(child):
+                continue
             entries.append(
                 {
                     "name": child.name,
@@ -258,7 +260,7 @@ def search_workspace_text(
     files_inspected = 0
     truncated = False
 
-    for file_path in _iter_search_files(search_path):
+    for file_path in _iter_search_files(workspace, search_path):
         if files_inspected >= MAX_SEARCH_FILES:
             truncated = True
             break
@@ -456,7 +458,7 @@ def _get_search_arguments(arguments: object) -> tuple[str, Path, bool]:
     return query, Path(path), case_sensitive
 
 
-def _iter_search_files(search_path: Path):
+def _iter_search_files(workspace: Workspace, search_path: Path):
     """Yield regular search files in deterministic relative path order."""
 
     if search_path.is_file():
@@ -467,6 +469,8 @@ def _iter_search_files(search_path: Path):
         raise ToolArgumentError(
             "search_text path must reference a regular file or directory."
         )
+    if workspace.is_ignored_traversal_path(search_path):
+        return
 
     try:
         children = sorted(search_path.iterdir(), key=lambda child: child.name)
@@ -479,8 +483,8 @@ def _iter_search_files(search_path: Path):
 
         if child.is_file():
             yield child
-        elif child.is_dir():
-            yield from _iter_search_files(child)
+        elif child.is_dir() and not workspace.is_ignored_traversal_path(child):
+            yield from _iter_search_files(workspace, child)
 
 
 def _read_search_file(file_path: Path) -> str | None:

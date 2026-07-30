@@ -16,7 +16,10 @@ from agent_workbench.symbol_tools import (
 )
 from agent_workbench.tool_registry import ToolRegistry
 from agent_workbench.tools import ToolDefinition
-from agent_workbench.workspace import Workspace
+from agent_workbench.workspace import (
+    DEFAULT_IGNORED_TRAVERSAL_DIRECTORY_NAMES,
+    Workspace,
+)
 
 
 def create_workspace(tmp_path: Path) -> tuple[Path, Workspace]:
@@ -371,6 +374,40 @@ def test_orders_results_by_path_line_and_qualified_name_without_duplicates(
             for match in first_result["matches"]
         }
     )
+
+
+def test_directory_search_skips_generated_directories_deterministically(
+    tmp_path: Path,
+) -> None:
+    """Inspect ordered source files without entering centralized ignored paths."""
+
+    root, workspace = create_workspace(tmp_path)
+    alpha = root / "alpha"
+    alpha.mkdir()
+    (alpha / "source.py").write_text(
+        "def target_alpha():\n    pass\n",
+        encoding="utf-8",
+    )
+    (root / "zeta.py").write_text(
+        "def target_zeta():\n    pass\n",
+        encoding="utf-8",
+    )
+    for directory_name in DEFAULT_IGNORED_TRAVERSAL_DIRECTORY_NAMES:
+        ignored = root / directory_name
+        ignored.mkdir()
+        (ignored / "ignored.py").write_text(
+            "def target_ignored():\n    pass\n",
+            encoding="utf-8",
+        )
+
+    result = search_workspace_symbols(workspace, {"query": "target"})
+
+    assert [match["path"] for match in result["matches"]] == [
+        "alpha/source.py",
+        "zeta.py",
+    ]
+    assert result["files_inspected"] == 2
+    assert result["files_skipped"] == 0
 
 
 def test_directory_search_skips_invalid_syntax_encoding_and_oversized_files(

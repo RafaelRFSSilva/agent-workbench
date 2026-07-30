@@ -219,7 +219,7 @@ def search_workspace_symbols(
     files_skipped = 0
     truncated = False
 
-    for discovered_path in _iter_python_files(search_path):
+    for discovered_path in _iter_python_files(workspace, search_path):
         canonical_path = workspace.resolve(discovered_path.relative_to(workspace.root))
 
         if canonical_path in seen_files:
@@ -318,8 +318,11 @@ def _get_symbol_arguments(
     return query, Path(path), kind, case_sensitive
 
 
-def _iter_python_files(search_path: Path):
+def _iter_python_files(workspace: Workspace, search_path: Path):
     """Yield non-symlink regular Python files in deterministic path order."""
+
+    if workspace.is_ignored_traversal_path(search_path):
+        return
 
     try:
         children = sorted(search_path.iterdir(), key=lambda child: child.name)
@@ -331,8 +334,8 @@ def _iter_python_files(search_path: Path):
             continue
         if child.is_file() and child.suffix == ".py":
             yield child
-        elif child.is_dir():
-            yield from _iter_python_files(child)
+        elif child.is_dir() and not workspace.is_ignored_traversal_path(child):
+            yield from _iter_python_files(workspace, child)
 
 
 def _validate_explicit_python_file(file_path: Path) -> None:
