@@ -20,6 +20,7 @@ from agent_workbench.errors import CompletionError
 from agent_workbench.git_tools import (
     INSPECT_GIT_DIFF_DEFINITION,
     INSPECT_GIT_STATUS_DEFINITION,
+    inspect_workspace_git_diff,
     inspect_workspace_git_status,
     register_git_tools,
 )
@@ -963,6 +964,123 @@ def test_safe_untracked_git_evidence_satisfies_final_diff_gate(
 
     assert result.final_phase is CodingPhase.DONE
     assert result.inspected_git_diff_after_change is True
+
+
+def test_untracked_only_created_files_reach_done_without_staging(
+    tmp_path: Path,
+) -> None:
+    """Validate and verify a source-and-test task composed only of new files."""
+
+    repository = create_coding_repository(tmp_path / "project", passing=True)
+    source_content = (
+        "def multiply(left: int, right: int) -> int:\n    return left * right\n"
+    )
+    test_content = (
+        "from created_module import multiply\n"
+        "\n"
+        "\n"
+        "def test_multiply() -> None:\n"
+        "    assert multiply(2, 3) == 6\n"
+    )
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            tool_response(
+                "create-files",
+                "apply_workspace_changes",
+                {
+                    "changes": [
+                        {
+                            "path": "created_module.py",
+                            "expected_content": "",
+                            "replacement_content": source_content,
+                            "create_if_missing": True,
+                        },
+                        {
+                            "path": "test_created_module.py",
+                            "expected_content": "",
+                            "replacement_content": test_content,
+                            "create_if_missing": True,
+                        },
+                    ]
+                },
+            ),
+            ChatResponse(text="Created the source and focused test."),
+        ]
+    )
+
+    result = run_autonomous_coding_task(
+        create_session(repository, provider),
+        "Create a multiplication module and focused test.",
+        tool_approval_handler=approve,
+    )
+
+    diff_index = result.executed_tool_names.index("inspect_git_diff")
+    diff_output = result.tool_results[diff_index].output
+    assert isinstance(diff_output, dict)
+    assert result.final_phase is CodingPhase.DONE
+    assert result.workspace_change_applied is True
+    assert result.validation_succeeded is True
+    assert result.inspected_git_status_after_change is True
+    assert result.inspected_git_diff_after_change is True
+    assert diff_output["unstaged"] == ""
+    assert diff_output["staged"] == ""
+    assert "a/created_module.py" in diff_output["untracked"]
+    assert "a/test_created_module.py" in diff_output["untracked"]
+    assert diff_output["untracked"].strip()
+    assert run_git(repository, "diff", "--cached", "--name-only").stdout == ""
+    assert run_git(repository, "status", "--short").stdout == (
+        "?? created_module.py\n?? test_created_module.py\n"
+    )
+
+
+def test_omitted_only_untracked_file_cannot_reach_done(tmp_path: Path) -> None:
+    """Reject VERIFY when the only untracked change has no safe diff evidence."""
+
+    repository = create_coding_repository(tmp_path / "project", passing=True)
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            tool_response(
+                "create-unsafe",
+                "apply_workspace_changes",
+                {
+                    "changes": [
+                        {
+                            "path": ".env",
+                            "expected_content": "",
+                            "replacement_content": "SAFE_PLACEHOLDER=1\n",
+                            "create_if_missing": True,
+                        }
+                    ]
+                },
+            ),
+            ChatResponse(text="Created the requested file."),
+        ]
+    )
+
+    with pytest.raises(
+        CompletionError,
+        match=r"phase VERIFY: final Git diff is empty",
+    ):
+        run_autonomous_coding_task(
+            create_session(repository, provider),
+            "Create one local environment placeholder.",
+            tool_approval_handler=approve,
+        )
+
+    diff_output = inspect_workspace_git_diff(Workspace(repository), {})
+    assert diff_output["unstaged"] == ""
+    assert diff_output["staged"] == ""
+    assert diff_output["untracked"] == ""
+    assert diff_output["untracked_omitted"] == [
+        {
+            "reason": "unsafe_or_ignored",
+            "file_count": 1,
+        }
+    ]
+    assert run_git(repository, "diff", "--cached", "--name-only").stdout == ""
+    assert run_git(repository, "status", "--short").stdout == "?? .env\n"
 
 
 def test_failed_git_inspection_prevents_done(tmp_path: Path) -> None:

@@ -31,7 +31,7 @@ repository-lifecycle changes.
    separately. The target is always `"."` in v1.
 9. Require controller-owned DONE evidence: successful latest Ruff format, Ruff
    check, and pytest results, successful Git status and complete diff
-   inspection, and a non-empty final tracked/staged diff.
+   inspection, and non-empty tracked, staged, or safe untracked diff evidence.
 10. Review the immutable commit preview, exact CLI-supplied message, exact path
     set, and every complete diff.
 11. Approve the isolated local commit once.
@@ -209,18 +209,24 @@ The implemented regression battery uses scripted providers and real temporary
 Git repositories. It deterministically proves phase progression, edit
 continuations (including maximum-tool-round recovery), bounded cross-phase
 discovery evidence, ordered acceptance criteria, validation-driven repair, the
-repair limit, false completion rejection, and the final diff gate. Automated
-tests do not call Ollama or any paid/cloud provider.
+repair limit, false completion rejection, generated-directory filtering,
+read-only untracked Git evidence, untracked-only DONE, isolated new-file
+commits, and the final diff gate. Automated tests do not call Ollama or any
+paid/cloud provider.
 
-Those tests validate controller behavior, not local-model capability. Manual
-benchmarks of this deterministic workflow with `gpt-oss:20b` or another real
-local model remain future evaluation work. Record model name, task fixture,
-approval decisions, phase counters, validation results, and final diff when
-such a benchmark is run.
+Those tests validate controller behavior, not local-model capability. A prior
+manual benchmark with `qwen3-coder:30b` through Ollama exercised the earlier
+deterministic workflow and exposed the traversal and untracked-file limitations
+addressed here. Record model name, task fixture, approval decisions, phase
+counters, validation results, and final diff for future benchmark runs.
 
-V1 uses the existing tracked/staged Git diff inspection. A task that creates
-only new untracked files cannot reach DONE; include a tracked-file change or
-wait for a future diff contract that represents untracked contents.
+V1 can reach DONE for tasks composed only of safe untracked UTF-8 regular files.
+Git inspection does not stage them: it renders at most 64 files, reads at most
+32 KiB per file, and caps combined untracked diff evidence at 64 KiB. Binary,
+unsupported, unreadable, oversized, sensitive, ignored, and limit-exceeding
+files are omitted with bounded metadata. Omission metadata alone cannot satisfy
+VERIFY and requires manual review. No post-hardening real-model benchmark has
+passed yet.
 
 ## Tasks suitable for `gpt-oss:20b`
 

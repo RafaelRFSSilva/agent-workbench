@@ -888,6 +888,12 @@ regular UTF-8 files in deterministic relative order, skips invalid UTF-8 and
 directory symlinks, and reports truncation at its query, file, byte, match, and
 line limits.
 
+All recursive workspace inspection uses one immutable traversal policy.
+`list_files`, `search_text`, and `search_symbols` omit `.git`, `.venv`, `venv`,
+`__pycache__`, `.pytest_cache`, `.ruff_cache`, `.mypy_cache`, `.tox`, `.nox`,
+`node_modules`, `dist`, `build`, `.next`, `.turbo`, `coverage`, and `htmlcov`
+directories. The policy does not change explicit safe `read_file` access.
+
 `search_symbols` parses Python with `ast.parse()` and never imports or executes
 inspected code. Lexical AST scope identifies classes, top-level and nested
 functions, asynchronous functions, methods, and nested classes. The portable
@@ -905,9 +911,16 @@ requested explicitly. Limits are 256 query characters, 512 Python files,
 100 KiB per file, 256 matches, and 512 qualified-name characters;
 `truncated` reports bounded file, match, or name handling.
 
-Git inspection runs only fixed non-shell status and diff commands with external
-helpers disabled, a three-second timeout, and 100 KiB output limits; it
-separates unstaged and staged diff results.
+Git inspection runs only fixed non-shell status, diff, and untracked-file
+enumeration commands with external helpers disabled and a three-second timeout.
+Diff evidence separates unstaged tracked, staged, and safe untracked results.
+Safe untracked UTF-8 regular files are rendered as deterministic new-file
+diffs without staging or changing the index. At most 64 untracked files are
+represented, at most 32 KiB is read per file, and combined untracked diff
+evidence is capped at 64 KiB within the existing 100 KiB total Git output
+limit. Binary, unsupported, unreadable, oversized, sensitive, ignored, and
+excess files contribute bounded omission metadata rather than contents;
+omission metadata alone is not a non-empty diff.
 
 The controlled write boundary is intentionally stricter than reads.
 `apply_file_patch` never follows a target or parent symlink, rejects `.git`,
@@ -1347,21 +1360,22 @@ terminal.
 
 After the latest validation sequence succeeds, the controller invokes
 `inspect_git_status` and `inspect_git_diff`. DONE requires a successful
-workspace action, a non-empty tracked/staged Git diff, successful latest Ruff
-format/check/pytest results, and successful final Git inspections. A model
-response cannot select DONE or override these gates. Terminal failures raise a
-phase-specific `CompletionError`, and the isolated workflow cannot plan a
-commit unless the result phase is DONE.
+workspace action, non-empty tracked, staged, or safe untracked Git diff
+evidence, successful latest Ruff format/check/pytest results, and successful
+final Git inspections. A model response cannot select DONE or override these
+gates. Terminal failures raise a phase-specific `CompletionError`, and the
+isolated workflow cannot plan a commit unless the result phase is DONE.
 
 `AutonomousCodingResult` preserves tool rounds, exact `ToolResult` snapshots,
 executed and approved tool names, validation runs, Git inspection evidence, and
 assistant summary. It also exposes final phase, workspace-change evidence,
 repair attempts, and completion continuations for stable CLI rendering.
 
-The v1 controller remains Python-specific. Its final diff gate uses the
-existing Git diff inspection, so a task whose only changes are new untracked
-files cannot reach DONE until a future inspection contract represents those
-contents.
+The v1 controller remains Python-specific. Untracked-only tasks can reach DONE
+when every required new file has safe bounded text evidence. A task containing
+only omitted untracked files cannot pass VERIFY; binary, unsupported,
+unreadable, oversized, sensitive, ignored, or limit-exceeding files require
+manual review.
 
 ## Broader Orchestration Boundary
 

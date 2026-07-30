@@ -421,6 +421,10 @@ workspace-relative order, including hidden entries but never following
 directory symlinks. It skips invalid UTF-8 safely and is bounded to a
 256-character query, 512 files, 100 KiB per file, 256 matching lines, and
 1,000 returned characters per line; its `truncated` result indicates a limit.
+Recursive listing and searches share one immutable traversal policy that omits
+Git internals, virtual environments, Python/tool caches, dependency trees, and
+generated build, coverage, and frontend output directories. Explicit safe
+`read_file` access is unchanged.
 
 `search_symbols` uses the standard-library Python AST without importing or
 executing inspected code. It finds classes, functions, asynchronous functions,
@@ -440,9 +444,12 @@ file, 256 matches, and 512 characters per returned qualified name.
 file, match, or qualified-name limits.
 
 Git inspection uses only fixed non-shell commands: status is equivalent to
-`git status --short --branch`, while diff returns separate unstaged and staged
-fixed-command output. Commands have a three-second timeout, disable external
-diff helpers, and limit combined returned diff output to 100 KiB.
+`git status --short --branch`, while diff returns separate unstaged, staged,
+and safe untracked evidence. Safe untracked UTF-8 regular files appear as
+new-file diffs without staging or index mutation. Inspection represents at
+most 64 untracked files, reads at most 32 KiB per file, caps combined untracked
+diff evidence at 64 KiB, and retains the 100 KiB total Git output limit.
+Unsupported or unsafe files return bounded omission metadata without contents.
 
 Use `--show-tool-traces` with active tools to display compact deterministic
 JSON invocation and result records before the final response. Traces are
@@ -632,9 +639,10 @@ After a successful workspace action, the controller invokes
 exact order. Failed validation enters a bounded REPAIR phase and reruns the
 complete sequence after another successful change. The controller then invokes
 Git status and diff inspection. Success requires a non-empty final
-tracked/staged diff and successful latest validation and Git evidence. Every
-file change and executable validation remains default-deny and requires
-approval for that exact invocation.
+tracked, staged, or safe untracked diff and successful latest validation and
+Git evidence. Omission metadata alone does not satisfy verification. Every file
+change and executable validation remains default-deny and requires approval
+for that exact invocation.
 
 Direct and isolated results show the same stable evidence block:
 
@@ -819,10 +827,10 @@ Agent Workbench does not yet provide:
 - Multi-agent orchestration.
 - MCP integration.
 - Concurrent worktree management, automatic approval, merge, or push.
-- DONE for tasks whose only changes are new untracked files; v1 requires a
-  non-empty tracked or staged Git diff.
-- Automated real-model benchmarks; the regression battery uses scripted
-  providers, while local-model benchmarking remains manual future work.
+- DONE when the only changes are binary, unsupported, unreadable, oversized,
+  sensitive, ignored, or beyond the bounded untracked-evidence limits.
+- A post-hardening real-model benchmark; the current regression battery is
+  scripted, and the earlier `qwen3-coder:30b` benchmark predates these fixes.
 - A navigable terminal workspace.
 - A VS Code extension.
 - Voice prompt input.
