@@ -106,17 +106,29 @@ def test_commit_approval_renders_complete_preview_before_one_prompt(
     assert "/tmp/" not in output
 
 
-@pytest.mark.parametrize("failure", [EOFError(), KeyboardInterrupt()])
-def test_commit_approval_interruption_denies(monkeypatch, failure) -> None:
-    """Treat interrupted final commit approval as an explicit denial."""
+def test_commit_approval_eof_denies(monkeypatch) -> None:
+    """Treat unavailable final commit approval input as denial."""
 
-    monkeypatch.setattr("builtins.input", Mock(side_effect=failure))
+    monkeypatch.setattr("builtins.input", Mock(side_effect=EOFError))
     request = IsolatedCommitApprovalRequest(
         IsolatedCommitAction.CREATE,
         _commit_preview(),
     )
 
     assert _prompt_for_isolated_commit_approval(request) is ToolApprovalDecision.DENY
+
+
+def test_commit_approval_keyboard_interrupt_propagates(monkeypatch) -> None:
+    """Propagate final commit cancellation to the outer CLI boundary."""
+
+    monkeypatch.setattr("builtins.input", Mock(side_effect=KeyboardInterrupt))
+    request = IsolatedCommitApprovalRequest(
+        IsolatedCommitAction.CREATE,
+        _commit_preview(),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        _prompt_for_isolated_commit_approval(request)
 
 
 def test_commit_approval_rejects_invalid_preview_without_prompt(monkeypatch) -> None:

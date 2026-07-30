@@ -51,6 +51,7 @@ from agent_workbench.worktrees import (
 
 EXIT_COMMANDS = {"/exit", "/quit"}
 AUTONOMOUS_MAX_TOOL_ROUNDS = DEFAULT_AUTONOMOUS_MAX_TOOL_ROUNDS
+CANCELLATION_MESSAGE = "[CANCELLED] Task cancelled by user. Workspace preserved."
 
 
 def run_cli(
@@ -124,6 +125,18 @@ def run_cli(
 
 
 def main(
+    argv: Sequence[str] | None = None,
+) -> None:
+    """Run the CLI and normalize operator cancellation."""
+
+    try:
+        _main(argv)
+    except KeyboardInterrupt:
+        print(CANCELLATION_MESSAGE)
+        raise SystemExit(130) from None
+
+
+def _main(
     argv: Sequence[str] | None = None,
 ) -> None:
     """Run the CLI using the resolved provider and model."""
@@ -513,7 +526,7 @@ def _prompt_for_isolated_commit_approval(request) -> ToolApprovalDecision:
     print("  No destructive automatic cleanup will occur.")
     try:
         answer = input("Approve isolated commit? [y/N]: ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
+    except EOFError:
         print()
         return ToolApprovalDecision.DENY
     if answer in {"y", "yes"}:
@@ -555,7 +568,7 @@ def _prompt_for_worktree_approval(
 
     try:
         answer = input(prompt).strip().lower()
-    except (EOFError, KeyboardInterrupt):
+    except EOFError:
         print()
         return ToolApprovalDecision.DENY
     if answer in {"y", "yes"}:
@@ -665,7 +678,7 @@ def _prompt_for_tool_approval(
 
     try:
         answer = input("Approve action? [y/N]: ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
+    except EOFError:
         print()
         return ToolApprovalDecision.DENY
 

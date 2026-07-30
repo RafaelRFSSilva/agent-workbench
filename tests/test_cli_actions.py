@@ -163,14 +163,10 @@ def test_file_rewrite_approval_renders_complete_diff(monkeypatch, capsys) -> Non
     assert "+new" in output
 
 
-@pytest.mark.parametrize("failure", [EOFError(), KeyboardInterrupt()])
-def test_cli_approval_input_interruption_denies(
-    monkeypatch,
-    failure,
-) -> None:
-    """Treat unavailable or interrupted approval input as denial."""
+def test_cli_approval_input_eof_denies(monkeypatch) -> None:
+    """Treat unavailable approval input as denial."""
 
-    monkeypatch.setattr("builtins.input", Mock(side_effect=failure))
+    monkeypatch.setattr("builtins.input", Mock(side_effect=EOFError))
 
     decision = _prompt_for_tool_approval(
         approval_request(
@@ -188,6 +184,28 @@ def test_cli_approval_input_interruption_denies(
     )
 
     assert decision is ToolApprovalDecision.DENY
+
+
+def test_cli_approval_input_keyboard_interrupt_propagates(monkeypatch) -> None:
+    """Propagate operator cancellation to the outer CLI boundary."""
+
+    monkeypatch.setattr("builtins.input", Mock(side_effect=KeyboardInterrupt))
+
+    with pytest.raises(KeyboardInterrupt):
+        _prompt_for_tool_approval(
+            approval_request(
+                "run_ruff_check",
+                {
+                    "tool": "run_ruff_check",
+                    "path": ".",
+                    "command": ["python", "-m", "ruff", "check", "."],
+                    "cwd": ".",
+                    "timeout_seconds": 30,
+                    "may_modify_files": False,
+                    "executes_project_code": False,
+                },
+            )
+        )
 
 
 @pytest.mark.parametrize(

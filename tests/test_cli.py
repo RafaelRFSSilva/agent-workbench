@@ -15,6 +15,7 @@ from agent_workbench.coding_loop import (
 )
 from agent_workbench.cli import (
     AUTONOMOUS_MAX_TOOL_ROUNDS,
+    CANCELLATION_MESSAGE,
     _display_coding_progress,
     main,
     run_cli as run_session_cli,
@@ -1782,6 +1783,142 @@ def test_invalid_project_configuration_prevents_provider_construction(
     assert "Configuration error:" in output
     assert "[coding].api_key" in output
     assert str(tmp_path) not in output
+
+
+@pytest.mark.parametrize(
+    "interrupt_source",
+    [
+        "workspace discovery",
+        "provider completion",
+        "model tool-calling",
+        "approval input",
+        "validation",
+        "direct coding",
+    ],
+)
+def test_direct_coding_interrupts_exit_cleanly_with_preserved_workspace(
+    monkeypatch,
+    tmp_path,
+    capsys,
+    interrupt_source,
+) -> None:
+    """Normalize direct-workflow interrupts at one outer CLI boundary."""
+
+    changed_path = tmp_path / "approved.py"
+    session = Mock()
+
+    if interrupt_source == "workspace discovery":
+        monkeypatch.setattr(
+            "agent_workbench.cli.discover_project_configuration",
+            Mock(side_effect=KeyboardInterrupt),
+        )
+    else:
+        monkeypatch.setattr(
+            "agent_workbench.cli.create_agent_session",
+            Mock(return_value=session),
+        )
+
+        def interrupt_task(_session, _prompt, **kwargs):
+            if interrupt_source == "approval input":
+                request = Mock(
+                    invocation=Mock(tool_name="run_pytest"),
+                    preview={},
+                )
+                monkeypatch.setattr(
+                    "builtins.input",
+                    Mock(side_effect=KeyboardInterrupt),
+                )
+                kwargs["tool_approval_handler"](request)
+            if interrupt_source in {
+                "validation",
+                "direct coding",
+            }:
+                changed_path.write_text("approved = True\n", encoding="utf-8")
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(
+            "agent_workbench.cli.run_autonomous_coding_task",
+            interrupt_task,
+        )
+
+    with pytest.raises(SystemExit) as raised:
+        main(
+            [
+                "code",
+                "--provider",
+                "ollama",
+                "--model",
+                "test-model",
+                "--workspace",
+                str(tmp_path),
+                "--enable-actions",
+                "--task",
+                "Fix it.",
+            ]
+        )
+
+    assert raised.value.code == 130
+    output = capsys.readouterr()
+    assert output.out.count(CANCELLATION_MESSAGE) == 1
+    assert output.err == ""
+    assert "Traceback" not in output.out
+    assert "Workspace preserved." in output.out
+    if interrupt_source in {"validation", "direct coding"}:
+        assert changed_path.read_text(encoding="utf-8") == "approved = True\n"
+
+
+def test_isolated_coding_interrupt_exits_cleanly_without_cleanup(
+    monkeypatch,
+    tmp_path,
+    capsys,
+) -> None:
+    """Propagate isolated cancellation without cleanup or failure conversion."""
+
+    target = tmp_path / "isolated"
+    sentinel = target / "preserved.txt"
+
+    def interrupt_after_isolated_change(*_args, **_kwargs):
+        target.mkdir()
+        sentinel.write_text("approved isolated change\n", encoding="utf-8")
+        raise KeyboardInterrupt
+
+    runner = Mock(side_effect=interrupt_after_isolated_change)
+    monkeypatch.setattr(
+        "agent_workbench.cli.run_isolated_autonomous_workflow",
+        runner,
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        main(
+            [
+                "code",
+                "--provider",
+                "ollama",
+                "--model",
+                "test-model",
+                "--workspace",
+                str(tmp_path),
+                "--enable-actions",
+                "--task",
+                "Fix it.",
+                "--worktree-path",
+                str(target),
+                "--worktree-branch",
+                "agent/cancel",
+                "--commit-message",
+                "fix: cancelled task",
+            ]
+        )
+
+    assert raised.value.code == 130
+    captured = capsys.readouterr()
+    assert captured.out.count(CANCELLATION_MESSAGE) == 1
+    assert captured.out == f"{CANCELLATION_MESSAGE}\n"
+    assert captured.err == ""
+    assert "Traceback" not in captured.out
+    assert target.is_dir()
+    assert sentinel.is_file()
+    assert sentinel.read_text(encoding="utf-8") == "approved isolated change\n"
 
 
 def test_main_uses_interactive_runtime_setup(
