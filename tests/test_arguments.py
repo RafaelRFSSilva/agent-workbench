@@ -38,6 +38,104 @@ def test_parse_cli_arguments_accepts_provider_and_model() -> None:
     assert arguments.system_prompt is None
 
 
+def test_code_command_accepts_a_positional_task() -> None:
+    """Map the short positional code task to the existing task input."""
+
+    arguments = parse_cli_arguments(["code", "Fix the failing tests."])
+
+    assert arguments.task_prompt == "Fix the failing tests."
+
+
+def test_code_command_preserves_the_task_option() -> None:
+    """Keep the existing explicit task option fully supported."""
+
+    arguments = parse_cli_arguments(["code", "--task", "Fix the failing tests."])
+
+    assert arguments.task_prompt == "Fix the failing tests."
+
+
+def test_code_command_rejects_positional_and_option_tasks_together() -> None:
+    """Reject ambiguous duplicate task sources."""
+
+    with pytest.raises(SystemExit) as raised:
+        parse_cli_arguments(
+            [
+                "code",
+                "Positional task.",
+                "--task",
+                "Option task.",
+            ]
+        )
+
+    assert raised.value.code == 2
+
+
+def test_code_command_rejects_an_empty_positional_task() -> None:
+    """Reject an empty short coding task."""
+
+    with pytest.raises(SystemExit) as raised:
+        parse_cli_arguments(["code", "   "])
+
+    assert raised.value.code == 2
+
+
+def test_init_command_parses_supported_explicit_options() -> None:
+    """Parse every supported project initializer option."""
+
+    arguments = parse_cli_arguments(
+        [
+            "init",
+            "--provider",
+            "ollama",
+            "--model",
+            "qwen3-coder:30b",
+            "--agent",
+            "developer",
+            "--max-tool-rounds",
+            "9",
+            "--temperature",
+            "0.3",
+            "--top-p",
+            "0.8",
+            "--max-output-tokens",
+            "2048",
+            "--isolated",
+            "--enable-tools",
+            "--enable-actions",
+        ]
+    )
+
+    assert arguments.init is True
+    assert arguments.provider_name == "ollama"
+    assert arguments.model_name == "qwen3-coder:30b"
+    assert arguments.agent_name == "developer"
+    assert arguments.max_tool_rounds == 9
+    assert arguments.temperature == 0.3
+    assert arguments.top_p == 0.8
+    assert arguments.max_output_tokens == 2048
+    assert arguments.isolated is True
+    assert arguments.enable_tools is True
+    assert arguments.enable_actions is True
+
+
+def test_init_command_defaults_booleans_on_and_accepts_explicit_disabling() -> None:
+    """Expose effective paired boolean options while preserving useful defaults."""
+
+    defaults = parse_cli_arguments(["init"])
+    disabled = parse_cli_arguments(
+        [
+            "init",
+            "--no-enable-tools",
+            "--no-enable-actions",
+        ]
+    )
+
+    assert defaults.enable_tools is True
+    assert defaults.enable_actions is True
+    assert disabled.enable_tools is False
+    assert disabled.enable_actions is False
+
+
 def test_parse_cli_arguments_rejects_unsupported_provider() -> None:
     """Reject providers outside the supported provider set."""
 
@@ -191,7 +289,7 @@ def test_explicit_cli_values_override_project_configuration(tmp_path) -> None:
             temperature=0.1,
             top_p=0.2,
             max_output_tokens=100,
-            isolated=True,
+            isolated=False,
         ),
     )
     arguments = CLIArguments(

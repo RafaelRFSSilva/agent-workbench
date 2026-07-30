@@ -7,6 +7,7 @@ from pathlib import Path
 from agent_workbench.agents import AgentProfile
 from agent_workbench.arguments import (
     DEFAULT_AUTONOMOUS_MAX_TOOL_ROUNDS,
+    CLIArguments,
     RuntimeConfiguration,
     parse_cli_arguments,
     resolve_runtime_configuration,
@@ -18,7 +19,13 @@ from agent_workbench.coding_loop import (
     CodingPhase,
     run_autonomous_coding_task,
 )
-from agent_workbench.config import discover_project_configuration, load_environment
+from agent_workbench.config import (
+    PROJECT_CONFIG_CONTEXT,
+    ProjectCodingConfiguration,
+    create_project_configuration,
+    discover_project_configuration,
+    load_environment,
+)
 from agent_workbench.errors import (
     CompletionError,
     ConfigurationError,
@@ -123,6 +130,10 @@ def main(
 
     load_environment()
     arguments = parse_cli_arguments(argv)
+    if arguments.init:
+        _initialize_project(arguments)
+        return
+
     task_prompt = getattr(arguments, "task_prompt", None)
     commit_message = getattr(arguments, "commit_message", None)
 
@@ -172,6 +183,36 @@ def main(
         runtime_configuration,
         task_prompt=task_prompt,
     )
+
+
+def _initialize_project(arguments: CLIArguments) -> None:
+    """Create one complete project coding configuration in the current directory."""
+
+    provider_name = arguments.provider_name
+    model_name = arguments.model_name
+    agent_name = arguments.agent_name
+    if provider_name is None or model_name is None or agent_name is None:
+        print("Configuration error: Project initializer configuration is incomplete.")
+        raise SystemExit(1)
+
+    configuration = ProjectCodingConfiguration(
+        provider=provider_name,
+        model=model_name,
+        agent=agent_name,
+        enable_tools=arguments.enable_tools,
+        enable_actions=arguments.enable_actions,
+        max_tool_rounds=arguments.max_tool_rounds,
+        temperature=arguments.temperature,
+        top_p=arguments.top_p,
+        max_output_tokens=arguments.max_output_tokens,
+        isolated=arguments.isolated,
+    )
+    try:
+        create_project_configuration(Path.cwd(), configuration)
+    except ConfigurationError as exc:
+        print(f"Configuration error: {exc}")
+        raise SystemExit(1) from None
+    print(f"Created {PROJECT_CONFIG_CONTEXT}")
 
 
 def _run_configured_cli(

@@ -5,6 +5,8 @@ import subprocess
 from pathlib import Path
 from unittest.mock import call, Mock
 
+import pytest
+
 from agent_workbench.built_in_tools import create_built_in_tool_registry
 from agent_workbench.coding_loop import (
     CodingPhase,
@@ -24,6 +26,10 @@ from agent_workbench.messages import ChatRequest, ChatResponse, Message
 from agent_workbench.session import AgentSession, SessionId
 from agent_workbench.agents import get_agent_profile
 from agent_workbench.generation import GenerationConfig
+from agent_workbench.config import (
+    PROJECT_CONFIG_RELATIVE_PATH,
+    load_project_configuration,
+)
 from agent_workbench.git_tools import register_git_tools
 from agent_workbench.structured_outputs import JSONResponseFormat
 from agent_workbench.symbol_tools import register_symbol_tools
@@ -76,6 +82,21 @@ class FakeProvider:
             return ChatResponse(text=outcome)
 
         return outcome
+
+
+EXPECTED_INITIALIZED_CONFIG = """\
+[coding]
+provider = "ollama"
+model = "qwen3-coder:30b"
+agent = "developer"
+enable_tools = true
+enable_actions = true
+max_tool_rounds = 8
+temperature = 0.2
+top_p = 0.9
+max_output_tokens = 4096
+isolated = false
+"""
 
 
 def run_cli(
@@ -1517,6 +1538,221 @@ def test_main_discovers_explicit_workspace_configuration_before_provider(
 
     discover_mock.assert_called_once_with(tmp_path)
     assert resolve_mock.call_args.kwargs["project_configuration"] is discovered
+
+
+def test_init_creates_deterministic_loadable_project_configuration(
+    monkeypatch,
+    tmp_path,
+    capsys,
+) -> None:
+    """Create the fixed UTF-8 project file with useful local coding defaults."""
+
+    create_session_mock = Mock()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        "agent_workbench.cli.create_agent_session",
+        create_session_mock,
+    )
+
+    main(
+        [
+            "init",
+            "--provider",
+            "ollama",
+            "--model",
+            "qwen3-coder:30b",
+        ]
+    )
+
+    configuration_path = tmp_path / PROJECT_CONFIG_RELATIVE_PATH
+    contents = configuration_path.read_text(encoding="utf-8")
+    assert contents == EXPECTED_INITIALIZED_CONFIG
+    assert "api_key" not in contents
+    assert "access_token" not in contents
+    assert "password" not in contents
+    assert str(Path.home()) not in contents
+    loaded = load_project_configuration(configuration_path)
+    assert loaded.provider == "ollama"
+    assert loaded.model == "qwen3-coder:30b"
+    assert loaded.enable_tools is True
+    assert loaded.enable_actions is True
+    assert loaded.isolated is False
+    assert capsys.readouterr().out == ("Created .agent-workbench/config.toml\n")
+    create_session_mock.assert_not_called()
+
+
+def test_init_creates_configuration_in_the_current_nested_directory(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """Treat the current nested directory as the initialized project root."""
+
+    nested = tmp_path / "packages" / "example"
+    nested.mkdir(parents=True)
+    monkeypatch.chdir(nested)
+
+    main(
+        [
+            "init",
+            "--provider",
+            "ollama",
+            "--model",
+            "qwen3-coder:30b",
+        ]
+    )
+
+    assert (nested / PROJECT_CONFIG_RELATIVE_PATH).is_file()
+    assert not (tmp_path / PROJECT_CONFIG_RELATIVE_PATH).exists()
+
+
+def test_init_explicit_disable_options_generate_false_booleans(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """Persist explicit tool and action disabling in generated TOML."""
+
+    monkeypatch.chdir(tmp_path)
+
+    main(
+        [
+            "init",
+            "--provider",
+            "ollama",
+            "--model",
+            "qwen3-coder:30b",
+            "--no-enable-tools",
+            "--no-enable-actions",
+        ]
+    )
+
+    configuration_path = tmp_path / PROJECT_CONFIG_RELATIVE_PATH
+    contents = configuration_path.read_text(encoding="utf-8")
+    loaded = load_project_configuration(configuration_path)
+    assert "enable_tools = false\n" in contents
+    assert "enable_actions = false\n" in contents
+    assert loaded.enable_tools is False
+    assert loaded.enable_actions is False
+
+
+def test_init_refuses_an_existing_file_without_modifying_it(
+    monkeypatch,
+    tmp_path,
+    capsys,
+) -> None:
+    """Never overwrite, truncate, or silently back up project configuration."""
+
+    configuration_path = tmp_path / PROJECT_CONFIG_RELATIVE_PATH
+    configuration_path.parent.mkdir()
+    original = '[coding]\nmodel = "keep-me"\n'
+    configuration_path.write_text(original, encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(SystemExit) as raised:
+        main(["init"])
+
+    assert raised.value.code == 1
+    assert configuration_path.read_text(encoding="utf-8") == original
+    assert list(configuration_path.parent.iterdir()) == [configuration_path]
+    captured = capsys.readouterr()
+    assert "Configuration error:" in captured.out
+    assert ".agent-workbench/config.toml already exists" in captured.out
+    assert "Traceback" not in captured.out
+    assert captured.err == ""
+
+
+def test_init_failure_leaves_no_partial_config_or_gitignore_change(
+    monkeypatch,
+    tmp_path,
+    capsys,
+) -> None:
+    """Clean only a newly-created partial target when writing fails."""
+
+    gitignore = tmp_path / ".gitignore"
+    gitignore.write_text(".venv/\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    original_open = Path.open
+
+    class FailingWriter:
+        def __init__(self, file_object) -> None:
+            self._file_object = file_object
+
+        def __enter__(self):
+            self._file_object.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._file_object.__exit__(*args)
+
+        def write(self, value):
+            self._file_object.write(value[:12])
+            self._file_object.flush()
+            raise OSError("simulated write failure")
+
+    def failing_open(path, *args, **kwargs):
+        file_object = original_open(path, *args, **kwargs)
+        if path.name == "config.toml" and args and args[0] == "x":
+            return FailingWriter(file_object)
+        return file_object
+
+    monkeypatch.setattr(Path, "open", failing_open)
+
+    with pytest.raises(SystemExit) as raised:
+        main(["init"])
+
+    assert raised.value.code == 1
+    assert not (tmp_path / PROJECT_CONFIG_RELATIVE_PATH).exists()
+    assert gitignore.read_text(encoding="utf-8") == ".venv/\n"
+    captured = capsys.readouterr()
+    assert "Configuration error:" in captured.out
+    assert "Traceback" not in captured.out
+    assert captured.err == ""
+
+
+def test_short_code_command_uses_detected_project_root_and_configuration(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """Use root coding defaults when invoked from a nested source directory."""
+
+    configuration_path = tmp_path / PROJECT_CONFIG_RELATIVE_PATH
+    configuration_path.parent.mkdir()
+    configuration_path.write_text(EXPECTED_INITIALIZED_CONFIG, encoding="utf-8")
+    nested = tmp_path / "src" / "package"
+    nested.mkdir(parents=True)
+    monkeypatch.chdir(nested)
+    session = Mock()
+    create_session_mock = Mock(return_value=session)
+    run_mock = Mock()
+    monkeypatch.setattr(
+        "agent_workbench.cli.create_agent_session",
+        create_session_mock,
+    )
+    monkeypatch.setattr(
+        "agent_workbench.cli._run_configured_cli",
+        run_mock,
+    )
+
+    main(["code", "Fix the failing tests."])
+
+    runtime_configuration = create_session_mock.call_args.args[1]
+    assert runtime_configuration.provider_name == "ollama"
+    assert runtime_configuration.model_name == "qwen3-coder:30b"
+    assert runtime_configuration.agent_profile.name == "Developer"
+    assert runtime_configuration.workspace_root == tmp_path.resolve()
+    assert runtime_configuration.enable_tools is True
+    assert runtime_configuration.enable_actions is True
+    assert runtime_configuration.max_tool_rounds == 8
+    create_session_mock.assert_called_once_with(
+        SessionId("cli-session"),
+        runtime_configuration,
+        max_tool_rounds=8,
+    )
+    run_mock.assert_called_once_with(
+        session,
+        runtime_configuration,
+        task_prompt="Fix the failing tests.",
+    )
 
 
 def test_invalid_project_configuration_prevents_provider_construction(

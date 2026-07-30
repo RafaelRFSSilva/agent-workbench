@@ -1,11 +1,11 @@
 """Command-line arguments and runtime configuration resolution."""
 
 import sys
-from argparse import ArgumentParser, ArgumentTypeError
+from argparse import ArgumentParser, ArgumentTypeError, BooleanOptionalAction
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
 from agent_workbench.agents import (
     SUPPORTED_AGENT_NAMES,
@@ -15,6 +15,8 @@ from agent_workbench.agents import (
 )
 
 from agent_workbench.config import (
+    DEFAULT_MODEL_NAME,
+    DEFAULT_PROVIDER_NAME,
     SUPPORTED_PROVIDERS,
     ProjectConfiguration,
     ProviderName,
@@ -33,6 +35,13 @@ from agent_workbench.structured_outputs import (
 DEFAULT_AUTONOMOUS_MAX_TOOL_ROUNDS = 16
 """Default maximum tool rounds for one autonomous CLI task."""
 
+DEFAULT_PROJECT_MAX_TOOL_ROUNDS = 8
+DEFAULT_PROJECT_TEMPERATURE = 0.2
+DEFAULT_PROJECT_TOP_P = 0.9
+DEFAULT_PROJECT_MAX_OUTPUT_TOKENS = 4096
+
+type CLICommand = Literal["run", "code", "init"]
+
 
 @dataclass(frozen=True, slots=True)
 class CLIArguments:
@@ -40,6 +49,7 @@ class CLIArguments:
 
     provider_name: ProviderName | None
     model_name: str | None
+    init: bool = False
     setup: bool = False
     task_prompt: str | None = None
     max_tool_rounds: int | None = None
@@ -59,6 +69,7 @@ class CLIArguments:
     show_assistant_summary: bool = False
     worktree_path: Path | None = None
     worktree_branch: str | None = None
+    isolated: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -246,16 +257,17 @@ def _positive_output_token_limit(value: str) -> int:
 
 def _normalize_cli_argv(
     argv: Sequence[str] | None,
-) -> tuple[list[str], bool]:
-    """Remove the optional code command before normal argument parsing."""
+) -> tuple[list[str], CLICommand]:
+    """Remove one optional command before normal argument parsing."""
 
     normalized_argv = list(sys.argv[1:] if argv is None else argv)
-    code_command = bool(normalized_argv and normalized_argv[0] == "code")
+    command: CLICommand = "run"
 
-    if code_command:
+    if normalized_argv and normalized_argv[0] in {"code", "init"}:
+        command = cast(CLICommand, normalized_argv[0])
         normalized_argv = normalized_argv[1:]
 
-    return normalized_argv, code_command
+    return normalized_argv, command
 
 
 def parse_cli_arguments(
@@ -263,7 +275,11 @@ def parse_cli_arguments(
 ) -> CLIArguments:
     """Parse optional provider and model command-line arguments."""
 
-    normalized_argv, code_command = _normalize_cli_argv(argv)
+    normalized_argv, command = _normalize_cli_argv(argv)
+    if command == "init":
+        return _parse_init_arguments(normalized_argv)
+
+    code_command = command == "code"
     parser = ArgumentParser(
         prog="agent-workbench code" if code_command else "agent-workbench",
         description=(
@@ -404,7 +420,20 @@ def parse_cli_arguments(
         help="New local branch for an isolated worktree; requires --worktree-path.",
     )
 
+    if code_command:
+        parser.add_argument(
+            "positional_task",
+            nargs="?",
+            type=_non_empty_task_prompt,
+            help="Supervised autonomous coding task.",
+        )
+
     parsed_arguments = parser.parse_args(normalized_argv)
+
+    positional_task = parsed_arguments.positional_task if code_command else None
+    if positional_task is not None and parsed_arguments.task is not None:
+        parser.error("positional task cannot be combined with --task.")
+    task_prompt = positional_task or parsed_arguments.task
 
     setup_conflicts = (
         parsed_arguments.provider is not None
@@ -424,7 +453,7 @@ def parse_cli_arguments(
         or parsed_arguments.show_assistant_summary
         or parsed_arguments.worktree_path is not None
         or parsed_arguments.worktree_branch is not None
-        or parsed_arguments.task is not None
+        or task_prompt is not None
         or parsed_arguments.max_tool_rounds is not None
         or parsed_arguments.commit_message is not None
     )
@@ -457,9 +486,97 @@ def parse_cli_arguments(
         show_assistant_summary=parsed_arguments.show_assistant_summary,
         worktree_path=parsed_arguments.worktree_path,
         worktree_branch=parsed_arguments.worktree_branch,
-        task_prompt=parsed_arguments.task,
+        task_prompt=task_prompt,
         max_tool_rounds=parsed_arguments.max_tool_rounds,
         commit_message=parsed_arguments.commit_message,
+    )
+
+
+def _parse_init_arguments(argv: Sequence[str]) -> CLIArguments:
+    """Parse the bounded project configuration initializer."""
+
+    parser = ArgumentParser(
+        prog="agent-workbench init",
+        description="Create project coding configuration.",
+    )
+    parser.add_argument(
+        "--provider",
+        choices=sorted(SUPPORTED_PROVIDERS),
+        default=DEFAULT_PROVIDER_NAME,
+        help="Language model provider to configure.",
+    )
+    parser.add_argument(
+        "--model",
+        type=_non_empty_model_name,
+        help="Provider-specific model name.",
+    )
+    parser.add_argument(
+        "--agent",
+        choices=sorted(SUPPORTED_AGENT_NAMES),
+        default="developer",
+        help="Reusable agent profile to configure.",
+    )
+    parser.add_argument(
+        "--max-tool-rounds",
+        type=_positive_tool_round_limit,
+        default=DEFAULT_PROJECT_MAX_TOOL_ROUNDS,
+        help="Maximum tool execution rounds for one coding task.",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=_temperature,
+        default=DEFAULT_PROJECT_TEMPERATURE,
+        help="Sampling temperature between 0.0 and 1.0.",
+    )
+    parser.add_argument(
+        "--top-p",
+        type=_top_p,
+        default=DEFAULT_PROJECT_TOP_P,
+        help="Nucleus sampling probability between 0.0 and 1.0.",
+    )
+    parser.add_argument(
+        "--max-output-tokens",
+        type=_positive_output_token_limit,
+        default=DEFAULT_PROJECT_MAX_OUTPUT_TOKENS,
+        help="Maximum number of tokens generated in each response.",
+    )
+    parser.add_argument(
+        "--enable-tools",
+        action=BooleanOptionalAction,
+        default=True,
+        help="Enable or disable the available built-in tools.",
+    )
+    parser.add_argument(
+        "--enable-actions",
+        action=BooleanOptionalAction,
+        default=True,
+        help="Enable or disable approved file changes and validation commands.",
+    )
+    parser.add_argument(
+        "--isolated",
+        action="store_true",
+        help="Require explicit isolated-worktree options for coding.",
+    )
+    parsed_arguments = parser.parse_args(argv)
+    provider_name = cast(ProviderName, parsed_arguments.provider)
+    model_name = parsed_arguments.model
+    if model_name is None and provider_name == DEFAULT_PROVIDER_NAME:
+        model_name = DEFAULT_MODEL_NAME
+    if model_name is None:
+        parser.error("--model is required for the selected provider.")
+
+    return CLIArguments(
+        provider_name=provider_name,
+        model_name=model_name,
+        init=True,
+        agent_name=parsed_arguments.agent,
+        max_tool_rounds=parsed_arguments.max_tool_rounds,
+        temperature=parsed_arguments.temperature,
+        top_p=parsed_arguments.top_p,
+        max_output_tokens=parsed_arguments.max_output_tokens,
+        enable_tools=parsed_arguments.enable_tools,
+        enable_actions=parsed_arguments.enable_actions,
+        isolated=parsed_arguments.isolated,
     )
 
 
@@ -523,6 +640,17 @@ def resolve_runtime_configuration(
     if arguments.commit_message is not None and arguments.worktree_path is None:
         raise ConfigurationError(
             "--commit-message requires --worktree-path and --worktree-branch."
+        )
+
+    project_isolated = bool(project is not None and project.isolated)
+    if (
+        project_isolated
+        and arguments.task_prompt is not None
+        and arguments.worktree_path is None
+    ):
+        raise ConfigurationError(
+            "[coding].isolated=true requires explicit --worktree-path, "
+            "--worktree-branch, and --commit-message."
         )
 
     if arguments.agent_name is not None and arguments.agent_file is not None:
@@ -621,5 +749,5 @@ def resolve_runtime_configuration(
         ),
         worktree_path=arguments.worktree_path,
         worktree_branch=arguments.worktree_branch,
-        isolated=bool(project is not None and project.isolated),
+        isolated=arguments.worktree_path is not None or project_isolated,
     )

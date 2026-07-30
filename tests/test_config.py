@@ -11,6 +11,7 @@ from agent_workbench.config import (
     PROJECT_CONFIG_RELATIVE_PATH,
     PROVIDER_ENV_VAR,
     ProjectCodingConfiguration,
+    create_project_configuration,
     discover_project_configuration,
     get_model_name,
     get_provider_name,
@@ -200,6 +201,78 @@ isolated = false
         max_output_tokens=4096,
         isolated=False,
     )
+
+
+def _complete_project_coding_configuration(
+    **overrides: object,
+) -> ProjectCodingConfiguration:
+    """Build one complete project coding configuration for creation tests."""
+
+    values: dict[str, object] = {
+        "provider": "ollama",
+        "model": "qwen3-coder:30b",
+        "agent": "developer",
+        "enable_tools": True,
+        "enable_actions": True,
+        "max_tool_rounds": 8,
+        "temperature": 0.2,
+        "top_p": 0.9,
+        "max_output_tokens": 4096,
+        "isolated": False,
+    }
+    values.update(overrides)
+    return ProjectCodingConfiguration(**values)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"model": None}, r"\[coding\]\.model is required"),
+        ({"model": 3}, r"\[coding\]\.model.*string"),
+        ({"enable_tools": 1}, r"\[coding\]\.enable_tools.*boolean"),
+    ],
+)
+def test_project_configuration_rendering_failure_creates_no_target(
+    tmp_path: Path,
+    overrides: dict[str, object],
+    match: str,
+) -> None:
+    """Finish strict rendering validation before touching the target path."""
+
+    configuration_path = tmp_path / PROJECT_CONFIG_RELATIVE_PATH
+
+    with pytest.raises(ConfigurationError, match=match):
+        create_project_configuration(
+            tmp_path,
+            _complete_project_coding_configuration(**overrides),
+        )
+
+    assert not configuration_path.exists()
+    assert not configuration_path.parent.exists()
+
+
+def test_rendering_failure_preserves_an_existing_project_configuration(
+    tmp_path: Path,
+) -> None:
+    """Leave an existing configuration byte-for-byte unchanged on render failure."""
+
+    configuration_path = _write_project_configuration(
+        tmp_path,
+        '[coding]\nmodel = "keep-me"\n',
+    )
+    original = configuration_path.read_bytes()
+
+    with pytest.raises(
+        ConfigurationError,
+        match=r"\[coding\]\.enable_actions.*boolean",
+    ):
+        create_project_configuration(
+            tmp_path,
+            _complete_project_coding_configuration(enable_actions="yes"),
+        )
+
+    assert configuration_path.read_bytes() == original
+    assert list(configuration_path.parent.iterdir()) == [configuration_path]
 
 
 def test_project_configuration_is_discovered_from_root_and_nested_directory(

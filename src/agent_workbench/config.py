@@ -1,5 +1,6 @@
 """Configuration helpers for Agent Workbench."""
 
+import json
 import os
 import tomllib
 from dataclasses import dataclass
@@ -169,6 +170,124 @@ def load_project_configuration(
         max_output_tokens=max_output_tokens,
         isolated=isolated,
     )
+
+
+def create_project_configuration(
+    project_root: Path,
+    configuration: ProjectCodingConfiguration,
+) -> Path:
+    """Create one deterministic project configuration without overwriting."""
+
+    content = render_project_configuration(configuration)
+    configuration_path = project_root / PROJECT_CONFIG_RELATIVE_PATH
+    try:
+        configuration_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        raise ConfigurationError(
+            f"Unable to create directory for {PROJECT_CONFIG_CONTEXT}."
+        ) from None
+
+    created = False
+    try:
+        configuration_file = configuration_path.open(
+            "x",
+            encoding="utf-8",
+            newline="\n",
+        )
+        created = True
+        with configuration_file:
+            configuration_file.write(content)
+    except FileExistsError:
+        raise ConfigurationError(
+            f"{PROJECT_CONFIG_CONTEXT} already exists; existing file preserved."
+        ) from None
+    except (OSError, RuntimeError, UnicodeError):
+        if created:
+            try:
+                configuration_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise ConfigurationError(
+            f"Unable to create {PROJECT_CONFIG_CONTEXT}; no configuration was saved."
+        ) from None
+
+    return configuration_path
+
+
+def render_project_configuration(
+    configuration: ProjectCodingConfiguration,
+) -> str:
+    """Render one complete human-readable project coding configuration."""
+
+    required_values = {
+        "provider": configuration.provider,
+        "model": configuration.model,
+        "agent": configuration.agent,
+        "enable_tools": configuration.enable_tools,
+        "enable_actions": configuration.enable_actions,
+        "max_tool_rounds": configuration.max_tool_rounds,
+        "temperature": configuration.temperature,
+        "top_p": configuration.top_p,
+        "max_output_tokens": configuration.max_output_tokens,
+        "isolated": configuration.isolated,
+    }
+    missing = [key for key, value in required_values.items() if value is None]
+    if missing:
+        raise ConfigurationError(
+            f"Cannot create {PROJECT_CONFIG_CONTEXT}: "
+            f"[coding].{missing[0]} is required."
+        )
+
+    provider = _optional_project_provider(required_values)
+    model = _optional_project_non_blank_string(required_values, "model")
+    agent = _optional_project_agent(required_values)
+    enable_tools = _optional_project_boolean(required_values, "enable_tools")
+    enable_actions = _optional_project_boolean(required_values, "enable_actions")
+    max_tool_rounds = _optional_project_positive_integer(
+        required_values,
+        "max_tool_rounds",
+    )
+    temperature = _optional_project_unit_interval(required_values, "temperature")
+    top_p = _optional_project_unit_interval(required_values, "top_p")
+    max_output_tokens = _optional_project_positive_integer(
+        required_values,
+        "max_output_tokens",
+    )
+    isolated = _optional_project_boolean(required_values, "isolated")
+
+    return (
+        "[coding]\n"
+        f"provider = {_toml_string(provider)}\n"
+        f"model = {_toml_string(model)}\n"
+        f"agent = {_toml_string(agent)}\n"
+        f"enable_tools = {_toml_boolean(enable_tools)}\n"
+        f"enable_actions = {_toml_boolean(enable_actions)}\n"
+        f"max_tool_rounds = {max_tool_rounds}\n"
+        f"temperature = {temperature}\n"
+        f"top_p = {top_p}\n"
+        f"max_output_tokens = {max_output_tokens}\n"
+        f"isolated = {_toml_boolean(isolated)}\n"
+    )
+
+
+def _toml_string(value: object) -> str:
+    """Encode a validated string as one TOML basic string."""
+
+    if not isinstance(value, str):
+        raise ConfigurationError(
+            f"Cannot create {PROJECT_CONFIG_CONTEXT}: expected a string."
+        )
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _toml_boolean(value: object) -> str:
+    """Encode a validated strict boolean for TOML."""
+
+    if not isinstance(value, bool):
+        raise ConfigurationError(
+            f"Cannot create {PROJECT_CONFIG_CONTEXT}: expected a boolean."
+        )
+    return "true" if value else "false"
 
 
 def _optional_project_provider(
