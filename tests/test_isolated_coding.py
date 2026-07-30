@@ -8,18 +8,24 @@ from unittest.mock import Mock
 
 import pytest
 
-from agent_workbench.arguments import RuntimeConfiguration
+from agent_workbench.arguments import (
+    CLIArguments,
+    RuntimeConfiguration,
+    resolve_runtime_configuration,
+)
 from agent_workbench.coding_loop import (
     AutonomousCodingResult,
     CodingPhase,
     ValidationRun,
 )
 from agent_workbench.errors import CompletionError, ConfigurationError
+from agent_workbench.config import discover_project_configuration
 from agent_workbench.isolated_coding import (
     IsolatedAutonomousWorkflowResult,
     run_isolated_autonomous_workflow,
 )
 from agent_workbench.session import SessionId
+from agent_workbench.messages import ChatRequest, ChatResponse
 from agent_workbench.tasks import TaskSpec
 from agent_workbench.tools import ToolApprovalDecision
 from agent_workbench.worktree_commits import MAX_COMMIT_MESSAGE_BYTES
@@ -266,6 +272,96 @@ def test_runs_isolated_task_and_creates_verified_local_commit(
         run_git(target, "log", "-1", "--pretty=%s").stdout.strip()
         == "fix: correct add implementation"
     )
+
+
+def test_isolated_coding_uses_discovered_project_instructions_in_provider_request(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Cover exact-root discovery through an isolated provider request and task."""
+
+    source = create_repository(tmp_path / "source")
+    configuration_directory = source / ".agent-workbench"
+    configuration_directory.mkdir()
+    (configuration_directory / "config.toml").write_text(
+        '[coding]\nprovider = "ollama"\nmodel = "test-model"\nenable_actions = true\n',
+        encoding="utf-8",
+    )
+    project_instructions = "# Isolated Project\n\n- Preserve isolation.\n"
+    (configuration_directory / "instructions.md").write_text(
+        project_instructions,
+        encoding="utf-8",
+    )
+    run_git(source, "add", ".agent-workbench")
+    run_git(source, "commit", "-m", "add project configuration")
+    nested = source / "src" / "package"
+    nested.mkdir(parents=True)
+    discovered = discover_project_configuration(nested)
+    assert discovered is not None
+    task = "Correct the add implementation."
+    runtime = resolve_runtime_configuration(
+        CLIArguments(
+            provider_name=None,
+            model_name=None,
+            task_prompt=task,
+            system_prompt="Existing system instructions.",
+        ),
+        project_configuration=discovered,
+    )
+    target = tmp_path / "isolated"
+    requests: list[ChatRequest] = []
+
+    def complete(request: ChatRequest) -> ChatResponse:
+        requests.append(request)
+        return ChatResponse(text="Captured.")
+
+    provider = SimpleNamespace(
+        name="Fake",
+        model_name="test-model",
+        complete=complete,
+    )
+    monkeypatch.setattr(
+        "agent_workbench.session_factory.create_provider",
+        lambda _provider_name, _model_name: provider,
+    )
+
+    def run_coding(session, prompt, **_kwargs):
+        assert prompt == task
+        session.send(prompt, allowed_tool_names=())
+        (target / "module.py").write_text(
+            "def add(left: int, right: int) -> int:\n    return left + right\n",
+            encoding="utf-8",
+        )
+        return coding_result()
+
+    monkeypatch.setattr(
+        "agent_workbench.isolated_coding.run_autonomous_coding_task",
+        run_coding,
+    )
+
+    run_isolated_autonomous_workflow(
+        SessionId("isolated-project-instructions"),
+        runtime,
+        "agent/project-instructions",
+        target,
+        task,
+        "fix: use project instructions",
+        worktree_approval_handler=approve,
+        tool_approval_handler=approve,
+        commit_approval_handler=approve,
+    )
+
+    expected_system_prompt = (
+        "Existing system instructions.\n\n"
+        "<project_instructions>\n"
+        f"{project_instructions}\n"
+        "</project_instructions>"
+    )
+    assert requests[0].system_prompt == expected_system_prompt
+    assert requests[0].system_prompt.count(project_instructions) == 1
+    assert requests[0].messages == [{"role": "user", "content": task}]
+    assert nested.is_dir()
+    assert run_git(source, "status", "--short").stdout == ""
 
 
 def test_commits_exact_new_files_after_untracked_verification(

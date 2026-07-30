@@ -1757,6 +1757,78 @@ def test_short_code_command_uses_detected_project_root_and_configuration(
     )
 
 
+def test_nested_direct_coding_sends_only_exact_root_instructions_as_system_context(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """Cover discovery through the provider request without instruction leakage."""
+
+    outer_configuration = tmp_path / PROJECT_CONFIG_RELATIVE_PATH
+    outer_configuration.parent.mkdir()
+    outer_configuration.write_text(EXPECTED_INITIALIZED_CONFIG, encoding="utf-8")
+    (outer_configuration.parent / "instructions.md").write_text(
+        "Outer instructions must not load.",
+        encoding="utf-8",
+    )
+    project = tmp_path / "workspace" / "project"
+    configuration_path = project / PROJECT_CONFIG_RELATIVE_PATH
+    configuration_path.parent.mkdir(parents=True)
+    configuration_path.write_text(EXPECTED_INITIALIZED_CONFIG, encoding="utf-8")
+    project_instructions = "# Project\n\n- Use the exact configured root.\n"
+    (configuration_path.parent / "instructions.md").write_text(
+        project_instructions,
+        encoding="utf-8",
+    )
+    (project / "AGENTS.md").write_text(
+        "AGENTS content must not load.",
+        encoding="utf-8",
+    )
+    sibling = tmp_path / "workspace" / "sibling" / ".agent-workbench"
+    sibling.mkdir(parents=True)
+    (sibling / "instructions.md").write_text(
+        "Sibling instructions must not load.",
+        encoding="utf-8",
+    )
+    nested = project / "src" / "package"
+    nested.mkdir(parents=True)
+    monkeypatch.chdir(nested)
+    provider = FakeProvider(["Captured."])
+    monkeypatch.setattr(
+        "agent_workbench.session_factory.create_provider",
+        lambda _provider_name, _model_name: provider,
+    )
+
+    task = "Fix the failing tests."
+
+    def run_task(session, prompt, **_kwargs):
+        assert prompt == task
+        response = session.send(prompt, allowed_tool_names=())
+        return Mock(assistant_summary=response.text)
+
+    monkeypatch.setattr("agent_workbench.cli.run_autonomous_coding_task", run_task)
+
+    main(
+        [
+            "code",
+            "--system-prompt",
+            "Existing system instructions.",
+            task,
+        ]
+    )
+
+    assert provider.requests[0].system_prompt == (
+        "Existing system instructions.\n\n"
+        "<project_instructions>\n"
+        f"{project_instructions}\n"
+        "</project_instructions>"
+    )
+    assert provider.requests[0].system_prompt.count(project_instructions) == 1
+    assert provider.requests[0].messages == [{"role": "user", "content": task}]
+    assert "Outer instructions" not in provider.requests[0].system_prompt
+    assert "Sibling instructions" not in provider.requests[0].system_prompt
+    assert "AGENTS content" not in provider.requests[0].system_prompt
+
+
 def test_invalid_project_configuration_prevents_provider_construction(
     monkeypatch,
     tmp_path,
