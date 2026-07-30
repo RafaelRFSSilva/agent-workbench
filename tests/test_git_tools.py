@@ -10,6 +10,9 @@ from agent_workbench.errors import WorkspacePathError
 from agent_workbench.git_tools import (
     GIT_TIMEOUT_SECONDS,
     MAX_GIT_OUTPUT_BYTES,
+    MAX_UNTRACKED_EVIDENCE_BYTES,
+    MAX_UNTRACKED_FILES,
+    MAX_UNTRACKED_FILE_BYTES,
     inspect_workspace_git_diff,
     inspect_workspace_git_status,
     register_git_tools,
@@ -80,7 +83,10 @@ def test_registers_git_tools_with_exact_schemas_and_order(tmp_path: Path) -> Non
     ]
     assert [definition.description for definition in registry.definitions[1:]] == [
         "Inspect the Git working-tree status inside the authorized workspace.",
-        "Inspect the current unstaged and staged Git diff inside the authorized workspace.",
+        (
+            "Inspect the current unstaged, staged, and safe untracked Git "
+            "evidence inside the authorized workspace."
+        ),
     ]
     assert [definition.input_schema for definition in registry.definitions[1:]] == [
         {
@@ -191,6 +197,156 @@ def test_inspects_unstaged_staged_and_path_scoped_diffs(tmp_path: Path) -> None:
     assert status_after_inspection == b" M README.md\nA  staged.txt\n"
 
 
+def test_includes_untracked_text_diff_without_mutating_index(
+    tmp_path: Path,
+) -> None:
+    """Represent one new text file while leaving it untracked and unstaged."""
+
+    root, workspace = create_workspace(tmp_path)
+    initialize_repository(root)
+    (root / "new.py").write_text("value = 1\n", encoding="utf-8")
+    status_before = run_git(root, "status", "--porcelain=v1").stdout
+    index_before = run_git(root, "diff", "--cached", "--binary").stdout
+
+    result = inspect_workspace_git_diff(workspace, {})
+
+    assert result["unstaged"] == ""
+    assert result["staged"] == ""
+    assert "diff --git a/new.py b/new.py" in result["untracked"]
+    assert "new file mode 100644" in result["untracked"]
+    assert "--- /dev/null" in result["untracked"]
+    assert "+++ b/new.py" in result["untracked"]
+    assert "+value = 1" in result["untracked"]
+    assert result["untracked_omitted"] == []
+    assert run_git(root, "diff", "--cached", "--binary").stdout == index_before
+    assert run_git(root, "status", "--porcelain=v1").stdout == status_before
+    assert status_before == b"?? new.py\n"
+
+
+def test_orders_multiple_untracked_files_and_honors_path_scope(
+    tmp_path: Path,
+) -> None:
+    """Return complete new-file evidence in deterministic relative-path order."""
+
+    root, workspace = create_workspace(tmp_path)
+    initialize_repository(root)
+    nested = root / "middle"
+    nested.mkdir()
+    (root / "zeta.txt").write_text("zeta\n", encoding="utf-8")
+    (root / "alpha.txt").write_text("alpha\n", encoding="utf-8")
+    (nested / "item.txt").write_text("middle\n", encoding="utf-8")
+
+    full = inspect_workspace_git_diff(workspace, {})
+    scoped = inspect_workspace_git_diff(workspace, {"path": "middle/item.txt"})
+
+    assert full["untracked"].index("a/alpha.txt") < full["untracked"].index(
+        "a/middle/item.txt"
+    )
+    assert full["untracked"].index("a/middle/item.txt") < full["untracked"].index(
+        "a/zeta.txt"
+    )
+    assert "middle/item.txt" in scoped["untracked"]
+    assert "alpha.txt" not in scoped["untracked"]
+    assert "zeta.txt" not in scoped["untracked"]
+
+
+def test_preserves_tracked_diff_while_adding_untracked_evidence(
+    tmp_path: Path,
+) -> None:
+    """Keep existing tracked and staged fields unchanged for mixed changes."""
+
+    root, workspace = create_workspace(tmp_path)
+    initialize_repository(root)
+    (root / "README.md").write_text("tracked change\n", encoding="utf-8")
+    (root / "new.txt").write_text("untracked change\n", encoding="utf-8")
+
+    result = inspect_workspace_git_diff(workspace, {})
+
+    assert "-baseline" in result["unstaged"]
+    assert "+tracked change" in result["unstaged"]
+    assert result["staged"] == ""
+    assert "+untracked change" in result["untracked"]
+
+
+def test_omits_oversized_and_binary_untracked_contents_with_metadata(
+    tmp_path: Path,
+) -> None:
+    """Return bounded safe markers without exposing unsupported file bodies."""
+
+    assert MAX_UNTRACKED_FILES == 64
+    assert MAX_UNTRACKED_FILE_BYTES == 32 * 1024
+    assert MAX_UNTRACKED_EVIDENCE_BYTES == 64 * 1024
+    root, workspace = create_workspace(tmp_path)
+    initialize_repository(root)
+    (root / "large.txt").write_bytes(b"x" * (MAX_UNTRACKED_FILE_BYTES + 1))
+    (root / "binary.dat").write_bytes(b"private\0\xffcontent")
+
+    result = inspect_workspace_git_diff(workspace, {})
+
+    assert result["untracked"] == ""
+    assert result["untracked_omitted"] == [
+        {
+            "path": "binary.dat",
+            "reason": "binary_or_non_utf8",
+            "size_bytes": 16,
+        },
+        {
+            "path": "large.txt",
+            "reason": "exceeds_file_size_limit",
+            "size_bytes": MAX_UNTRACKED_FILE_BYTES + 1,
+        },
+    ]
+    assert "private" not in str(result)
+    assert "content" not in str(result)
+
+
+def test_omits_sensitive_and_generated_untracked_paths_without_exposure(
+    tmp_path: Path,
+) -> None:
+    """Exclude private and traversal-ignored paths from all visible evidence."""
+
+    root, workspace = create_workspace(tmp_path)
+    initialize_repository(root)
+    (root / ".env").write_text("TOKEN=private\n", encoding="utf-8")
+    for directory_name in (".venv", "node_modules", "dist", "build"):
+        directory = root / directory_name
+        directory.mkdir()
+        (directory / "private.txt").write_text(
+            f"private {directory_name}\n",
+            encoding="utf-8",
+        )
+
+    result = inspect_workspace_git_diff(workspace, {})
+
+    assert result["untracked"] == ""
+    assert result["untracked_omitted"] == [
+        {
+            "reason": "unsafe_or_ignored",
+            "file_count": 5,
+        }
+    ]
+    assert ".env" not in str(result)
+    assert ".venv" not in str(result)
+    assert "node_modules" not in str(result)
+    assert "private" not in str(result)
+
+
+def test_inspects_empty_repository_without_untracked_evidence(tmp_path: Path) -> None:
+    """Return stable empty fields for an unborn repository with no files."""
+
+    root, workspace = create_workspace(tmp_path)
+    run_git(root, "init")
+
+    result = inspect_workspace_git_diff(workspace, {})
+
+    assert result == {
+        "unstaged": "",
+        "staged": "",
+        "untracked": "",
+        "untracked_omitted": [],
+    }
+
+
 def test_rejects_traversal_and_non_repository_workspaces(tmp_path: Path) -> None:
     """Delegate path containment and reject workspaces without a Git worktree."""
 
@@ -225,7 +381,12 @@ def test_uses_fixed_non_shell_commands_and_disables_external_diffs(
     inspect_workspace_git_status(workspace, {})
     inspect_workspace_git_diff(workspace, {})
 
-    status_call, diff_unstaged_call, diff_staged_call = run_mock.call_args_list
+    (
+        status_call,
+        diff_unstaged_call,
+        diff_staged_call,
+        untracked_call,
+    ) = run_mock.call_args_list
     assert status_call.args[0] == [
         "git",
         "-c",
@@ -253,6 +414,16 @@ def test_uses_fixed_non_shell_commands_and_disables_external_diffs(
         "diff",
         "--cached",
         "--no-ext-diff",
+        "--",
+    ]
+    assert untracked_call.args[0] == [
+        "git",
+        "-c",
+        "core.pager=cat",
+        "ls-files",
+        "--others",
+        "--exclude-standard",
+        "-z",
         "--",
     ]
     assert all(call.kwargs["shell"] is False for call in run_mock.call_args_list)

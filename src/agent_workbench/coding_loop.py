@@ -652,13 +652,18 @@ def _require_verification_success(
         )
     unstaged = diff_output.get("unstaged")
     staged = diff_output.get("staged")
-    if not isinstance(unstaged, str) or not isinstance(staged, str):
+    untracked = diff_output.get("untracked", "")
+    if (
+        not isinstance(unstaged, str)
+        or not isinstance(staged, str)
+        or not isinstance(untracked, str)
+    ):
         raise _workflow_failure(
             state,
             CodingPhase.VERIFY,
             "inspect_git_diff returned invalid evidence",
         )
-    if not unstaged.strip() and not staged.strip():
+    if not unstaged.strip() and not staged.strip() and not untracked.strip():
         raise _workflow_failure(
             state,
             CodingPhase.VERIFY,

@@ -918,6 +918,53 @@ def test_successful_actions_with_empty_final_diff_are_rejected(
     assert run_git(repository, "status", "--short").stdout == ""
 
 
+def test_safe_untracked_git_evidence_satisfies_final_diff_gate(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Treat safe untracked text evidence as a non-empty verified change."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    original = "def add(left: int, right: int) -> int:\n    return left - right\n"
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            replacement_response(
+                "edit",
+                expected_content=original,
+                expected_text="return left - right",
+                replacement_text="return left + right",
+            ),
+            ChatResponse(text="Edit complete."),
+        ]
+    )
+    monkeypatch.setattr(
+        "agent_workbench.git_tools.inspect_workspace_git_diff",
+        lambda _workspace, _arguments: {
+            "unstaged": "",
+            "staged": "",
+            "untracked": (
+                "diff --git a/new.py b/new.py\n"
+                "new file mode 100644\n"
+                "--- /dev/null\n"
+                "+++ b/new.py\n"
+                "@@ -0,0 +1 @@\n"
+                "+value = 1\n"
+            ),
+            "untracked_omitted": [],
+        },
+    )
+
+    result = run_autonomous_coding_task(
+        create_session(repository, provider),
+        "Correct the add implementation.",
+        tool_approval_handler=approve,
+    )
+
+    assert result.final_phase is CodingPhase.DONE
+    assert result.inspected_git_diff_after_change is True
+
+
 def test_failed_git_inspection_prevents_done(tmp_path: Path) -> None:
     """Reject successful validation when final Git diff inspection errors."""
 
