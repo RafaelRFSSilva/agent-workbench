@@ -5,11 +5,92 @@
 Agent Workbench should allow each software repository to define how AI agents
 are configured and how they may interact with that project.
 
-The current command-line arguments provide explicit runtime configuration.
+The current command-line interface supports explicit runtime configuration and
+discovers foundational coding defaults from `.agent-workbench/config.toml`.
+Configured projects may also provide automatic project-level coding
+instructions. The broader structures described later in this document remain
+future design work.
 
-A future project configuration directory will make that configuration
-discoverable, reusable, version-controlled, and accessible from terminal and
-VS Code interfaces.
+## Implemented Project Coding Instructions
+
+A configured project may contain:
+
+```text
+your-project/
+├── .agent-workbench/
+│   ├── config.toml
+│   └── instructions.md
+└── project source files
+```
+
+The `instructions.md` file is optional. It belongs to the exact project root
+containing the `.agent-workbench/config.toml` selected by configuration
+discovery. Starting a coding command in a nested directory uses that discovered
+root; Agent Workbench does not perform a separate instructions traversal or
+load instructions from a parent project, sibling repository, neighbouring
+worktree, or user home directory.
+
+`agent-workbench init` creates `config.toml`, but it does not create
+`instructions.md`. A minimal configured workflow is:
+
+```bash
+agent-workbench init --provider ollama --model gpt-oss:20b
+agent-workbench code "Fix the failing tests."
+```
+
+An instructions file can contain ordinary Markdown such as:
+
+```markdown
+# Project Instructions
+
+- Use Python 3.12.
+- Keep all public functions fully typed.
+- Prefer small, focused changes.
+- Run Ruff and pytest after modifications.
+- Do not modify public APIs without explicit approval.
+```
+
+### Loading and validation
+
+Project instructions must be a regular, readable file encoded as strict UTF-8.
+The maximum size is 102,400 bytes: content exactly at 100 KiB is accepted, and
+larger content is rejected before session or provider construction. Invalid
+UTF-8, directories, and unsupported filesystem objects are rejected with
+concise configuration errors. Empty and whitespace-only files are valid but
+contribute no additional instructions. Agent Workbench reads the contents
+without modifying, creating, deleting, renaming, or normalizing the source
+file.
+
+### System-context composition
+
+For coding tasks, the complete existing system prompt or agent-profile
+instructions remain first. Agent Workbench then appends exactly one section:
+
+```text
+<project_instructions>
+...
+</project_instructions>
+```
+
+The original non-whitespace Markdown is preserved inside the delimiter. The
+source path is not included in model context, and the contents are not inserted
+into the user task, treated as a context-file attachment, or duplicated.
+Explicit system prompts and built-in or custom agent profiles retain their
+existing selection semantics. Direct and isolated coding workflows use the
+same system-context composition, and validated instructions do not leak into
+later, unrelated sessions. Non-coding interactive sessions do not apply these
+coding instructions.
+
+### Security boundary
+
+Project instructions are model instructions, not executable commands, tool
+authorization, or approval. They do not bypass default-deny tool and action
+approvals and cannot authorize arbitrary command execution. File modifications
+and fixed validation commands remain subject to the existing approval policy.
+
+A local Codex `AGENTS.md` is separate operator guidance. Agent Workbench loads
+only `.agent-workbench/instructions.md` for this feature and does not treat
+`AGENTS.md` as project instructions.
 
 ## Proposed Project Structure
 
@@ -829,21 +910,16 @@ configuration framework before the underlying runtime models are stable.
 
 ## Current Status
 
-Project-local configuration discovery is not implemented.
+Project-local `.agent-workbench/config.toml` discovery and optional
+`.agent-workbench/instructions.md` coding instructions are implemented. The
+current application also supports command-line arguments, environment and
+`.env` configuration, explicit profile and context files, and prompt-based
+interactive setup.
 
-The current application still requires:
-
-- Command-line arguments.
-- Environment configuration.
-- A local `.env` file.
-- Explicit profile files.
-- Explicit context file paths.
-- Prompt-based interactive setup.
-
-The proposed `.agent-workbench/` structure, skills, commands, rules, and MCP
-configuration describe the intended future direction.
-
-They must not be presented as current functionality.
+The other proposed `.agent-workbench/` structures in this document—including
+local overrides, project agents, rules, skills, commands, and MCP
+configuration—remain future direction and must not be presented as current
+functionality.
 
 ## Open Design Questions
 

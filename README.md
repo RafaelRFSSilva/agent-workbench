@@ -20,6 +20,8 @@ Implemented capabilities:
 - Provider-independent requests through `ChatProvider` and `ChatRequest`.
 - Interactive multi-turn conversations with in-memory history.
 - Runtime provider and model selection.
+- Discoverable `.agent-workbench/config.toml` coding defaults and optional
+  project-level coding instructions.
 - Secure `.env` configuration.
 - System prompts.
 - Built-in and custom TOML agent profiles.
@@ -156,6 +158,63 @@ Normal coding output is concise controller-owned progress. Exact mutation
 diffs still appear before approval. Add `--show-tool-traces` only when
 debugging tool calls, or `--show-assistant-summary` to display the model's
 complete final prose.
+
+## Project Coding Instructions
+
+A configured repository may include an optional project-instructions file next
+to its project configuration:
+
+```text
+.agent-workbench/
+├── config.toml
+└── instructions.md
+```
+
+Create the configuration, then add `instructions.md` separately as needed;
+`agent-workbench init` does not create the instructions file.
+
+```bash
+agent-workbench init --provider ollama --model gpt-oss:20b
+agent-workbench code "Fix the failing tests."
+```
+
+For example, `.agent-workbench/instructions.md` may contain:
+
+```markdown
+# Project Instructions
+
+- Use Python 3.12.
+- Keep all public functions fully typed.
+- Prefer small, focused changes.
+- Run Ruff and pytest after modifications.
+- Do not modify public APIs without explicit approval.
+```
+
+Coding invoked from a nested directory discovers the nearest
+`.agent-workbench/config.toml` and loads `instructions.md` only from that same
+project root. The optional file must be a regular, readable strict UTF-8 file
+no larger than 102,400 bytes; exactly 100 KiB is accepted, while larger files
+are rejected. Empty and whitespace-only files contribute no instructions.
+
+The contents are appended after the existing system prompt or agent-profile
+instructions as exactly one system-level section:
+
+```text
+<project_instructions>
+...
+</project_instructions>
+```
+
+They are never inserted into the user task. Direct and isolated coding use the
+same composition contract. A local Codex `AGENTS.md` is separate operator
+guidance and is not loaded as Agent Workbench project instructions.
+
+Project instructions are model context, not executable commands or permission
+grants. They do not bypass tool or action approvals, cannot authorize arbitrary
+command execution, and do not change the existing approval policy for file
+modifications or validation commands.
+
+See [Project Configuration](docs/project-configuration.md).
 
 ## Local Ollama Setup
 
@@ -782,6 +841,8 @@ force removal, merge, push, or branch deletion. See the
 ```text
 Command-Line Arguments
         ↓
+Project .agent-workbench/config.toml
+        ↓
 Runtime Environment Variables
         ↓
 Local .env File
@@ -833,12 +894,14 @@ Completed foundations:
 - [x] End-to-end isolated autonomous workflow: create an approved worktree,
   run controlled coding, require validation and Git inspection, create an
   approved exact local commit, and preserve the worktree and branch.
+- [x] Project configuration discovery and optional project-level coding
+  instructions for direct and isolated workflows.
 
 Next milestones:
 
 - [ ] Persistent lifecycle records and crash-safe restart recovery.
 - [ ] Deletion and rename transactions with explicit conflict handling.
-- [ ] Local project retrieval and project configuration.
+- [ ] Local project retrieval and broader project configuration capabilities.
 - [ ] Task lifecycle, assignment, dependencies, and multi-agent orchestration.
 - [ ] Terminal and VS Code interfaces.
 - [ ] Voice input, evaluation, persistence, MCP, and AWS deployment.
