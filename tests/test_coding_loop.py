@@ -181,6 +181,27 @@ def replacement_response(
     )
 
 
+def rewrite_response(
+    invocation_id: str,
+    *,
+    expected_content: str,
+    replacement_content: str,
+) -> ChatResponse:
+    """Create one optimistic SHA-guarded whole-file rewrite response."""
+
+    return tool_response(
+        invocation_id,
+        "apply_file_rewrite",
+        {
+            "path": "module.py",
+            "expected_file_sha256": hashlib.sha256(
+                expected_content.encode("utf-8")
+            ).hexdigest(),
+            "replacement_content": replacement_content,
+        },
+    )
+
+
 def approve(_request) -> ToolApprovalDecision:
     """Approve one action inside a disposable test repository."""
 
@@ -255,6 +276,7 @@ def test_controller_runs_discover_edit_validate_verify_and_done(
     assert not discover_tools.intersection(
         {
             "apply_file_patch",
+            "apply_file_rewrite",
             "apply_text_replacement",
             "apply_workspace_changes",
             "run_ruff_format",
@@ -265,6 +287,7 @@ def test_controller_runs_discover_edit_validate_verify_and_done(
     edit_tools = {tool.name for tool in provider.requests[2].tools}
     assert {
         "apply_file_patch",
+        "apply_file_rewrite",
         "apply_text_replacement",
         "apply_workspace_changes",
     }.issubset(edit_tools)
@@ -735,6 +758,21 @@ def test_repeated_validation_failure_stops_at_repair_limit(
     ("tool_name", "arguments"),
     [
         (
+            "apply_file_rewrite",
+            {
+                "path": "module.py",
+                "expected_file_sha256": hashlib.sha256(
+                    (
+                        "def add(left: int, right: int) -> int:\n"
+                        "    return left - right\n"
+                    ).encode("utf-8")
+                ).hexdigest(),
+                "replacement_content": (
+                    "def add(left: int, right: int) -> int:\n    return left + right\n"
+                ),
+            },
+        ),
+        (
             "apply_file_patch",
             {
                 "path": "module.py",
@@ -792,6 +830,38 @@ def test_all_controlled_workspace_action_shapes_count_as_changes(
     assert result.workspace_change_applied is True
     assert tool_name in result.executed_tool_names
     assert result.validation_succeeded is True
+
+
+def test_successful_file_rewrite_reaches_validation_done_and_path_evidence(
+    tmp_path: Path,
+) -> None:
+    """Treat a successful rewrite as the exact approved changed path."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    original = "def add(left: int, right: int) -> int:\n    return left - right\n"
+    replacement = "def add(left: int, right: int) -> int:\n    return left + right\n"
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            rewrite_response(
+                "rewrite",
+                expected_content=original,
+                replacement_content=replacement,
+            ),
+            ChatResponse(text="Rewrite complete."),
+        ]
+    )
+
+    result = run_autonomous_coding_task(
+        create_session(repository, provider),
+        "Correct the add implementation.",
+        tool_approval_handler=approve,
+    )
+
+    assert result.final_phase is CodingPhase.DONE
+    assert result.validation_succeeded is True
+    assert result.approved_workspace_paths == ("module.py",)
+    assert "apply_file_rewrite" in result.approved_action_names
 
 
 def test_repairs_without_new_changes_stop_without_revalidating(

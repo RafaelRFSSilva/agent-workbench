@@ -57,6 +57,7 @@ _VALIDATION_TOOL_NAMES = (
 _WORKSPACE_CHANGE_TOOL_NAMES = frozenset(
     {
         "apply_file_patch",
+        "apply_file_rewrite",
         "apply_text_replacement",
         "apply_workspace_changes",
     }
