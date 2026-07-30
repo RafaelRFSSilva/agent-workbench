@@ -2,6 +2,7 @@
 
 import json
 from collections.abc import Sequence
+from pathlib import Path
 
 from agent_workbench.agents import AgentProfile
 from agent_workbench.arguments import (
@@ -17,7 +18,7 @@ from agent_workbench.coding_loop import (
     CodingPhase,
     run_autonomous_coding_task,
 )
-from agent_workbench.config import load_environment
+from agent_workbench.config import discover_project_configuration, load_environment
 from agent_workbench.errors import (
     CompletionError,
     ConfigurationError,
@@ -129,7 +130,15 @@ def main(
         if arguments.setup:
             runtime_configuration = run_interactive_setup()
         else:
-            runtime_configuration = resolve_runtime_configuration(arguments)
+            project_configuration = discover_project_configuration(
+                arguments.workspace_root
+                if arguments.workspace_root is not None
+                else Path.cwd()
+            )
+            runtime_configuration = resolve_runtime_configuration(
+                arguments,
+                project_configuration=project_configuration,
+            )
     except ConfigurationError as exc:
         print(f"Configuration error: {exc}")
         return

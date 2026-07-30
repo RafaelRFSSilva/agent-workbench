@@ -16,6 +16,7 @@ from agent_workbench.agents import (
 
 from agent_workbench.config import (
     SUPPORTED_PROVIDERS,
+    ProjectConfiguration,
     ProviderName,
     get_model_name,
     get_provider_name,
@@ -79,6 +80,7 @@ class RuntimeConfiguration:
     max_tool_rounds: int = DEFAULT_AUTONOMOUS_MAX_TOOL_ROUNDS
     worktree_path: Path | None = None
     worktree_branch: str | None = None
+    isolated: bool = False
 
 
 def _non_empty_model_name(value: str) -> str:
@@ -463,19 +465,45 @@ def parse_cli_arguments(
 
 def resolve_runtime_configuration(
     arguments: CLIArguments,
+    *,
+    project_configuration: ProjectConfiguration | None = None,
 ) -> RuntimeConfiguration:
-    """Resolve CLI overrides against environment-based configuration."""
+    """Resolve CLI overrides against project and application configuration."""
+
+    project = (
+        project_configuration.configuration
+        if project_configuration is not None
+        else None
+    )
 
     if arguments.provider_name is not None and arguments.model_name is None:
         raise ConfigurationError("--model is required when --provider is specified.")
 
-    if arguments.task_prompt is not None and not arguments.enable_actions:
-        raise ConfigurationError("--task requires --enable-actions.")
+    enable_tools = arguments.enable_tools or bool(
+        project is not None and project.enable_tools
+    )
+    enable_actions = arguments.enable_actions or bool(
+        project is not None and project.enable_actions
+    )
+    workspace_root = (
+        arguments.workspace_root
+        if arguments.workspace_root is not None
+        else (
+            project_configuration.project_root
+            if project_configuration is not None
+            else None
+        )
+    )
+
+    if arguments.task_prompt is not None and not enable_actions:
+        raise ConfigurationError(
+            "--task requires --enable-actions or [coding].enable_actions=true."
+        )
 
     if arguments.max_tool_rounds is not None and arguments.task_prompt is None:
         raise ConfigurationError("--max-tool-rounds requires --task.")
 
-    if arguments.enable_actions and arguments.workspace_root is None:
+    if enable_actions and workspace_root is None:
         raise ConfigurationError("--enable-actions requires --workspace.")
 
     if (arguments.worktree_path is None) != (arguments.worktree_branch is None):
@@ -483,7 +511,7 @@ def resolve_runtime_configuration(
             "--worktree-path and --worktree-branch must be supplied together."
         )
 
-    if arguments.worktree_path is not None and arguments.workspace_root is None:
+    if arguments.worktree_path is not None and workspace_root is None:
         raise ConfigurationError("Worktree isolation options require --workspace.")
 
     if arguments.worktree_path is not None and arguments.task_prompt is None:
@@ -508,10 +536,13 @@ def resolve_runtime_configuration(
             "--agent-file cannot be combined with --system-prompt."
         )
 
+    project_agent_name = project.agent if project is not None else None
     if arguments.agent_file is not None:
         agent_profile = load_agent_profile_file(arguments.agent_file)
     elif arguments.agent_name is not None:
         agent_profile = get_agent_profile(arguments.agent_name)
+    elif arguments.system_prompt is None and project_agent_name is not None:
+        agent_profile = get_agent_profile(project_agent_name)
     else:
         agent_profile = None
 
@@ -526,9 +557,27 @@ def resolve_runtime_configuration(
     )
 
     generation_config = GenerationConfig(
-        temperature=arguments.temperature,
-        top_p=arguments.top_p,
-        max_output_tokens=arguments.max_output_tokens,
+        temperature=(
+            arguments.temperature
+            if arguments.temperature is not None
+            else project.temperature
+            if project is not None
+            else None
+        ),
+        top_p=(
+            arguments.top_p
+            if arguments.top_p is not None
+            else project.top_p
+            if project is not None
+            else None
+        ),
+        max_output_tokens=(
+            arguments.max_output_tokens
+            if arguments.max_output_tokens is not None
+            else project.max_output_tokens
+            if project is not None
+            else None
+        ),
     )
 
     response_format = (
@@ -537,8 +586,16 @@ def resolve_runtime_configuration(
         else None
     )
 
-    provider_name = arguments.provider_name or get_provider_name()
-    model_name = arguments.model_name or get_model_name(provider_name)
+    provider_name = (
+        arguments.provider_name
+        or (project.provider if project is not None else None)
+        or get_provider_name()
+    )
+    model_name = (
+        arguments.model_name
+        or (project.model if project is not None else None)
+        or get_model_name(provider_name)
+    )
 
     return RuntimeConfiguration(
         provider_name=provider_name,
@@ -548,16 +605,21 @@ def resolve_runtime_configuration(
         context_documents=context_documents,
         generation_config=generation_config,
         response_format=response_format,
-        enable_tools=arguments.enable_tools,
-        workspace_root=arguments.workspace_root,
-        enable_actions=arguments.enable_actions,
+        enable_tools=enable_tools,
+        workspace_root=workspace_root,
+        enable_actions=enable_actions,
         show_tool_traces=arguments.show_tool_traces,
         show_assistant_summary=arguments.show_assistant_summary,
         max_tool_rounds=(
             arguments.max_tool_rounds
             if arguments.max_tool_rounds is not None
-            else DEFAULT_AUTONOMOUS_MAX_TOOL_ROUNDS
+            else (
+                project.max_tool_rounds
+                if project is not None and project.max_tool_rounds is not None
+                else DEFAULT_AUTONOMOUS_MAX_TOOL_ROUNDS
+            )
         ),
         worktree_path=arguments.worktree_path,
         worktree_branch=arguments.worktree_branch,
+        isolated=bool(project is not None and project.isolated),
     )

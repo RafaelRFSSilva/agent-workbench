@@ -1486,6 +1486,68 @@ def test_main_reports_invalid_workspace_configuration(
     run_cli_mock.assert_not_called()
 
 
+def test_main_discovers_explicit_workspace_configuration_before_provider(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """Start project configuration discovery at an explicit workspace."""
+
+    configuration = RuntimeConfiguration(
+        provider_name="ollama",
+        model_name="project-model",
+    )
+    discovered = Mock()
+    discover_mock = Mock(return_value=discovered)
+    resolve_mock = Mock(return_value=configuration)
+    create_mock = Mock(return_value=Mock(tool_registry=None))
+
+    monkeypatch.setattr("agent_workbench.cli.load_environment", Mock())
+    monkeypatch.setattr(
+        "agent_workbench.cli.discover_project_configuration",
+        discover_mock,
+    )
+    monkeypatch.setattr(
+        "agent_workbench.cli.resolve_runtime_configuration",
+        resolve_mock,
+    )
+    monkeypatch.setattr("agent_workbench.cli.create_agent_session", create_mock)
+    monkeypatch.setattr("agent_workbench.cli.run_cli", Mock())
+
+    main(["--workspace", str(tmp_path)])
+
+    discover_mock.assert_called_once_with(tmp_path)
+    assert resolve_mock.call_args.kwargs["project_configuration"] is discovered
+
+
+def test_invalid_project_configuration_prevents_provider_construction(
+    monkeypatch,
+    tmp_path,
+    capsys,
+) -> None:
+    """Fail safely before constructing any provider-backed session."""
+
+    failure = ConfigurationError(
+        "project configuration .agent-workbench/config.toml: "
+        "unknown key [coding].api_key"
+    )
+    create_mock = Mock()
+
+    monkeypatch.setattr("agent_workbench.cli.load_environment", Mock())
+    monkeypatch.setattr(
+        "agent_workbench.cli.discover_project_configuration",
+        Mock(side_effect=failure),
+    )
+    monkeypatch.setattr("agent_workbench.cli.create_agent_session", create_mock)
+
+    main(["code", "--workspace", str(tmp_path), "--task", "Fix it."])
+
+    create_mock.assert_not_called()
+    output = capsys.readouterr().out
+    assert "Configuration error:" in output
+    assert "[coding].api_key" in output
+    assert str(tmp_path) not in output
+
+
 def test_main_uses_interactive_runtime_setup(
     monkeypatch,
 ) -> None:
