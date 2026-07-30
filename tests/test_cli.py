@@ -1431,3 +1431,70 @@ def test_main_uses_interactive_runtime_setup(
         session,
         agent_profile=None,
     )
+
+
+def test_main_routes_code_command_to_existing_autonomous_workflow(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """Route the explicit code command through the existing task workflow."""
+
+    configuration = RuntimeConfiguration(
+        provider_name="ollama",
+        model_name="test-model",
+        workspace_root=tmp_path,
+        enable_actions=True,
+    )
+    session = Mock()
+    result = Mock(
+        assistant_summary="Task complete.",
+        tool_round_count=1,
+        validation_succeeded=True,
+        inspected_git_status=True,
+        inspected_git_diff=True,
+        validation_runs=(),
+    )
+    resolve_configuration_mock = Mock(return_value=configuration)
+    create_session_mock = Mock(return_value=session)
+    runner_mock = Mock(return_value=result)
+
+    monkeypatch.setattr("agent_workbench.cli.load_environment", Mock())
+    monkeypatch.setattr(
+        "agent_workbench.cli.resolve_runtime_configuration",
+        resolve_configuration_mock,
+    )
+    monkeypatch.setattr(
+        "agent_workbench.cli.create_agent_session",
+        create_session_mock,
+    )
+    monkeypatch.setattr(
+        "agent_workbench.cli.run_autonomous_coding_task",
+        runner_mock,
+    )
+
+    main(
+        [
+            "code",
+            "--workspace",
+            str(tmp_path),
+            "--enable-actions",
+            "--task",
+            "Fix the defect.",
+        ]
+    )
+
+    parsed_arguments = resolve_configuration_mock.call_args.args[0]
+    assert parsed_arguments.workspace_root == tmp_path
+    assert parsed_arguments.enable_actions is True
+    assert parsed_arguments.task_prompt == "Fix the defect."
+    create_session_mock.assert_called_once_with(
+        SessionId("cli-session"),
+        configuration,
+        max_tool_rounds=AUTONOMOUS_MAX_TOOL_ROUNDS,
+    )
+    assert runner_mock.call_args.args == (
+        session,
+        "Fix the defect.",
+    )
+    assert callable(runner_mock.call_args.kwargs["tool_approval_handler"])
+    assert callable(runner_mock.call_args.kwargs["tool_round_observer"])
