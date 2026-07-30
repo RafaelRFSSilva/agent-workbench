@@ -1,5 +1,6 @@
 """Tests for safe read-only Git workspace tools."""
 
+import json
 import subprocess
 from pathlib import Path
 from unittest.mock import Mock
@@ -13,6 +14,7 @@ from agent_workbench.git_tools import (
     MAX_UNTRACKED_EVIDENCE_BYTES,
     MAX_UNTRACKED_FILES,
     MAX_UNTRACKED_FILE_BYTES,
+    MAX_UNTRACKED_OMISSION_METADATA_BYTES,
     inspect_workspace_git_diff,
     inspect_workspace_git_status,
     register_git_tools,
@@ -64,6 +66,20 @@ def create_existing_definition() -> ToolDefinition:
             "properties": {},
             "additionalProperties": False,
         },
+    )
+
+
+def serialized_result_size(result: object) -> int:
+    """Measure one result through the documented stable JSON boundary."""
+
+    return len(
+        json.dumps(
+            result,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
     )
 
 
@@ -329,6 +345,85 @@ def test_omits_sensitive_and_generated_untracked_paths_without_exposure(
     assert ".venv" not in str(result)
     assert "node_modules" not in str(result)
     assert "private" not in str(result)
+
+
+def test_collapses_many_long_omission_paths_with_stable_bounded_metadata(
+    tmp_path: Path,
+) -> None:
+    """Aggregate excess omission metadata without exposing additional paths."""
+
+    assert MAX_UNTRACKED_OMISSION_METADATA_BYTES == 16 * 1024
+    root, workspace = create_workspace(tmp_path)
+    initialize_repository(root)
+    for index in range(MAX_UNTRACKED_FILES):
+        name = f"binary-{index:02d}-" + ("x" * 220) + ".dat"
+        (root / name).write_bytes(b"\0")
+
+    first = inspect_workspace_git_diff(workspace, {})
+    second = inspect_workspace_git_diff(workspace, {})
+
+    assert first == second
+    assert first["untracked"] == ""
+    assert first["untracked_omitted"] == [
+        {
+            "reason": "omission_metadata_limit",
+            "file_count": MAX_UNTRACKED_FILES,
+            "reason_counts": {
+                "binary_or_non_utf8": MAX_UNTRACKED_FILES,
+            },
+        }
+    ]
+    assert "binary-00" not in str(first)
+    assert serialized_result_size(first) <= MAX_GIT_OUTPUT_BYTES
+
+
+def test_mixed_untracked_diff_and_omission_metadata_are_both_bounded(
+    tmp_path: Path,
+) -> None:
+    """Retain useful safe evidence and one bounded unsupported-file marker."""
+
+    root, workspace = create_workspace(tmp_path)
+    initialize_repository(root)
+    (root / "created.py").write_text("value = 1\n", encoding="utf-8")
+    (root / "binary.dat").write_bytes(b"\0private")
+
+    result = inspect_workspace_git_diff(workspace, {})
+
+    assert "a/created.py" in result["untracked"]
+    assert result["untracked_omitted"] == [
+        {
+            "path": "binary.dat",
+            "reason": "binary_or_non_utf8",
+            "size_bytes": 8,
+        }
+    ]
+    assert "private" not in str(result)
+    assert serialized_result_size(result) <= MAX_GIT_OUTPUT_BYTES
+
+
+def test_near_limit_tracked_diff_counts_omission_metadata(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Measure every returned field through compact deterministic JSON."""
+
+    root, workspace = create_workspace(tmp_path)
+    (root / "binary.dat").write_bytes(b"\0")
+    near_limit_tracked = "x" * (MAX_GIT_OUTPUT_BYTES - 512)
+    run_mock = Mock(
+        side_effect=[
+            near_limit_tracked,
+            "",
+            "binary.dat\0",
+        ]
+    )
+    monkeypatch.setattr("agent_workbench.git_tools._run_git", run_mock)
+
+    result = inspect_workspace_git_diff(workspace, {})
+
+    assert result["untracked_omitted"]
+    assert serialized_result_size(result) <= MAX_GIT_OUTPUT_BYTES
+    assert serialized_result_size(result) > MAX_GIT_OUTPUT_BYTES - 1024
 
 
 def test_inspects_empty_repository_without_untracked_evidence(tmp_path: Path) -> None:

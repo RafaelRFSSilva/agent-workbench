@@ -892,7 +892,9 @@ All recursive workspace inspection uses one immutable traversal policy.
 `list_files`, `search_text`, and `search_symbols` omit `.git`, `.venv`, `venv`,
 `__pycache__`, `.pytest_cache`, `.ruff_cache`, `.mypy_cache`, `.tox`, `.nox`,
 `node_modules`, `dist`, `build`, `.next`, `.turbo`, `coverage`, and `htmlcov`
-directories. The policy does not change explicit safe `read_file` access.
+directories. `list_files` rejects an explicitly requested starting directory
+covered by this policy. The policy does not change explicit safe `read_file`
+access.
 
 `search_symbols` parses Python with `ast.parse()` and never imports or executes
 inspected code. Lexical AST scope identifies classes, top-level and nested
@@ -917,10 +919,12 @@ Diff evidence separates unstaged tracked, staged, and safe untracked results.
 Safe untracked UTF-8 regular files are rendered as deterministic new-file
 diffs without staging or changing the index. At most 64 untracked files are
 represented, at most 32 KiB is read per file, and combined untracked diff
-evidence is capped at 64 KiB within the existing 100 KiB total Git output
-limit. Binary, unsupported, unreadable, oversized, sensitive, ignored, and
-excess files contribute bounded omission metadata rather than contents;
-omission metadata alone is not a non-empty diff.
+evidence is capped at 64 KiB. The complete returned result, including omission
+metadata, is limited to 100 KiB by measuring compact, sorted-key UTF-8 JSON.
+Binary, unsupported, unreadable, oversized, sensitive, ignored, and excess
+files contribute omission metadata rather than contents. Detailed omission
+metadata has a 16 KiB budget and collapses to deterministic reason counts when
+necessary; omission metadata alone is not a non-empty diff.
 
 The controlled write boundary is intentionally stricter than reads.
 `apply_file_patch` never follows a target or parent symlink, rejects `.git`,
@@ -1130,8 +1134,12 @@ source and worktree paths remain private.
 
 Planning is read-only. It revalidates the source and target identities, active
 Git operations, absence of upstream tracking, and a clean real index. Every
-current change must be eligible; no path is silently excluded. The first
-boundary supports:
+current change must be eligible; no path is silently excluded. The autonomous
+workflow also requires the final Git path set to equal the effective paths
+produced by successful approved workspace actions before it creates a preview,
+requests commit approval, or stages anything. An unexpected tracked or
+untracked path fails planning and is preserved without exposing its contents.
+The first boundary supports:
 
 * Modifications to tracked UTF-8 regular files.
 * New untracked UTF-8 regular files.

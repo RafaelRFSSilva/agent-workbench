@@ -141,6 +141,10 @@ def list_workspace_files(
 
     if not directory_path.is_dir():
         raise ToolArgumentError("list_files path must reference a directory.")
+    if workspace.is_ignored_traversal_path(directory_path):
+        raise ToolArgumentError(
+            "list_files cannot start inside an ignored traversal directory."
+        )
 
     entries: list[JSONObject] = []
 

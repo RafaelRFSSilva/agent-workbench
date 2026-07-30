@@ -1,6 +1,6 @@
 """Validated planning for approved commits inside isolated Git worktrees."""
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 import difflib
 from enum import StrEnum
@@ -301,6 +301,8 @@ class _BoundedCapture:
 def plan_isolated_commit(
     worktree: WorktreeHandle,
     commit_message: str,
+    *,
+    expected_paths: Iterable[str] | None = None,
 ) -> IsolatedCommitPlan:
     """Validate and snapshot every eligible change in one isolated worktree."""
 
@@ -314,12 +316,17 @@ def plan_isolated_commit(
         )
 
     message = _validate_commit_message(commit_message)
+    safe_expected_paths = _snapshot_expected_paths(expected_paths)
     state = _inspect_commit_worktree(worktree)
     author_name = _read_local_identity(worktree.worktree_path, "user.name")
     author_email = _read_local_identity(worktree.worktree_path, "user.email")
     _reject_in_progress_operation(worktree.worktree_path)
     _require_clean_index(worktree.worktree_path)
-    changes = _collect_changes(worktree.worktree_path, state.head)
+    changes = _collect_changes(
+        worktree.worktree_path,
+        state.head,
+        expected_paths=safe_expected_paths,
+    )
     _validate_complete_limits(changes)
 
     fingerprint = _fingerprint(
@@ -371,6 +378,7 @@ def create_isolated_commit(
         current_plan = plan_isolated_commit(
             plan.worktree,
             plan.commit_message,
+            expected_paths=plan.paths,
         )
     except ConfigurationError:
         raise CompletionError(
@@ -708,6 +716,8 @@ def _require_clean_index(worktree: Path) -> None:
 def _collect_changes(
     worktree: Path,
     old_head: str,
+    *,
+    expected_paths: tuple[str, ...] | None,
 ) -> tuple[_CommitChange, ...]:
     """Collect every eligible working-tree change in deterministic order."""
 
@@ -738,10 +748,22 @@ def _collect_changes(
             "isolated commit requires at least one eligible change."
         )
 
+    resolved_entries = tuple(
+        (status_code, *_resolve_changed_path(worktree, raw_path))
+        for status_code, raw_path in status_entries
+    )
+    observed_paths = tuple(
+        sorted(relative_path for _status, relative_path, _target in resolved_entries)
+    )
+    if expected_paths is not None and observed_paths != expected_paths:
+        raise ConfigurationError(
+            "isolated commit contains a changed path outside the successful "
+            "approved workspace actions."
+        )
+
     changes = []
     canonical_paths: set[Path] = set()
-    for status_code, raw_path in status_entries:
-        relative_path, target = _resolve_changed_path(worktree, raw_path)
+    for status_code, relative_path, target in resolved_entries:
         canonical = target.resolve(strict=True)
         if canonical in canonical_paths:
             raise ConfigurationError("isolated commit paths are ambiguous.")
@@ -761,6 +783,48 @@ def _collect_changes(
             )
         changes.append(change)
     return tuple(sorted(changes, key=lambda change: change.path))
+
+
+def _snapshot_expected_paths(
+    paths: Iterable[str] | None,
+) -> tuple[str, ...] | None:
+    """Validate and snapshot an optional exact controller-approved path set."""
+
+    if paths is None:
+        return None
+    if isinstance(paths, str):
+        raise ConfigurationError(
+            "isolated commit expected paths must be an iterable of paths."
+        )
+    try:
+        values = tuple(paths)
+    except TypeError:
+        raise ConfigurationError(
+            "isolated commit expected paths must be an iterable of paths."
+        ) from None
+
+    validated = []
+    for path in values:
+        if (
+            not isinstance(path, str)
+            or not path
+            or any(ord(character) < 32 or ord(character) == 127 for character in path)
+        ):
+            raise ConfigurationError("isolated commit expected path is unsafe.")
+        pure = PurePosixPath(path)
+        if (
+            pure.is_absolute()
+            or pure.as_posix() != path
+            or not pure.parts
+            or any(part in ("", ".", "..") for part in pure.parts)
+            or ".git" in pure.parts
+            or pure.parts[0].startswith(("-", ":"))
+        ):
+            raise ConfigurationError("isolated commit expected path is unsafe.")
+        validated.append(path)
+    if len(validated) != len(set(validated)):
+        raise ConfigurationError("isolated commit expected paths contain duplicates.")
+    return tuple(sorted(validated))
 
 
 def _verify_staged_plan(plan: IsolatedCommitPlan) -> None:

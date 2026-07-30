@@ -32,12 +32,14 @@ repository-lifecycle changes.
 9. Require controller-owned DONE evidence: successful latest Ruff format, Ruff
    check, and pytest results, successful Git status and complete diff
    inspection, and non-empty tracked, staged, or safe untracked diff evidence.
-10. Review the immutable commit preview, exact CLI-supplied message, exact path
+10. Require the final Git path set to equal the effective paths produced by
+    successful approved workspace actions.
+11. Review the immutable commit preview, exact CLI-supplied message, exact path
     set, and every complete diff.
-11. Approve the isolated local commit once.
-12. Require the workflow to verify the new commit and a clean isolated worktree.
-13. Preserve the worktree, local branch, and commit for external review.
-14. Push and create a Pull Request manually only after external review.
+12. Approve the isolated local commit once.
+13. Require the workflow to verify the new commit and a clean isolated worktree.
+14. Preserve the worktree, local branch, and commit for external review.
+15. Push and create a Pull Request manually only after external review.
 
 Every DISCOVER, EDIT, and REPAIR prompt, including continuations, receives the
 original ordered acceptance criteria. The controller carries bounded sanitized
@@ -193,6 +195,8 @@ paths, or unrelated repository content.
 - **Incomplete rollback:** stop and manually inspect every path listed in the
   error. Do not assume the workspace returned to its original state.
 - **Commit denied or stale before staging:** no new staging or commit occurs.
+- **Unexpected final path:** commit planning fails before preview, approval, or
+  staging. Preserve every tracked and untracked path for manual inspection.
 - **Staging or commit failure:** the isolated index may be partially or fully
   staged. Do not reset or unstage automatically; inspect `HEAD`, the branch,
   index, worktree, and exact relative paths.
@@ -222,11 +226,13 @@ counters, validation results, and final diff for future benchmark runs.
 
 V1 can reach DONE for tasks composed only of safe untracked UTF-8 regular files.
 Git inspection does not stage them: it renders at most 64 files, reads at most
-32 KiB per file, and caps combined untracked diff evidence at 64 KiB. Binary,
+32 KiB per file, and caps combined untracked diff evidence at 64 KiB. The
+complete compact, sorted-key UTF-8 JSON result is limited to 100 KiB. Binary,
 unsupported, unreadable, oversized, sensitive, ignored, and limit-exceeding
-files are omitted with bounded metadata. Omission metadata alone cannot satisfy
-VERIFY and requires manual review. No post-hardening real-model benchmark has
-passed yet.
+files are omitted with metadata whose detailed form has a 16 KiB budget and
+collapses to deterministic reason counts when needed. Omission metadata alone
+cannot satisfy VERIFY and requires manual review. No post-hardening real-model
+benchmark has passed yet.
 
 ## Tasks suitable for `gpt-oss:20b`
 

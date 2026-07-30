@@ -234,6 +234,7 @@ def test_controller_runs_discover_edit_validate_verify_and_done(
         "run_ruff_check",
         "run_pytest",
     )
+    assert result.approved_workspace_paths == ("module.py",)
     assert result.validation_succeeded is True
     assert len(result.tool_results) == result.tool_round_count
     assert all(tool_result.status == "success" for tool_result in result.tool_results)
@@ -1023,6 +1024,10 @@ def test_untracked_only_created_files_reach_done_without_staging(
     assert result.validation_succeeded is True
     assert result.inspected_git_status_after_change is True
     assert result.inspected_git_diff_after_change is True
+    assert result.approved_workspace_paths == (
+        "created_module.py",
+        "test_created_module.py",
+    )
     assert diff_output["unstaged"] == ""
     assert diff_output["staged"] == ""
     assert "a/created_module.py" in diff_output["untracked"]

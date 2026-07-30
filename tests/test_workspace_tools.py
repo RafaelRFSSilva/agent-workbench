@@ -352,6 +352,66 @@ def test_recursive_listing_and_search_skip_generated_directories(
     assert explicitly_read["content"] == "needle .venv\n"
 
 
+@pytest.mark.parametrize(
+    "ignored_directory",
+    [".venv", ".git", "node_modules", "dist", "build"],
+)
+def test_rejects_listing_from_inside_ignored_directories(
+    tmp_path: Path,
+    ignored_directory: str,
+) -> None:
+    """Do not enumerate an explicitly requested ignored traversal root."""
+
+    root, workspace = create_workspace(tmp_path)
+    ignored = root / ignored_directory
+    ignored.mkdir()
+    (ignored / "known.txt").write_text("known safe text\n", encoding="utf-8")
+
+    with pytest.raises(
+        ToolArgumentError,
+        match="list_files cannot start inside an ignored traversal directory",
+    ):
+        list_workspace_files(
+            workspace,
+            {"path": ignored_directory, "depth": 2},
+        )
+
+    assert (
+        read_workspace_file(
+            workspace,
+            {"path": f"{ignored_directory}/known.txt"},
+        )["content"]
+        == "known safe text\n"
+    )
+
+
+def test_registry_returns_safe_ignored_listing_error(tmp_path: Path) -> None:
+    """Expose a correctable static error without ignored-directory contents."""
+
+    root, workspace = create_workspace(tmp_path)
+    ignored = root / ".venv"
+    ignored.mkdir()
+    (ignored / "private.txt").write_text("private contents\n", encoding="utf-8")
+    registry = ToolRegistry()
+    register_workspace_tools(registry, workspace)
+
+    result = registry.execute(
+        ToolInvocation(
+            id="list-ignored",
+            tool_name="list_files",
+            arguments={"path": ".venv", "depth": 2},
+        )
+    )
+
+    assert result.status == "error"
+    assert result.error == (
+        "Invalid tool arguments: list_files cannot start inside an ignored "
+        "traversal directory."
+    )
+    assert "private.txt" not in str(result)
+    assert "private contents" not in str(result)
+
+
 def test_lists_through_the_maximum_depth(tmp_path: Path) -> None:
     """Traverse descendants through exactly MAX_LIST_DEPTH levels."""
 

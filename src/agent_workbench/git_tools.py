@@ -1,6 +1,7 @@
 """Provider-independent safe read-only Git inspection tools."""
 
 import difflib
+import json
 import stat
 import subprocess
 from pathlib import Path, PurePosixPath
@@ -13,7 +14,7 @@ GIT_TIMEOUT_SECONDS = 3
 """Maximum duration allowed for one fixed Git inspection command."""
 
 MAX_GIT_OUTPUT_BYTES = 100 * 1024
-"""Maximum combined captured output returned by one Git inspection."""
+"""Maximum captured output or serialized evidence returned by Git inspection."""
 
 MAX_UNTRACKED_FILES = 64
 """Maximum untracked files represented by one Git diff inspection."""
@@ -23,6 +24,9 @@ MAX_UNTRACKED_FILE_BYTES = 32 * 1024
 
 MAX_UNTRACKED_EVIDENCE_BYTES = 64 * 1024
 """Maximum combined diff-like evidence for untracked files."""
+
+MAX_UNTRACKED_OMISSION_METADATA_BYTES = 16 * 1024
+"""Maximum stable serialized omission metadata returned by Git inspection."""
 
 MAX_UNTRACKED_DISPLAY_PATH_CHARACTERS = 512
 """Maximum safe relative path length exposed in untracked evidence."""
@@ -157,21 +161,84 @@ def inspect_workspace_git_diff(
         workspace,
         untracked_output,
     )
-
-    if (
-        len(unstaged_output.encode())
-        + len(staged_output.encode())
-        + len(untracked_evidence.encode())
-        > MAX_GIT_OUTPUT_BYTES
-    ):
-        raise ValueError("Git output exceeds the configured size limit.")
-
-    return {
+    untracked_omitted = _bound_untracked_omissions(untracked_omitted)
+    result: JSONObject = {
         "unstaged": unstaged_output,
         "staged": staged_output,
         "untracked": untracked_evidence,
         "untracked_omitted": untracked_omitted,
     }
+    if len(_serialize_git_evidence(result)) > MAX_GIT_OUTPUT_BYTES:
+        if untracked_omitted and not _omissions_are_aggregated(untracked_omitted):
+            result["untracked_omitted"] = _aggregate_untracked_omissions(
+                untracked_omitted
+            )
+        if len(_serialize_git_evidence(result)) > MAX_GIT_OUTPUT_BYTES:
+            raise ValueError("Git output exceeds the configured size limit.")
+
+    return result
+
+
+def _bound_untracked_omissions(
+    omissions: list[JSONObject],
+) -> list[JSONObject]:
+    """Collapse omission details whose stable JSON exceeds its own budget."""
+
+    if len(_serialize_git_evidence(omissions)) <= MAX_UNTRACKED_OMISSION_METADATA_BYTES:
+        return omissions
+    return _aggregate_untracked_omissions(omissions)
+
+
+def _aggregate_untracked_omissions(
+    omissions: list[JSONObject],
+) -> list[JSONObject]:
+    """Return deterministic reason counts without retaining individual paths."""
+
+    reason_counts: dict[str, int] = {}
+    file_count = 0
+    for omission in omissions:
+        reason = omission.get("reason")
+        if not isinstance(reason, str):
+            reason = "unavailable"
+        represented_count = omission.get("file_count", 1)
+        if (
+            isinstance(represented_count, bool)
+            or not isinstance(represented_count, int)
+            or represented_count < 1
+        ):
+            represented_count = 1
+        reason_counts[reason] = reason_counts.get(reason, 0) + represented_count
+        file_count += represented_count
+    return [
+        {
+            "reason": "omission_metadata_limit",
+            "file_count": file_count,
+            "reason_counts": dict(sorted(reason_counts.items())),
+        }
+    ]
+
+
+def _omissions_are_aggregated(omissions: list[JSONObject]) -> bool:
+    """Return whether omissions already contain one bounded aggregate."""
+
+    return (
+        len(omissions) == 1 and omissions[0].get("reason") == "omission_metadata_limit"
+    )
+
+
+def _serialize_git_evidence(value: object) -> bytes:
+    """Serialize returned evidence deterministically for complete size checks."""
+
+    try:
+        return json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except (TypeError, UnicodeEncodeError, ValueError):
+        raise ValueError("Git output exceeds the configured size limit.") from None
 
 
 def _build_untracked_evidence(

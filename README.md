@@ -424,7 +424,8 @@ directory symlinks. It skips invalid UTF-8 safely and is bounded to a
 Recursive listing and searches share one immutable traversal policy that omits
 Git internals, virtual environments, Python/tool caches, dependency trees, and
 generated build, coverage, and frontend output directories. Explicit safe
-`read_file` access is unchanged.
+`list_files` requests starting inside those directories are rejected, while
+explicit safe `read_file` access is unchanged.
 
 `search_symbols` uses the standard-library Python AST without importing or
 executing inspected code. It finds classes, functions, asynchronous functions,
@@ -448,8 +449,10 @@ Git inspection uses only fixed non-shell commands: status is equivalent to
 and safe untracked evidence. Safe untracked UTF-8 regular files appear as
 new-file diffs without staging or index mutation. Inspection represents at
 most 64 untracked files, reads at most 32 KiB per file, caps combined untracked
-diff evidence at 64 KiB, and retains the 100 KiB total Git output limit.
-Unsupported or unsafe files return bounded omission metadata without contents.
+diff evidence at 64 KiB, and limits the complete compact, sorted-key UTF-8 JSON
+result to 100 KiB. Unsupported or unsafe files return omission metadata without
+contents. Detailed omission metadata has a 16 KiB budget and collapses to
+deterministic reason counts when necessary.
 
 Use `--show-tool-traces` with active tools to display compact deterministic
 JSON invocation and result records before the final response. Traces are

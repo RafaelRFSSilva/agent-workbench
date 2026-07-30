@@ -161,6 +161,7 @@ class AutonomousCodingResult:
     last_workspace_change_sequence_index: int | None = None
     latest_git_status_sequence_index: int | None = None
     latest_git_diff_sequence_index: int | None = None
+    approved_workspace_paths: tuple[str, ...] = ()
 
     @property
     def validation_succeeded(self) -> bool:
@@ -711,6 +712,7 @@ def _build_result(
     last_workspace_change_sequence_index: int | None = None
     latest_git_status_sequence_index: int | None = None
     latest_git_diff_sequence_index: int | None = None
+    approved_workspace_paths: set[str] = set()
 
     for round_ in state.rounds:
         for invocation, result in zip(
@@ -733,6 +735,9 @@ def _build_result(
                 )
             ):
                 last_workspace_change_sequence_index = sequence_index
+                approved_workspace_paths.update(
+                    _changed_paths_from_workspace_result(result.output)
+                )
 
             if invocation.tool_name in _VALIDATION_TOOL_NAMES:
                 validation_runs.append(
@@ -773,7 +778,35 @@ def _build_result(
         last_workspace_change_sequence_index=last_workspace_change_sequence_index,
         latest_git_status_sequence_index=latest_git_status_sequence_index,
         latest_git_diff_sequence_index=latest_git_diff_sequence_index,
+        approved_workspace_paths=tuple(sorted(approved_workspace_paths)),
     )
+
+
+def _changed_paths_from_workspace_result(output: object) -> tuple[str, ...]:
+    """Extract effective canonical paths from successful approved action output."""
+
+    if not isinstance(output, dict):
+        return ()
+    candidates: list[dict[str, object]] = [output]
+    changes = output.get("changes")
+    if isinstance(changes, list):
+        candidates = [change for change in changes if isinstance(change, dict)]
+
+    paths = []
+    for candidate in candidates:
+        path = candidate.get("path")
+        operation = candidate.get("operation")
+        changed_lines = candidate.get("changed_lines")
+        if isinstance(path, str) and (
+            operation == "create"
+            or (
+                isinstance(changed_lines, int)
+                and not isinstance(changed_lines, bool)
+                and changed_lines > 0
+            )
+        ):
+            paths.append(path)
+    return tuple(paths)
 
 
 def _build_phase_prompt(
