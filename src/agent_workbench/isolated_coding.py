@@ -9,6 +9,7 @@ from agent_workbench.coding_loop import (
     DEFAULT_AUTONOMOUS_MAX_TOOL_ROUNDS,
     DEFAULT_CODING_ACCEPTANCE_CRITERIA,
     AutonomousCodingResult,
+    CodingPhase,
     run_autonomous_coding_task,
 )
 from agent_workbench.errors import CompletionError, ConfigurationError
@@ -239,6 +240,12 @@ def _validate_commit_message_input(message: object) -> str:
 def _require_commit_gates(coding_result: AutonomousCodingResult) -> None:
     """Require successful validation and final Git inspection before planning."""
 
+    if coding_result.final_phase is not CodingPhase.DONE:
+        raise CompletionError(
+            "Isolated autonomous coding did not reach the deterministic DONE "
+            "phase. The worktree and local branch were preserved for manual "
+            "recovery."
+        )
     if not coding_result.workspace_change_applied:
         raise CompletionError(
             "Isolated autonomous coding did not complete a successful approved "
