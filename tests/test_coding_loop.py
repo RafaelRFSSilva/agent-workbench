@@ -19,6 +19,8 @@ from agent_workbench.coding_loop import (
     MAX_REPAIR_VALIDATION_FIELD_CHARACTERS,
     CodingPhase,
     CodingWorkflowLimits,
+    _sanitize_prompt_text,
+    _sanitize_validation_output,
     run_autonomous_coding_task,
 )
 from agent_workbench.errors import CompletionError
@@ -516,9 +518,13 @@ def test_stale_patch_failure_reaches_next_edit_prompt_and_clears_after_rewrite(
     assert "attempt=1" in continuation
     assert "expected content does not match" in continuation
     assert "The previous action did not change the workspace." in continuation
-    assert "reread the target" in continuation
+    assert "call read_file for the complete file" in continuation
+    assert "partial line-range read" in continuation
+    assert "SHA from that complete latest read" in continuation
+    assert "replacement_content must contain the complete resulting file" in (
+        continuation
+    )
     assert "apply_file_rewrite" in continuation
-    assert "SHA from the latest read_file" in continuation
     assert "short literal snippet copied exactly from the latest file" in continuation
     assert "STALE-EXPECTED" not in continuation
     assert "REPLACEMENT" not in continuation
@@ -594,6 +600,66 @@ def test_failed_text_replacement_reaches_next_repair_prompt(
     assert "expected 1 occurrence(s) but found 0" in continuation
     assert "not present" not in continuation
     assert "SECRET-REPLACEMENT" not in continuation
+    assert result.final_phase is CodingPhase.DONE
+
+
+def test_action_failure_evidence_uses_conservative_generic_sanitizer(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Keep credential and token values out of an EDIT continuation."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    original = "def add(left: int, right: int) -> int:\n    return left - right\n"
+    corrected = "def add(left: int, right: int) -> int:\n    return left + right\n"
+    original_create_approval_request = ToolRegistry.create_approval_request
+
+    def create_approval_request(registry, invocation):
+        if invocation.id == "credential-failure":
+            raise CompletionError(
+                "OPENAI_API_KEY=edit-credential-value\n"
+                'REPAIR_TOKEN = "generic-action-value"'
+            )
+        return original_create_approval_request(registry, invocation)
+
+    monkeypatch.setattr(
+        ToolRegistry,
+        "create_approval_request",
+        create_approval_request,
+    )
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            tool_response(
+                "credential-failure",
+                "apply_file_patch",
+                {
+                    "path": "module.py",
+                    "expected_content": original,
+                    "replacement_content": corrected,
+                },
+            ),
+            ChatResponse(text="The action failed."),
+            rewrite_response(
+                "rewrite",
+                expected_content=original,
+                replacement_content=corrected,
+            ),
+            ChatResponse(text="Rewrite applied."),
+        ]
+    )
+
+    result = run_autonomous_coding_task(
+        create_session(repository, provider),
+        "Correct the add implementation.",
+        tool_approval_handler=approve,
+    )
+
+    continuation = provider.requests[3].messages[-1]["content"]
+    assert "Action failure evidence:" in continuation
+    assert "edit-credential-value" not in continuation
+    assert "generic-action-value" not in continuation
+    assert "[redacted sensitive content]" in continuation
     assert result.final_phase is CodingPhase.DONE
 
 
@@ -979,6 +1045,7 @@ def test_repair_prompt_preserves_all_safe_failure_and_runtime_evidence(
                 "stdout": (
                     "FAILED test_first - AssertionError: expected 3, got 2\n"
                     "FAILED test_second - AssertionError: feature flag missing\n"
+                    f'REPAIR_TOKEN = "{dynamic_value}"\n'
                     f"generated_token_identifier={dynamic_value}\n"
                     "dynamic runtime requirement: use the generated value above\n"
                     "PASSWORD=credential-must-be-redacted\n"
@@ -1037,6 +1104,7 @@ def test_repair_prompt_preserves_all_safe_failure_and_runtime_evidence(
     assert "stderr_excerpt:" in repair_prompt
     assert "FAILED test_first - AssertionError: expected 3, got 2" in repair_prompt
     assert "FAILED test_second - AssertionError: feature flag missing" in repair_prompt
+    assert f'REPAIR_TOKEN = "{dynamic_value}"' in repair_prompt
     assert f"generated_token_identifier={dynamic_value}" in repair_prompt
     assert "dynamic runtime requirement: use the generated value above" in repair_prompt
     assert "safe stderr assertion detail" in repair_prompt
@@ -1051,10 +1119,103 @@ def test_repair_prompt_preserves_all_safe_failure_and_runtime_evidence(
     assert "Do not call Ruff or pytest directly" in repair_prompt
     assert "latest file SHA" in repair_prompt
     assert "apply_file_rewrite" in repair_prompt
+    assert "call read_file for the complete file" in repair_prompt
+    assert "partial line-range read" in repair_prompt
+    assert "SHA from that complete latest read" in repair_prompt
+    assert "replacement_content must contain the complete resulting file" in (
+        repair_prompt
+    )
     assert "controller will run the full validation sequence afterward" in repair_prompt
     assert "Current changed-file paths: module.py" in repair_prompt
     assert result.repair_attempt_count == 1
     assert result.final_phase is CodingPhase.DONE
+
+
+@pytest.mark.parametrize(
+    ("sensitive_line", "secret_value"),
+    [
+        ("API_KEY=api-key-value", "api-key-value"),
+        ("OPENAI_API_KEY=openai-key-value", "openai-key-value"),
+        ("AWS_ACCESS_KEY_ID=AKIATESTVALUE1234", "AKIATESTVALUE1234"),
+        (
+            "AWS_SECRET_ACCESS_KEY=aws-secret-access-value",
+            "aws-secret-access-value",
+        ),
+        ("AWS_SESSION_TOKEN=aws-session-value", "aws-session-value"),
+        ("PASSWORD=password-value", "password-value"),
+        ("DB_PASSWORD=database-password-value", "database-password-value"),
+        ("SECRET=secret-value", "secret-value"),
+        ("ACCESS_TOKEN=access-token-value", "access-token-value"),
+        ("AUTH_TOKEN=auth-token-value", "auth-token-value"),
+        ("GITHUB_TOKEN=github-token-value", "github-token-value"),
+        ('{"OPENAI_API_KEY": "json-credential-value"}', "json-credential-value"),
+        ("DB_PASSWORD: yaml-credential-value", "yaml-credential-value"),
+        ('client_secret = "toml-credential-value"', "toml-credential-value"),
+        ("Authorization: Bearer authorization-value", "authorization-value"),
+        (
+            "Authorization Bearer alternate-authorization-value",
+            "alternate-authorization-value",
+        ),
+        ("Bearer ghp_obviousBearerValue12345", "ghp_obviousBearerValue12345"),
+        (".env contains dotenv-value", "dotenv-value"),
+        (".env.local contains local-dotenv-value", "local-dotenv-value"),
+        (".env.production contains production-dotenv-value", "production-dotenv-value"),
+        ("config/.env.staging contains staging-dotenv-value", "staging-dotenv-value"),
+    ],
+)
+def test_validation_output_sanitizer_redacts_credentials(
+    sensitive_line: str,
+    secret_value: str,
+) -> None:
+    """Redact common credential forms without exposing their values."""
+
+    sanitized = _sanitize_validation_output(
+        f"safe prefix\n{sensitive_line}\nsafe suffix"
+    )
+
+    assert "safe prefix" in sanitized
+    assert "safe suffix" in sanitized
+    assert secret_value not in sanitized
+    assert "[redacted sensitive content]" in sanitized
+
+
+def test_validation_output_sanitizer_preserves_safe_dynamic_requirements() -> None:
+    """Keep unrelated token identifiers and runtime values exact."""
+
+    output = (
+        'REPAIR_TOKEN = "RUNTIME7Q2M9"\n'
+        "generated_token_identifier=RUNTIME7Q2M9\n"
+        "dynamic runtime requirement: use RUNTIME7Q2M9"
+    )
+
+    assert _sanitize_validation_output(output) == output
+
+
+def test_validation_output_sanitizer_redacts_absolute_private_paths() -> None:
+    """Keep the existing absolute-path boundary in validation output."""
+
+    sanitized = _sanitize_validation_output(
+        "failure at /home/private/project/test_module.py:12"
+    )
+
+    assert "/home/private" not in sanitized
+    assert "[absolute-path]" in sanitized
+
+
+def test_generic_prompt_sanitizer_remains_conservative_for_token_lines() -> None:
+    """Do not use validation's permissive token handling for generic evidence."""
+
+    sanitized = _sanitize_prompt_text(
+        'REPAIR_TOKEN = "GENERIC-MUST-BE-REDACTED"\n'
+        "generated_token_identifier=GENERIC-MUST-ALSO-BE-REDACTED"
+    )
+
+    assert "GENERIC-MUST-BE-REDACTED" not in sanitized
+    assert "GENERIC-MUST-ALSO-BE-REDACTED" not in sanitized
+    assert sanitized.splitlines() == [
+        "[redacted sensitive content]",
+        "[redacted sensitive content]",
+    ]
 
 
 def test_repair_validation_output_is_deterministically_bounded(

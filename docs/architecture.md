@@ -941,7 +941,10 @@ and complete replacement content. Preview reads and hashes the file internally
 and shows its complete deterministic diff. Execution repeats the hash check
 after approval, then reuses the exact-content post-check, same-directory
 temporary file, atomic replacement, permission preservation, and existing
-file, diff, and changed-line limits. It cannot create files.
+file, diff, and changed-line limits. Controller guidance requires a complete
+latest `read_file`, prohibits constructing a rewrite from a partial line-range
+read, and requires `replacement_content` to contain the complete resulting
+file. It cannot create files.
 
 `apply_text_replacement` performs a smaller optimistic update for existing
 UTF-8 files. It requires an exact non-empty literal fragment, replacement
@@ -1370,13 +1373,19 @@ copied into this state. A later successful action clears obsolete guidance for
 its changed path while the original immutable tool results remain available
 for final reporting.
 
+Generic model-facing text—including objectives, acceptance criteria, discovery
+summaries, and action-failure evidence—uses a conservative sensitive-line
+sanitizer. Validation stdout and stderr use a separate sanitizer that redacts
+known credential assignments, authorization bearer values, obvious secret
+values, `.env` variants, and absolute paths without hiding a line solely
+because an unrelated test identifier contains `token`.
+
 Each validation stream excerpt is capped at 4,000 characters, and the complete
 formatted failed-validation evidence is capped at 12,000 characters with fair
 deterministic allocation and explicit truncation markers. The prompt instructs
 the model to resolve every listed failure and dynamic runtime requirement,
-make another controlled change, use the latest SHA with
-`apply_file_rewrite` for whole-file work, and leave Ruff and pytest execution
-to the controller.
+make another controlled change, perform a complete file read before
+`apply_file_rewrite`, and leave Ruff and pytest execution to the controller.
 
 The controller invokes `run_ruff_format`, `run_ruff_check`, and `run_pytest`
 against `"."` in that exact order through the registered preview, explicit

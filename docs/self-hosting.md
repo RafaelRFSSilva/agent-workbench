@@ -24,10 +24,11 @@ repository-lifecycle changes.
 5. Let the bounded read-only DISCOVER phase inspect repository and named files.
 6. Prefer `apply_text_replacement` for each small exact edit to an existing
    file, using a short literal copied exactly from the latest file. Use
-   `apply_file_rewrite` with the SHA-256 returned by the latest `read_file` for
-   a whole-file replacement. Use one `apply_workspace_changes` transaction
-   when several file changes must succeed together or when creation is
-   required.
+   `apply_file_rewrite` only after calling `read_file` for the complete file;
+   use that complete latest read's SHA-256 and send the complete resulting
+   file. Never construct a whole-file rewrite from a partial line-range read.
+   Use one `apply_workspace_changes` transaction when several file changes
+   must succeed together or when creation is required.
 7. Review every complete action preview and diff.
 8. Approve the controller-invoked Ruff format, Ruff check, and pytest sequence
    separately. The target is always `"."` in v1.
@@ -58,7 +59,9 @@ bounded safe evidence. The model is told that the workspace did not change and
 must reread the target. Failed validation enters REPAIR with every failed tool
 name, status, exit code, and bounded sanitized stdout and stderr excerpt.
 Assertion details and dynamic runtime requirements remain visible unless they
-match a credential, `.env`, or private-path boundary.
+match a credential, `.env`, or private-path boundary. Generic objectives,
+summaries, discovery, and action failures retain a separate, more conservative
+sensitive-line boundary.
 
 ## Recommended launch command
 
@@ -110,9 +113,11 @@ Use the existing test conventions:
    change when the objective requires them.
 3. Prefer apply_text_replacement for small exact edits to existing files,
    using a short literal copied exactly from the latest file. Use
-   apply_file_rewrite with the SHA-256 returned by the latest read_file for a
-   whole-file replacement. Use one apply_workspace_changes transaction when
-   several changes must succeed together.
+   apply_file_rewrite only after read_file returns the complete file. Use the
+   SHA from that complete latest read, and send the complete resulting file as
+   replacement_content. Never base a whole-file rewrite on a partial line-range
+   read. Use one apply_workspace_changes transaction when several changes must
+   succeed together.
 4. Wait for operator approval before every write action.
 5. Implement only the smallest correct change.
 6. Do not restart broad discovery during EDIT or REPAIR.

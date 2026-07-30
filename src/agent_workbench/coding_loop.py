@@ -1,7 +1,7 @@
 """Run one externally controlled deterministic coding workflow."""
 
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import PurePosixPath
@@ -83,17 +83,63 @@ _MAXIMUM_ROUNDS_CHANGE_SUMMARY = (
     "A successful workspace change was applied before the model-facing "
     "phase exhausted its tool-round budget."
 )
+_COMPLETE_FILE_REWRITE_GUIDANCE = (
+    "Before apply_file_rewrite, call read_file for the complete file. Do not "
+    "construct a whole-file rewrite from a partial line-range read. Use the "
+    "latest file SHA from that complete latest read. replacement_content must "
+    "contain the complete resulting file."
+)
 _ABSOLUTE_PATH_PATTERN = re.compile(r"(?<![\w.])/(?:[^\s\x00]+)")
-_SENSITIVE_ASSIGNMENT_PATTERN = re.compile(
+_GENERIC_SENSITIVE_LINE_PATTERN = re.compile(
+    r"(?i)(?:^|[^a-z])(?:api[_-]?key|password|secret|token|\.env)(?:[^a-z]|$)"
+)
+_VALIDATION_ASSIGNMENT_PATTERN = re.compile(
     r"""(?ix)
     (?:^|[\s{,])
     ["']?
-    (?:api[_-]?key|password|secret|token|access[_-]?token|auth[_-]?token|authorization)
+    (?P<name>[a-z][a-z0-9_-]{1,127})
     ["']?
     \s*[:=]
+    \s*
+    (?P<value>.+)
     """
 )
-_SENSITIVE_ENV_PATTERN = re.compile(r"(?i)(?:^|[/\\\s])\.env(?:$|[/\\\s:])")
+_VALIDATION_CREDENTIAL_NAME_PATTERN = re.compile(
+    r"""(?ix)^
+    (?:
+        (?:[a-z0-9]+[_-])*api[_-]?key
+        | (?:[a-z0-9]+[_-])*password
+        | (?:[a-z0-9]+[_-])*(?:secret[_-]access[_-]key|secret)
+        | (?:aws[_-])?access[_-]key[_-]id
+        | (?:aws[_-]session|github|gitlab|openai|stripe)[_-]token
+        | slack(?:[_-](?:app|bot|user))?[_-]token
+        | access[_-]token
+        | auth[_-]token
+        | authorization
+        | token
+    )
+    $"""
+)
+_VALIDATION_AUTHORIZATION_BEARER_PATTERN = re.compile(
+    r"(?i)\bauthorization\s*:?\s+bearer\s+\S+"
+)
+_VALIDATION_BEARER_VALUE_PATTERN = re.compile(
+    r"(?i)(?:^|[\s:=])bearer\s+[a-z0-9._~+/\-=]{8,}"
+)
+_VALIDATION_ENV_REFERENCE_PATTERN = re.compile(
+    r"(?i)(?<![a-z0-9_])\.env(?:\.[a-z0-9_-]+)*(?![a-z0-9_-])"
+)
+_VALIDATION_OBVIOUS_SECRET_VALUE_PATTERN = re.compile(
+    r"""(?ix)
+    (?:^|[\s"'=:(])
+    (?:
+        sk-[a-z0-9_-]{12,}
+        | gh[pousr]_[a-z0-9_]{12,}
+        | AKIA[A-Z0-9]{12,}
+    )
+    (?:$|[\s"',)])
+    """
+)
 
 
 class CodingPhase(StrEnum):
@@ -870,10 +916,10 @@ def _build_phase_prompt(
             f"{_numbered_lines(_format_action_failure_evidence(item) for item in state.action_failure_evidence)}\n\n"
             "Action failure recovery:\n"
             "The previous action did not change the workspace. The model must "
-            "reread the target before trying again. For a whole-file replacement, use "
-            "apply_file_rewrite with the SHA from the latest read_file. For a "
-            "small exact change, you may use apply_text_replacement with a short "
-            "literal snippet copied exactly from the latest file."
+            "reread the target before trying again. "
+            f"{_COMPLETE_FILE_REWRITE_GUIDANCE} For a small exact change, you "
+            "may use apply_text_replacement with a short literal snippet copied "
+            "exactly from the latest file."
         )
     return (
         "Continue one externally controlled deterministic coding workflow.\n\n"
@@ -920,8 +966,7 @@ def _build_repair_prompt(
         "- Apply another successful controlled workspace change.\n"
         "- Do not call Ruff or pytest directly because the controller owns "
         "validation.\n"
-        "- For whole-file changes, use apply_file_rewrite with the latest file "
-        "SHA from read_file.\n"
+        f"- {_COMPLETE_FILE_REWRITE_GUIDANCE}\n"
         "- The controller will run the full validation sequence afterward.\n"
         "This repair attempt requires another successful controlled workspace "
         "change before validation can run again."
@@ -942,11 +987,11 @@ def _bounded_validation_failure_evidence(
             raw_stdout = result.output.get("stdout")
             raw_stderr = result.output.get("stderr")
             if isinstance(raw_stdout, str):
-                stdout = _sanitize_prompt_text(raw_stdout)
+                stdout = _sanitize_validation_output(raw_stdout)
             if isinstance(raw_stderr, str):
-                stderr = _sanitize_prompt_text(raw_stderr)
+                stderr = _sanitize_validation_output(raw_stderr)
         if not stderr and result.error:
-            stderr = _sanitize_prompt_text(result.error)
+            stderr = _sanitize_validation_output(result.error)
 
         evidence.append(
             _ValidationFailureEvidence(
@@ -1382,17 +1427,60 @@ def _bounded_prompt_summary(text: str) -> str:
 
 
 def _sanitize_prompt_text(text: str) -> str:
-    """Redact sensitive lines and absolute paths from model-facing text."""
+    """Conservatively redact generic non-validation model-facing text."""
+
+    return _sanitize_model_facing_lines(
+        text,
+        _generic_prompt_line_is_sensitive,
+    )
+
+
+def _sanitize_validation_output(text: str) -> str:
+    """Redact validation credentials while preserving safe runtime identifiers."""
+
+    return _sanitize_model_facing_lines(
+        text,
+        _validation_output_line_is_sensitive,
+    )
+
+
+def _sanitize_model_facing_lines(
+    text: str,
+    sensitive_line: Callable[[str], bool],
+) -> str:
+    """Apply one explicit line policy and the shared absolute-path boundary."""
 
     safe_lines = []
     for line in text.splitlines():
-        if _SENSITIVE_ASSIGNMENT_PATTERN.search(line) or _SENSITIVE_ENV_PATTERN.search(
-            line
-        ):
+        if sensitive_line(line):
             safe_lines.append("[redacted sensitive content]")
         else:
             safe_lines.append(_ABSOLUTE_PATH_PATTERN.sub("[absolute-path]", line))
     return "\n".join(safe_lines)
+
+
+def _generic_prompt_line_is_sensitive(line: str) -> bool:
+    """Preserve the conservative generic sensitive-line policy."""
+
+    return _GENERIC_SENSITIVE_LINE_PATTERN.search(line) is not None
+
+
+def _validation_output_line_is_sensitive(line: str) -> bool:
+    """Identify credentials without treating every token identifier as secret."""
+
+    if (
+        _VALIDATION_ENV_REFERENCE_PATTERN.search(line)
+        or _VALIDATION_AUTHORIZATION_BEARER_PATTERN.search(line)
+        or _VALIDATION_BEARER_VALUE_PATTERN.search(line)
+        or _VALIDATION_OBVIOUS_SECRET_VALUE_PATTERN.search(line)
+    ):
+        return True
+    assignment = _VALIDATION_ASSIGNMENT_PATTERN.search(line)
+    return (
+        assignment is not None
+        and _VALIDATION_CREDENTIAL_NAME_PATTERN.fullmatch(assignment.group("name"))
+        is not None
+    )
 
 
 def _workspace_change_result_applied(
