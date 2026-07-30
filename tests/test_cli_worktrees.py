@@ -163,18 +163,23 @@ def test_worktree_approval_renders_complete_safe_preview_and_defaults_deny(
         assert "No force" in output
 
 
-@pytest.mark.parametrize("failure", [EOFError(), KeyboardInterrupt()])
-def test_worktree_approval_input_interruption_denies(
-    monkeypatch,
-    failure,
-) -> None:
-    """Treat unavailable or interrupted worktree approval input as denial."""
+def test_worktree_approval_input_eof_denies(monkeypatch) -> None:
+    """Treat unavailable worktree approval input as denial."""
 
-    monkeypatch.setattr("builtins.input", Mock(side_effect=failure))
+    monkeypatch.setattr("builtins.input", Mock(side_effect=EOFError))
 
     assert (
         _prompt_for_worktree_approval(creation_request()) is ToolApprovalDecision.DENY
     )
+
+
+def test_worktree_approval_input_keyboard_interrupt_propagates(monkeypatch) -> None:
+    """Propagate worktree cancellation to the outer CLI boundary."""
+
+    monkeypatch.setattr("builtins.input", Mock(side_effect=KeyboardInterrupt))
+
+    with pytest.raises(KeyboardInterrupt):
+        _prompt_for_worktree_approval(creation_request())
 
 
 def isolated_workflow_result() -> SimpleNamespace:

@@ -11,7 +11,13 @@ from agent_workbench.arguments import (
     parse_cli_arguments,
     resolve_runtime_configuration,
 )
-from agent_workbench.config import MODEL_ENV_VAR, PROVIDER_ENV_VAR
+from agent_workbench.config import (
+    DEFAULT_MODEL_NAME,
+    MODEL_ENV_VAR,
+    PROVIDER_ENV_VAR,
+    ProjectCodingConfiguration,
+    ProjectConfiguration,
+)
 from agent_workbench.errors import ConfigurationError
 
 
@@ -30,6 +36,104 @@ def test_parse_cli_arguments_accepts_provider_and_model() -> None:
     assert arguments.provider_name == "ollama"
     assert arguments.model_name == "gpt-oss:20b"
     assert arguments.system_prompt is None
+
+
+def test_code_command_accepts_a_positional_task() -> None:
+    """Map the short positional code task to the existing task input."""
+
+    arguments = parse_cli_arguments(["code", "Fix the failing tests."])
+
+    assert arguments.task_prompt == "Fix the failing tests."
+
+
+def test_code_command_preserves_the_task_option() -> None:
+    """Keep the existing explicit task option fully supported."""
+
+    arguments = parse_cli_arguments(["code", "--task", "Fix the failing tests."])
+
+    assert arguments.task_prompt == "Fix the failing tests."
+
+
+def test_code_command_rejects_positional_and_option_tasks_together() -> None:
+    """Reject ambiguous duplicate task sources."""
+
+    with pytest.raises(SystemExit) as raised:
+        parse_cli_arguments(
+            [
+                "code",
+                "Positional task.",
+                "--task",
+                "Option task.",
+            ]
+        )
+
+    assert raised.value.code == 2
+
+
+def test_code_command_rejects_an_empty_positional_task() -> None:
+    """Reject an empty short coding task."""
+
+    with pytest.raises(SystemExit) as raised:
+        parse_cli_arguments(["code", "   "])
+
+    assert raised.value.code == 2
+
+
+def test_init_command_parses_supported_explicit_options() -> None:
+    """Parse every supported project initializer option."""
+
+    arguments = parse_cli_arguments(
+        [
+            "init",
+            "--provider",
+            "ollama",
+            "--model",
+            "qwen3-coder:30b",
+            "--agent",
+            "developer",
+            "--max-tool-rounds",
+            "9",
+            "--temperature",
+            "0.3",
+            "--top-p",
+            "0.8",
+            "--max-output-tokens",
+            "2048",
+            "--isolated",
+            "--enable-tools",
+            "--enable-actions",
+        ]
+    )
+
+    assert arguments.init is True
+    assert arguments.provider_name == "ollama"
+    assert arguments.model_name == "qwen3-coder:30b"
+    assert arguments.agent_name == "developer"
+    assert arguments.max_tool_rounds == 9
+    assert arguments.temperature == 0.3
+    assert arguments.top_p == 0.8
+    assert arguments.max_output_tokens == 2048
+    assert arguments.isolated is True
+    assert arguments.enable_tools is True
+    assert arguments.enable_actions is True
+
+
+def test_init_command_defaults_booleans_on_and_accepts_explicit_disabling() -> None:
+    """Expose effective paired boolean options while preserving useful defaults."""
+
+    defaults = parse_cli_arguments(["init"])
+    disabled = parse_cli_arguments(
+        [
+            "init",
+            "--no-enable-tools",
+            "--no-enable-actions",
+        ]
+    )
+
+    assert defaults.enable_tools is True
+    assert defaults.enable_actions is True
+    assert disabled.enable_tools is False
+    assert disabled.enable_actions is False
 
 
 def test_parse_cli_arguments_rejects_unsupported_provider() -> None:
@@ -123,6 +227,123 @@ def test_environment_is_used_without_cli_arguments(
 
     assert configuration.provider_name == "anthropic"
     assert configuration.model_name == "claude-test-model"
+
+
+def test_project_configuration_overrides_application_defaults(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """Resolve project coding values ahead of environment and defaults."""
+
+    monkeypatch.setenv(PROVIDER_ENV_VAR, "anthropic")
+    monkeypatch.setenv(MODEL_ENV_VAR, "environment-model")
+    project = ProjectConfiguration(
+        project_root=tmp_path,
+        configuration_path=tmp_path / ".agent-workbench" / "config.toml",
+        configuration=ProjectCodingConfiguration(
+            provider="ollama",
+            model="project-model",
+            agent="developer",
+            enable_tools=True,
+            enable_actions=True,
+            max_tool_rounds=8,
+            temperature=0.2,
+            top_p=0.9,
+            max_output_tokens=4096,
+            isolated=False,
+        ),
+    )
+
+    configuration = resolve_runtime_configuration(
+        CLIArguments(provider_name=None, model_name=None, task_prompt="Fix it."),
+        project_configuration=project,
+    )
+
+    assert configuration.provider_name == "ollama"
+    assert configuration.model_name == "project-model"
+    assert configuration.agent_profile is not None
+    assert configuration.agent_profile.name == "Developer"
+    assert configuration.enable_tools is True
+    assert configuration.enable_actions is True
+    assert configuration.workspace_root == tmp_path
+    assert configuration.max_tool_rounds == 8
+    assert configuration.generation_config.temperature == 0.2
+    assert configuration.generation_config.top_p == 0.9
+    assert configuration.generation_config.max_output_tokens == 4096
+    assert configuration.isolated is False
+
+
+def test_explicit_cli_values_override_project_configuration(tmp_path) -> None:
+    """Give every existing explicit coding option precedence over TOML."""
+
+    project = ProjectConfiguration(
+        project_root=tmp_path,
+        configuration_path=tmp_path / ".agent-workbench" / "config.toml",
+        configuration=ProjectCodingConfiguration(
+            provider="anthropic",
+            model="project-model",
+            agent="reviewer",
+            enable_tools=False,
+            enable_actions=False,
+            max_tool_rounds=4,
+            temperature=0.1,
+            top_p=0.2,
+            max_output_tokens=100,
+            isolated=False,
+        ),
+    )
+    arguments = CLIArguments(
+        provider_name="ollama",
+        model_name="cli-model",
+        task_prompt="Fix it.",
+        agent_name="developer",
+        enable_tools=True,
+        enable_actions=True,
+        workspace_root=tmp_path / "explicit",
+        max_tool_rounds=12,
+        temperature=0.3,
+        top_p=0.8,
+        max_output_tokens=200,
+    )
+
+    configuration = resolve_runtime_configuration(
+        arguments,
+        project_configuration=project,
+    )
+
+    assert configuration.provider_name == "ollama"
+    assert configuration.model_name == "cli-model"
+    assert configuration.agent_profile is not None
+    assert configuration.agent_profile.name == "Developer"
+    assert configuration.enable_tools is True
+    assert configuration.enable_actions is True
+    assert configuration.workspace_root == tmp_path / "explicit"
+    assert configuration.max_tool_rounds == 12
+    assert configuration.generation_config.temperature == 0.3
+    assert configuration.generation_config.top_p == 0.8
+    assert configuration.generation_config.max_output_tokens == 200
+
+
+def test_missing_project_configuration_preserves_runtime_defaults(
+    monkeypatch,
+) -> None:
+    """Keep the existing environment and disabled-tool behavior without TOML."""
+
+    monkeypatch.delenv(PROVIDER_ENV_VAR, raising=False)
+    monkeypatch.delenv(MODEL_ENV_VAR, raising=False)
+
+    configuration = resolve_runtime_configuration(
+        CLIArguments(provider_name=None, model_name=None),
+        project_configuration=None,
+    )
+
+    assert configuration.provider_name == "ollama"
+    assert configuration.model_name == DEFAULT_MODEL_NAME
+    assert configuration.agent_profile is None
+    assert configuration.enable_tools is False
+    assert configuration.enable_actions is False
+    assert configuration.workspace_root is None
+    assert configuration.max_tool_rounds == DEFAULT_AUTONOMOUS_MAX_TOOL_ROUNDS
 
 
 def test_parse_cli_arguments_accepts_system_prompt() -> None:
