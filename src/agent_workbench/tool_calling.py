@@ -10,6 +10,7 @@ from agent_workbench.tool_registry import ToolRegistry
 from agent_workbench.tools import (
     ToolApprovalDecision,
     ToolApprovalHandler,
+    ToolDefinition,
     ToolResult,
 )
 
@@ -96,10 +97,24 @@ def _repeats_previous_inspection_batch(
     )
 
 
+def _without_inspection_tools(
+    tools: tuple[ToolDefinition, ...],
+) -> tuple[ToolDefinition, ...]:
+    """Return tool definitions without read-only inspection operations."""
+
+    return tuple(
+        definition
+        for definition in tools
+        if definition.name not in _REPEATED_INSPECTION_TOOL_NAMES
+    )
+
+
 def _add_temporary_recovery_instruction(
     request: ChatRequest,
     completed_rounds: tuple[ToolInteractionRound, ...],
     instruction: str,
+    *,
+    withhold_inspection_tools: bool = False,
 ) -> ChatRequest:
     """Return one temporary corrective request without rejected tool data."""
 
@@ -108,9 +123,16 @@ def _add_temporary_recovery_instruction(
     else:
         corrected_system_prompt = f"{request.system_prompt}\n\n{instruction}"
 
+    corrected_tools = (
+        _without_inspection_tools(request.tools)
+        if withhold_inspection_tools
+        else request.tools
+    )
+
     return replace(
         request,
         system_prompt=corrected_system_prompt,
+        tools=corrected_tools,
         tool_interactions=completed_rounds,
     )
 
@@ -170,6 +192,7 @@ def run_tool_calling_loop(
                 request,
                 completed_rounds,
                 _REPEATED_TOOL_BATCH_RECOVERY_INSTRUCTION,
+                withhold_inspection_tools=True,
             )
             continue
 
