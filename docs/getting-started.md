@@ -589,13 +589,14 @@ Controlled writes and validation are disabled by default. Enable them only for
 an explicitly authorized workspace:
 
 ```bash
-uv run agent-workbench \
+uv run agent-workbench code \
   --provider ollama \
-  --model gpt-oss:20b \
+  --model qwen3-coder:30b \
   --agent developer \
   --workspace . \
+  --enable-tools \
   --enable-actions \
-  --show-tool-traces
+  --task "Fix the failing tests."
 ```
 
 `--enable-actions` cannot be used without `--workspace`. It adds, after the
@@ -622,6 +623,12 @@ Only `y` or `yes`, case-insensitively, approves. Blank input, EOF, interruption,
 or any other text denies. Approval is one-use and exact-invocation only. The
 model must request one effectful action per tool round; mixed or multiple
 actions are rejected before execution.
+
+Normal `code` output consists of concise typed phase, changed-path, validation,
+repair, verification, DONE, or terminal-failure lines. Complete mutation diffs
+remain visible in approval previews. Raw tool-call records are hidden unless
+`--show-tool-traces` is supplied; the model's complete final prose is hidden
+unless `--show-assistant-summary` is supplied.
 
 `apply_file_patch` accepts exactly `path`, `expected_content`,
 `replacement_content`, and optional `create_if_missing`. It updates one
@@ -704,14 +711,25 @@ Agent Workbench reports the relative paths that require manual inspection.
 File deletion, rename, directory creation, binary files, and mode changes are
 unsupported.
 
-The validation tools run fixed commands without a shell or caller flags,
-against a canonical workspace-relative target. Ruff commands time out after
-30 seconds; pytest times out after 120 seconds. Stdout and stderr are
+The validation tools run fixed commands without a shell or caller flags.
+During autonomous coding, the controller formats only existing `.py` paths
+reported by successful approved workspace actions in the current task, one
+sorted workspace-relative path at a time. Baseline-dirty and unrelated files
+are not formatter targets unless a successful task action changed that exact
+path. A non-Python-only task records a typed formatter skip. Ruff check and
+pytest still target `"."` and inspect the complete project. Ruff commands time
+out after 30 seconds; pytest times out after 120 seconds. Stdout and stderr are
 independently capped at 100 KiB. The minimal offline environment provides no
 dependency installation or public-network capability. Ruff and pytest
 non-zero exit codes are returned normally so the model can diagnose them.
-Ruff format may change files, and pytest executes project code, so review each
-preview carefully.
+Ruff format may change its exact approved target, and pytest executes project
+code, so review each preview carefully.
+
+The controller captures baseline changed paths before DISCOVER. After every
+formatter invocation and again before DONE, it rejects any tracked or
+untracked changed path outside that baseline plus the exact paths from
+successful approved actions. It never resets, restores, cleans, stages, or
+deletes unexpected paths; the workspace remains available for manual recovery.
 
 Suggested request:
 
@@ -732,7 +750,7 @@ The primary workspace can remain clean while one coding session uses a new
 local branch and sibling Git worktree:
 
 ```bash
-uv run agent-workbench \
+uv run agent-workbench code \
   --provider ollama \
   --model gpt-oss:20b \
   --agent developer \
@@ -740,7 +758,8 @@ uv run agent-workbench \
   --worktree-path ../agent-workbench-task \
   --worktree-branch agent/task \
   --enable-actions \
-  --show-tool-traces
+  --task "Fix the failing tests." \
+  --commit-message "fix: correct the failing tests"
 ```
 
 The two worktree options are an explicit pair; neither has an inferred value.
@@ -762,7 +781,8 @@ Create local branch and isolated worktree
         ↓
 Construct isolated AgentSession
         ↓
-Inspect, patch, Ruff, pytest, status, diff
+Inspect, patch, format approved Python paths, check project, test project,
+status, diff
         ↓
 Validate every changed entry and require a clean index
         ↓

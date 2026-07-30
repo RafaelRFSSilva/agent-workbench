@@ -3,11 +3,11 @@
 This playbook uses the local `gpt-oss:20b` model for one bounded autonomous
 coding task inside a separately approved Git worktree. The model may inspect
 and request controlled edits. The application controller, rather than the
-model, runs Ruff format, Ruff check, pytest, Git status, and Git diff in fixed
-phases. Worktree creation, controlled actions, executable validation, and the
-final local commit remain explicitly approved. The workflow preserves the
-worktree and local branch after success. Pushes and Pull Requests remain
-manual.
+model, formats only approved changed Python paths, runs project-wide Ruff check
+and pytest, and inspects Git status and diff in fixed phases. Worktree creation,
+controlled actions, executable validation, and the final local commit remain
+explicitly approved. The workflow preserves the worktree and local branch
+after success. Pushes and Pull Requests remain manual.
 
 The primary repository must be completely clean before launch. Do not use this
 workflow as a substitute for external review of security-sensitive or
@@ -30,11 +30,14 @@ repository-lifecycle changes.
    Use one `apply_workspace_changes` transaction when several file changes
    must succeed together or when creation is required.
 7. Review every complete action preview and diff.
-8. Approve the controller-invoked Ruff format, Ruff check, and pytest sequence
-   separately. The target is always `"."` in v1.
-9. Require controller-owned DONE evidence: successful latest Ruff format, Ruff
-   check, and pytest results, successful Git status and complete diff
-   inspection, and non-empty tracked, staged, or safe untracked diff evidence.
+8. Approve each controller-invoked Ruff format target separately, then approve
+   project-wide Ruff check and pytest. Formatter targets are sorted existing
+   Python paths produced by successful approved actions; formatting is safely
+   skipped when none exist.
+9. Require controller-owned DONE evidence: successful or safely skipped latest
+   Ruff format, successful Ruff check and pytest, successful Git status and
+   complete diff inspection, and non-empty tracked, staged, or safe untracked
+   diff evidence.
 10. Require the final Git path set to equal the effective paths produced by
     successful approved workspace actions.
 11. Review the immutable commit preview, exact CLI-supplied message, exact path
@@ -68,7 +71,7 @@ sensitive-line boundary.
 From the clean primary Agent Workbench repository:
 
 ```bash
-uv run agent-workbench \
+uv run agent-workbench code \
   --provider ollama \
   --model gpt-oss:20b \
   --agent developer \
@@ -77,8 +80,7 @@ uv run agent-workbench \
   --task "<BOUNDED_TASK>" \
   --worktree-path ../agent-workbench-task \
   --worktree-branch agent/task-name \
-  --commit-message "<COMMIT_MESSAGE>" \
-  --show-tool-traces
+  --commit-message "<COMMIT_MESSAGE>"
 ```
 
 The worktree target must be absent, its parent must already exist, and the
@@ -86,6 +88,11 @@ branch must be a new local branch. Isolated execution requires `--workspace`,
 `--enable-actions`, `--task`, both worktree options, and `--commit-message`.
 The task and commit message are supplied before worktree creation; they are not
 requested interactively after the coding session.
+
+Normal output is concise controller-owned progress. Exact complete diffs remain
+visible for workspace and commit approval. Add `--show-tool-traces` only for
+debugging tool calls, or `--show-assistant-summary` when the model's complete
+final prose is needed.
 
 ## Reusable local-agent prompt template
 
@@ -124,9 +131,9 @@ Use the existing test conventions:
 
 Request at most one effectful tool per response. Wait for approval before
 every effectful action. Do not request validation or Git verification tools:
-the controller withholds them during model-facing phases and invokes them
-itself in the fixed order Ruff format, Ruff check, pytest, Git status, Git
-diff. If validation fails, resolve every listed failure and dynamic runtime
+the controller withholds them during model-facing phases and invokes sorted
+per-file Ruff format, project-wide Ruff check and pytest, then Git status and
+Git diff. If validation fails, resolve every listed failure and dynamic runtime
 requirement in the bounded REPAIR evidence, then make another controlled
 change. Do not weaken tests or validation. Do not independently
 request Git commit, push, merge, branch deletion, reset, restore, clean, or
@@ -166,7 +173,8 @@ private paths, or `.env` values in the task prompt or commit message.
 ### Validation approval
 
 - The action is the expected fixed Ruff or pytest tool.
-- The target is exactly `"."`.
+- A Ruff format target is one expected approved changed Python file.
+- Ruff check and pytest target `"."` and inspect the complete project.
 - No caller flags, arbitrary command, environment, or unexpected path appears.
 - Only one effectful action is present in the response.
 
@@ -234,7 +242,8 @@ discovery evidence, ordered acceptance criteria, validation-driven repair, the
 repair limit, bounded cross-send action failures, simultaneous assertion and
 dynamic runtime evidence, SHA-guarded whole-file repair, false completion
 rejection, generated-directory filtering, read-only untracked Git evidence,
-untracked-only DONE, isolated new-file commits, and the final diff gate.
+untracked-only DONE, isolated new-file commits, constrained formatting,
+unexpected-path rejection, concise repair progress, and the final diff gate.
 Automated tests do not call Ollama or any paid/cloud provider.
 
 Those tests validate controller behavior, not local-model capability. A prior

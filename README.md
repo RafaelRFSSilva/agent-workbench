@@ -139,6 +139,24 @@ Display the CLI help:
 uv run agent-workbench --help
 ```
 
+Run a normal local coding task:
+
+```bash
+uv run agent-workbench code \
+  --provider ollama \
+  --model qwen3-coder:30b \
+  --agent developer \
+  --workspace . \
+  --enable-tools \
+  --enable-actions \
+  --task "Fix the failing tests."
+```
+
+Normal coding output is concise controller-owned progress. Exact mutation
+diffs still appear before approval. Add `--show-tool-traces` only when
+debugging tool calls, or `--show-assistant-summary` to display the model's
+complete final prose.
+
 ## Local Ollama Setup
 
 Ollama is the default provider and `gpt-oss:20b` is the default model.
@@ -636,15 +654,14 @@ to inspect the authorized workspace, request approved changes, run validation,
 inspect the final Git state, report the result, and then exit:
 
 ```bash
-uv run agent-workbench \
+uv run agent-workbench code \
   --provider ollama \
-  --model gpt-oss:20b \
+  --model qwen3-coder:30b \
   --agent developer \
-  --workspace /path/to/project \
+  --workspace . \
+  --enable-tools \
   --enable-actions \
-  --max-tool-rounds 32 \
-  --show-tool-traces \
-  --task "Inspect the project, fix the defect with the smallest necessary change, run Ruff and pytest, inspect the final Git status and diff, and report the result."
+  --task "Fix the failing tests."
 ```
 
 `--task` requires both `--workspace` and `--enable-actions`. It cannot be
@@ -657,39 +674,51 @@ execution. The model may inspect the workspace and request structured file
 changes. It cannot choose validation, verification, phase progression, or
 DONE.
 
-After a successful workspace action, the controller invokes
-`run_ruff_format`, `run_ruff_check`, and `run_pytest` against `"."` in that
-exact order. Failed validation enters a bounded REPAIR phase and reruns the
-complete sequence after another successful change. Every failed validation is
-represented with its tool name, status, exit code, and bounded sanitized stdout
-and stderr excerpts. Safe action failures also survive across later EDIT and
-REPAIR sends so the model can reread stale targets instead of repeating an
-invalid request. Generic prompt text uses conservative line redaction;
-validation output uses a separate credential-aware boundary that preserves
-safe generated runtime requirements. The controller then invokes Git status
-and diff inspection.
+Before coding, the controller records the baseline Git changed-path set. After
+a successful workspace action, it runs Ruff format separately on each existing
+Python path produced by successful approved actions, in sorted
+workspace-relative order. It skips mutable formatting when the task changed no
+Python files. Ruff check and pytest still inspect the complete project.
+Failed validation enters a bounded REPAIR phase and reruns the sequence after
+another successful change. Every failed validation is represented with its
+tool name, status, exit code, and bounded sanitized stdout and stderr excerpts.
+Safe action failures also survive across later EDIT and REPAIR sends so the
+model can reread stale targets instead of repeating an invalid request.
+Generic prompt text uses conservative line redaction; validation output uses a
+separate credential-aware boundary that preserves safe generated runtime
+requirements. The controller then invokes Git status and diff inspection.
+
+After every Ruff format invocation and again before DONE, the controller
+requires current changed paths to remain within the baseline paths plus exact
+paths produced by successful approved actions. Any unexpected tracked or
+untracked path prevents DONE and leaves the workspace for manual recovery.
 Success requires a non-empty final
 tracked, staged, or safe untracked diff and successful latest validation and
 Git evidence. Omission metadata alone does not satisfy verification. Every file
 change and executable validation remains default-deny and requires approval
 for that exact invocation.
 
-Direct and isolated results show the same stable evidence block:
+Direct and isolated coding use the same stable progress lines:
 
 ```text
-Final phase: DONE
-Tool rounds: <count>
-Workspace change applied: yes
-Repair attempts: <count>
-Completion continuations: <count>
-Validation succeeded: yes
-Git status inspected: yes
-Git diff inspected: yes
+[DISCOVER] Inspecting workspace
+[DISCOVER] Inspection complete
+[EDIT] Applying controlled workspace changes
+[EDIT] Changed src/calculator.py
+[VALIDATE] Running controller-owned validation
+[VALIDATE] Ruff format passed
+[VALIDATE] Ruff check passed
+[VALIDATE] Pytest passed: 5 passed
+[VERIFY] Inspecting final workspace changes
+[VERIFY] 1 changed file
+[DONE] Task completed successfully
 ```
 
 `--show-tool-traces` displays each completed tool invocation and its redacted
 result while the task is running. Read file contents and absolute workspace
-paths are not displayed in traces.
+paths are not displayed in traces. The model's long final completion is hidden
+by default; use `--show-assistant-summary` to display it. Approval prompts and
+their exact complete diffs remain visible in normal mode.
 
 The task mode does not automatically commit, merge, push, delete files, rename
 files, install dependencies, run arbitrary shell commands, or access the public
@@ -702,7 +731,7 @@ Keep a clean primary repository untouched while one supervised autonomous task
 runs on a new local branch in a sibling worktree:
 
 ```bash
-uv run agent-workbench \
+uv run agent-workbench code \
   --provider ollama \
   --model gpt-oss:20b \
   --agent developer \
@@ -711,8 +740,7 @@ uv run agent-workbench \
   --task "Fix the defect and validate the project." \
   --worktree-path ../agent-workbench-task \
   --worktree-branch agent/task \
-  --commit-message "fix: correct the defect" \
-  --show-tool-traces
+  --commit-message "fix: correct the defect"
 ```
 
 `--worktree-path` and `--worktree-branch` must be supplied together. Isolated
@@ -729,9 +757,11 @@ Only `y` or `yes` approves the fixed local worktree command.
 The isolated `AgentSession` receives workspace tools for the new worktree only,
 and source-relative context files are reloaded from the corresponding isolated
 paths. Every file change and validation command remains separately approved.
-Commit planning cannot begin unless the deterministic controller reaches DONE
-with successful Ruff format, Ruff check, pytest, Git status, and non-empty Git
-diff evidence.
+Ruff format approvals identify one exact approved changed Python file; Ruff
+check and pytest remain project-wide. Commit planning cannot begin unless the
+deterministic controller reaches DONE with successful or safely skipped Ruff
+format evidence, successful Ruff check and pytest, Git status, and non-empty
+Git diff evidence.
 
 The exact `--commit-message`, ordered path set, and every complete diff are shown
 before a separate default-deny commit approval. A verified successful commit

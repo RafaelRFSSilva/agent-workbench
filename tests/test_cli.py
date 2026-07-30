@@ -1,5 +1,7 @@
 """Tests for the Agent Workbench command-line interface."""
 
+import hashlib
+import subprocess
 from pathlib import Path
 from unittest.mock import call, Mock
 
@@ -22,11 +24,18 @@ from agent_workbench.messages import ChatRequest, ChatResponse, Message
 from agent_workbench.session import AgentSession, SessionId
 from agent_workbench.agents import get_agent_profile
 from agent_workbench.generation import GenerationConfig
+from agent_workbench.git_tools import register_git_tools
 from agent_workbench.structured_outputs import JSONResponseFormat
 from agent_workbench.symbol_tools import register_symbol_tools
 from agent_workbench.tool_registry import ToolRegistry
-from agent_workbench.tools import ToolDefinition, ToolInvocation
+from agent_workbench.tools import (
+    ToolApprovalDecision,
+    ToolDefinition,
+    ToolInvocation,
+)
+from agent_workbench.validation_tools import register_validation_tools
 from agent_workbench.workspace import Workspace
+from agent_workbench.workspace_actions import register_workspace_action_tools
 from agent_workbench.workspace_tools import register_workspace_tools
 
 
@@ -126,6 +135,96 @@ def create_tool_response(
     """Create a response containing ordered tool invocations."""
 
     return ChatResponse(text=text, tool_invocations=invocations)
+
+
+def create_cli_coding_repository(root: Path) -> Path:
+    """Create one committed failing project for full CLI coding regressions."""
+
+    root.mkdir()
+    subprocess.run(
+        ["git", "init", "-b", "main"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "CLI Test User"],
+        cwd=root,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "cli-test@example.invalid"],
+        cwd=root,
+        check=True,
+    )
+    (root / "module.py").write_text(
+        "def add(left: int, right: int) -> int:\n    return left - right\n",
+        encoding="utf-8",
+    )
+    (root / "test_module.py").write_text(
+        "from module import add\n\n\n"
+        "def test_add() -> None:\n"
+        "    assert add(1, 2) == 3\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "add", "module.py", "test_module.py"],
+        cwd=root,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "initial"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+    )
+    return root
+
+
+def create_cli_coding_session(
+    repository: Path,
+    provider: FakeProvider,
+) -> AgentSession:
+    """Create one real action-enabled session for CLI progress regressions."""
+
+    registry = ToolRegistry()
+    workspace = Workspace(repository)
+    register_workspace_tools(registry, workspace)
+    register_symbol_tools(registry, workspace)
+    register_git_tools(registry, workspace)
+    register_workspace_action_tools(registry, workspace)
+    register_validation_tools(registry, workspace)
+    return AgentSession(
+        id=SessionId("cli-session"),
+        provider=provider,
+        tool_registry=registry,
+        max_tool_rounds=AUTONOMOUS_MAX_TOOL_ROUNDS,
+    )
+
+
+def coding_replacement_response(
+    invocation_id: str,
+    *,
+    expected_content: str,
+    expected_text: str,
+    replacement_text: str,
+) -> ChatResponse:
+    """Create one SHA-guarded literal replacement provider response."""
+
+    return create_tool_response(
+        ToolInvocation(
+            id=invocation_id,
+            tool_name="apply_text_replacement",
+            arguments={
+                "path": "module.py",
+                "expected_text": expected_text,
+                "replacement_text": replacement_text,
+                "expected_file_sha256": hashlib.sha256(
+                    expected_content.encode("utf-8")
+                ).hexdigest(),
+            },
+        )
+    )
 
 
 def test_exit_command_does_not_call_provider(monkeypatch, capsys) -> None:
@@ -1876,4 +1975,187 @@ def test_isolated_autonomous_output_preserves_progress_order_without_hashes(
         "[ISOLATED] Created local commit on agent/fix with 1 changed file\n"
         "[ISOLATED] Worktree clean; primary workspace unchanged; "
         "worktree and local branch preserved\n"
+    )
+
+
+def test_scripted_cli_progress_orders_failure_repair_success_verify_and_done(
+    monkeypatch,
+    tmp_path,
+    capsys,
+) -> None:
+    """Prove the complete normal operator-visible coding progress sequence."""
+
+    repository = create_cli_coding_repository(tmp_path / "project")
+    original = (repository / "module.py").read_text(encoding="utf-8")
+    multiplied = original.replace("left - right", "left * right")
+    provider = FakeProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            coding_replacement_response(
+                "bad-edit",
+                expected_content=original,
+                expected_text="return left - right",
+                replacement_text="return left * right",
+            ),
+            ChatResponse(
+                text="Provider completion after first edit with private prose."
+            ),
+            coding_replacement_response(
+                "repair",
+                expected_content=multiplied,
+                expected_text="return left * right",
+                replacement_text="return left + right",
+            ),
+            ChatResponse(
+                text=(
+                    "Provider long completion must remain hidden. "
+                    "replacement_content and tool-call JSON stay private."
+                )
+            ),
+        ]
+    )
+    session = create_cli_coding_session(repository, provider)
+    configuration = RuntimeConfiguration(
+        provider_name="ollama",
+        model_name="scripted",
+        workspace_root=repository,
+        enable_actions=True,
+    )
+
+    monkeypatch.setattr("agent_workbench.cli.load_environment", Mock())
+    monkeypatch.setattr(
+        "agent_workbench.cli.resolve_runtime_configuration",
+        Mock(return_value=configuration),
+    )
+    monkeypatch.setattr(
+        "agent_workbench.cli.create_agent_session",
+        Mock(return_value=session),
+    )
+    monkeypatch.setattr(
+        "agent_workbench.cli._prompt_for_tool_approval",
+        Mock(return_value=ToolApprovalDecision.APPROVE),
+    )
+
+    main(
+        [
+            "code",
+            "--provider",
+            "ollama",
+            "--model",
+            "scripted",
+            "--workspace",
+            str(repository),
+            "--enable-tools",
+            "--enable-actions",
+            "--agent",
+            "developer",
+            "--task",
+            "Fix the failing tests.",
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert output.splitlines() == [
+        "[DISCOVER] Inspecting workspace",
+        "[DISCOVER] Inspection complete",
+        "[EDIT] Applying controlled workspace changes",
+        "[EDIT] Changed module.py",
+        "[VALIDATE] Running controller-owned validation",
+        "[VALIDATE] Ruff format passed",
+        "[VALIDATE] Ruff check passed",
+        "[VALIDATE] Pytest failed: 1 failed",
+        "[REPAIR 1/2] Resolving validation failures",
+        "[REPAIR 1/2] Changed module.py",
+        "[VALIDATE] Running controller-owned validation",
+        "[VALIDATE] Ruff format passed",
+        "[VALIDATE] Ruff check passed",
+        "[VALIDATE] Pytest passed: 1 passed",
+        "[VERIFY] Inspecting final workspace changes",
+        "[VERIFY] 1 changed file",
+        "[DONE] Task completed successfully",
+    ]
+    assert '"tool_call"' not in output
+    assert '"tool_name"' not in output
+    assert "replacement_content" not in output
+    assert "return left * right" not in output
+    assert hashlib.sha256(original.encode("utf-8")).hexdigest() not in output
+    assert "Provider long completion" not in output
+
+
+def test_scripted_cli_unexpected_formatter_path_fails_without_done(
+    monkeypatch,
+    tmp_path,
+    capsys,
+) -> None:
+    """Prove unexpected formatter mutations produce one terminal failure."""
+
+    repository = create_cli_coding_repository(tmp_path / "project")
+    original = (repository / "module.py").read_text(encoding="utf-8")
+    provider = FakeProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            coding_replacement_response(
+                "edit",
+                expected_content=original,
+                expected_text="return left - right",
+                replacement_text="return left + right",
+            ),
+            ChatResponse(text="Hidden provider completion."),
+        ]
+    )
+    session = create_cli_coding_session(repository, provider)
+    configuration = RuntimeConfiguration(
+        provider_name="ollama",
+        model_name="scripted",
+        workspace_root=repository,
+        enable_actions=True,
+    )
+    from agent_workbench import validation_tools
+
+    original_run_validation = validation_tools.run_validation
+
+    def intrusive_validation(workspace, tool_name, arguments):
+        result = original_run_validation(workspace, tool_name, arguments)
+        if tool_name == "run_ruff_format":
+            (repository / "unexpected.txt").write_text(
+                "preserve me\n",
+                encoding="utf-8",
+            )
+        return result
+
+    monkeypatch.setattr(validation_tools, "run_validation", intrusive_validation)
+    monkeypatch.setattr("agent_workbench.cli.load_environment", Mock())
+    monkeypatch.setattr(
+        "agent_workbench.cli.resolve_runtime_configuration",
+        Mock(return_value=configuration),
+    )
+    monkeypatch.setattr(
+        "agent_workbench.cli.create_agent_session",
+        Mock(return_value=session),
+    )
+    monkeypatch.setattr(
+        "agent_workbench.cli._prompt_for_tool_approval",
+        Mock(return_value=ToolApprovalDecision.APPROVE),
+    )
+
+    main(
+        [
+            "code",
+            "--workspace",
+            str(repository),
+            "--enable-actions",
+            "--task",
+            "Fix the failing tests.",
+        ]
+    )
+
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[-1] == (
+        "[FAILED] VALIDATE: unexpected changed paths after run_ruff_format: "
+        "unexpected.txt; repair attempts 0/2; "
+        "workspace preserved for manual recovery"
+    )
+    assert "[DONE] Task completed successfully" not in lines
+    assert (repository / "unexpected.txt").read_text(encoding="utf-8") == (
+        "preserve me\n"
     )
