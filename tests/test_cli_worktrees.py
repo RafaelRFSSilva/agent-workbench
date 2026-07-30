@@ -15,6 +15,7 @@ from agent_workbench.cli import (
     _prompt_for_worktree_approval,
     main,
 )
+from agent_workbench.coding_loop import CodingPhase
 from agent_workbench.errors import CompletionError
 from agent_workbench.session import SessionId
 from agent_workbench.tools import ToolApprovalDecision
@@ -183,7 +184,10 @@ def isolated_workflow_result() -> SimpleNamespace:
         worktree=SimpleNamespace(target_display="../isolated"),
         coding_result=SimpleNamespace(
             assistant_summary="Corrected and validated the implementation.",
+            final_phase=CodingPhase.DONE,
             tool_round_count=6,
+            repair_attempt_count=1,
+            completion_continuation_count=2,
             validation_succeeded=True,
             inspected_git_status=True,
             inspected_git_diff=True,
@@ -301,9 +305,17 @@ def test_main_delegates_complete_isolated_workflow_once(
     assert "Worktree: ../isolated" in output
     assert "Branch: agent/task" in output
     assert "New isolated HEAD: " + "b" * 40 in output
-    assert "Validation succeeded: yes" in output
-    assert "Git status inspected: yes" in output
-    assert "Git diff inspected: yes" in output
+    evidence = (
+        "  Final phase: DONE\n"
+        "  Tool rounds: 6\n"
+        "  Workspace change applied: yes\n"
+        "  Repair attempts: 1\n"
+        "  Completion continuations: 2\n"
+        "  Validation succeeded: yes\n"
+        "  Git status inspected: yes\n"
+        "  Git diff inspected: yes\n"
+    )
+    assert evidence in output
     assert "Final worktree clean: yes" in output
     assert "Primary working tree unchanged" in output
     assert "Worktree and local branch preserved" in output
@@ -436,7 +448,10 @@ def test_workspace_change_applied_line_in_cli_output(
             worktree=SimpleNamespace(target_display="../isolated"),
             coding_result=SimpleNamespace(
                 assistant_summary="Corrected and validated the implementation.",
+                final_phase=CodingPhase.DONE,
                 tool_round_count=6,
+                repair_attempt_count=0,
+                completion_continuation_count=0,
                 validation_succeeded=True,
                 inspected_git_status=True,
                 inspected_git_diff=True,

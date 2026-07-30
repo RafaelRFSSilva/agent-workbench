@@ -184,6 +184,8 @@ class AgentSession:
         self,
         content: str,
         *,
+        allowed_tool_names: Iterable[str] | None = None,
+        max_tool_rounds: int | None = None,
         tool_round_observer: ToolRoundObserver | None = None,
         tool_approval_handler: ToolApprovalHandler | None = None,
         recover_approval_preview_errors: bool = False,
@@ -196,6 +198,17 @@ class AgentSession:
         if self._status is SessionStatus.COMPLETING:
             raise SessionStateError("session is already completing a request.")
 
+        if max_tool_rounds is not None and (
+            isinstance(max_tool_rounds, bool)
+            or not isinstance(max_tool_rounds, int)
+            or max_tool_rounds <= 0
+        ):
+            raise ConfigurationError("maximum tool rounds must be a positive integer.")
+
+        allowed_names = _normalize_allowed_tool_names(allowed_tool_names)
+        effective_max_tool_rounds = (
+            self._max_tool_rounds if max_tool_rounds is None else max_tool_rounds
+        )
         self._status = SessionStatus.COMPLETING
         user_message: Message = {
             "role": "user",
@@ -212,7 +225,11 @@ class AgentSession:
             generation_config=self._generation_config,
             response_format=self._response_format,
             tools=(
-                self._tool_registry.definitions
+                tuple(
+                    definition
+                    for definition in self._tool_registry.definitions
+                    if allowed_names is None or definition.name in allowed_names
+                )
                 if self._tool_registry is not None
                 else ()
             ),
@@ -226,7 +243,8 @@ class AgentSession:
                     self._provider,
                     request,
                     self._tool_registry,
-                    self._max_tool_rounds,
+                    effective_max_tool_rounds,
+                    allowed_tool_names=allowed_names,
                     tool_round_observer=tool_round_observer,
                     tool_approval_handler=tool_approval_handler,
                     recover_approval_preview_errors=recover_approval_preview_errors,
@@ -258,3 +276,28 @@ class AgentSession:
             f"message_count={len(self._messages)}"
             ")"
         )
+
+
+def _normalize_allowed_tool_names(
+    allowed_tool_names: Iterable[str] | None,
+) -> frozenset[str] | None:
+    """Return one immutable per-send tool allowlist."""
+
+    if allowed_tool_names is None:
+        return None
+    if isinstance(allowed_tool_names, str):
+        raise ConfigurationError("allowed tool names must be an iterable of names.")
+
+    try:
+        names = frozenset(allowed_tool_names)
+    except TypeError:
+        raise ConfigurationError(
+            "allowed tool names must be an iterable of names."
+        ) from None
+
+    if any(not isinstance(name, str) or not name.strip() for name in names):
+        raise ConfigurationError(
+            "allowed tool names must contain only non-blank strings."
+        )
+
+    return names

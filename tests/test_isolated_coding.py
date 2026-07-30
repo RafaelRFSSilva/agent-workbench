@@ -4,11 +4,16 @@ from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 import subprocess
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
 from agent_workbench.arguments import RuntimeConfiguration
-from agent_workbench.coding_loop import AutonomousCodingResult, ValidationRun
+from agent_workbench.coding_loop import (
+    AutonomousCodingResult,
+    CodingPhase,
+    ValidationRun,
+)
 from agent_workbench.errors import CompletionError, ConfigurationError
 from agent_workbench.isolated_coding import (
     IsolatedAutonomousWorkflowResult,
@@ -78,6 +83,7 @@ def approve(_request) -> ToolApprovalDecision:
 
 def coding_result(
     *,
+    final_phase: CodingPhase = CodingPhase.DONE,
     workspace_change_applied: bool = True,
     validation_succeeded: bool = True,
     validation_after_change: bool = True,
@@ -97,10 +103,15 @@ def coding_result(
             acceptance_criteria=("Run validation.",),
         ),
         assistant_summary="Corrected the implementation.",
+        final_phase=final_phase,
+        workspace_change_applied=workspace_change_applied,
+        repair_attempt_count=0,
+        completion_continuation_count=0,
         tool_round_count=6,
         executed_tool_names=(
             "read_file",
             "apply_workspace_changes",
+            "run_ruff_format",
             "run_ruff_check",
             "run_pytest",
             "inspect_git_status",
@@ -108,23 +119,31 @@ def coding_result(
         ),
         approved_action_names=(
             "apply_workspace_changes",
+            "run_ruff_format",
             "run_ruff_check",
             "run_pytest",
         ),
         validation_runs=(
             ValidationRun(
-                tool_name="run_ruff_check",
+                tool_name="run_ruff_format",
                 result_status="success",
                 exit_code=0,
                 sequence_index=validation_offset,
             ),
             ValidationRun(
+                tool_name="run_ruff_check",
+                result_status="success",
+                exit_code=0,
+                sequence_index=validation_offset + 1,
+            ),
+            ValidationRun(
                 tool_name="run_pytest",
                 result_status="success",
                 exit_code=pytest_exit_code,
-                sequence_index=validation_offset + 1,
+                sequence_index=validation_offset + 2,
             ),
         ),
+        tool_results=(),
         inspected_git_status=inspected_git_status,
         inspected_git_diff=inspected_git_diff,
         last_workspace_change_sequence_index=change_index,
@@ -180,7 +199,7 @@ def test_runs_isolated_task_and_creates_verified_local_commit(
         assert tool_round_observer is None
         assert tuple(acceptance_criteria) == (
             "Implement the requested behavior with bounded workspace changes.",
-            "Run Ruff static analysis and resolve introduced issues.",
+            "Run Ruff formatting and static analysis and resolve introduced issues.",
             "Run pytest and resolve introduced regressions.",
             "Inspect the final Git status and diff before reporting completion.",
         )
@@ -248,6 +267,10 @@ def test_runs_isolated_task_and_creates_verified_local_commit(
 @pytest.mark.parametrize(
     ("result", "message"),
     [
+        (
+            coding_result(final_phase=CodingPhase.VERIFY),
+            "deterministic DONE phase",
+        ),
         (
             coding_result(workspace_change_applied=False),
             "successful approved workspace change",
@@ -336,6 +359,68 @@ def test_failed_commit_gate_preserves_dirty_worktree_without_commit(
     assert run_git(target, "status", "--short").stdout == " M module.py\n"
     assert run_git(source, "rev-parse", "HEAD").stdout.strip() == original_head
     assert run_git(source, "branch", "--list", "agent/failed-gate").stdout.strip()
+    assert run_git(target, "log", "-1", "--pretty=%s").stdout.strip() == "initial"
+
+
+def test_deterministic_coding_failure_never_plans_a_commit(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Preserve the isolated worktree before any commit planning on failure."""
+
+    source = create_repository(tmp_path / "source")
+    target = tmp_path / "isolated"
+    captured = {}
+
+    def create_isolated(_session_id, _runtime, worktree, *, max_tool_rounds):
+        assert max_tool_rounds == 16
+        captured["worktree"] = worktree
+        return SimpleNamespace(worktree=worktree, session=object())
+
+    def fail_coding(_session, _prompt, **_kwargs):
+        worktree = captured["worktree"]
+        (worktree.worktree_path / "module.py").write_text(
+            "def add(left: int, right: int) -> int:\n    return left * right\n",
+            encoding="utf-8",
+        )
+        raise CompletionError(
+            "Deterministic coding failed in phase VALIDATE: pytest failed. "
+            "repair_attempts=2, completion_continuations=0."
+        )
+
+    commit_planning = Mock(side_effect=AssertionError("commit planning must not run"))
+    monkeypatch.setattr(
+        "agent_workbench.isolated_coding.create_isolated_agent_session",
+        create_isolated,
+    )
+    monkeypatch.setattr(
+        "agent_workbench.isolated_coding.run_autonomous_coding_task",
+        fail_coding,
+    )
+    monkeypatch.setattr(
+        "agent_workbench.isolated_coding.plan_isolated_commit",
+        commit_planning,
+    )
+
+    with pytest.raises(
+        CompletionError,
+        match=r"Autonomous coding failed: Deterministic coding failed in phase VALIDATE",
+    ):
+        run_isolated_autonomous_workflow(
+            SessionId("deterministic-failure"),
+            configuration(source),
+            "agent/deterministic-failure",
+            target,
+            "Correct the add implementation.",
+            "fix: must not be created",
+            worktree_approval_handler=approve,
+            tool_approval_handler=approve,
+            commit_approval_handler=approve,
+        )
+
+    commit_planning.assert_not_called()
+    assert target.exists()
+    assert run_git(target, "status", "--short").stdout == " M module.py\n"
     assert run_git(target, "log", "-1", "--pretty=%s").stdout.strip() == "initial"
 
 

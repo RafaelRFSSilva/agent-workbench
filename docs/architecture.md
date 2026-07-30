@@ -92,6 +92,29 @@ Interactive Setup ─────────┘
 
 This prevents the setup flow from becoming an independent execution path.
 
+The `code` command uses the same provider-independent session and registry, but
+an application controller owns phase progression:
+
+```text
+TaskSpec
+   ↓
+DISCOVER (model, read-only, at most four tool rounds)
+   ↓
+EDIT (model, read-only plus controlled workspace actions)
+   ↓
+VALIDATE (controller: Ruff format → Ruff check → pytest)
+   ↓ failed
+REPAIR (model, read-only plus controlled workspace actions)
+   └──────────────→ VALIDATE
+   ↓ passed
+VERIFY (controller: Git status → Git diff)
+   ↓
+DONE
+```
+
+Only successful tool results, validation exit codes, and final Git inspection
+can advance this workflow. Assistant text is never completion evidence.
+
 ## Package Structure
 
 The main application package is located under:
@@ -688,9 +711,12 @@ The test suite verifies:
 * Interactive setup behavior.
 * Provider factory behavior.
 * Tool translation, execution ordering, history, and CLI integration.
+* Deterministic coding phases with scripted providers and real temporary Git
+  repositories.
 
-Real provider validation is performed separately from the automated unit
-suite.
+Automated workflow tests never call Ollama or a paid/cloud provider. Manual
+benchmarks with real local models are separate future evaluation work and must
+not be confused with the deterministic scripted-provider regression battery.
 
 ## Current Layer Boundaries
 
@@ -794,6 +820,12 @@ invocations through `ToolRegistry`, appends validated interaction rounds, and
 stops on a response without tool invocations. Its positive maximum-round
 argument protects against unbounded new tool rounds; pre-existing rounds are
 forwarded without re-execution.
+
+`AgentSession.send()` may additionally receive an allowlist and maximum tool
+rounds for one call. The allowlist filters provider-visible definitions and is
+enforced again before execution. A withheld invocation produces a deterministic
+error `ToolResult` and cannot reach preview, approval, or execution. Omitting
+both options preserves the configured session behavior and default round limit.
 
 Registrations may mark a handler as approval-required and supply a deterministic
 preview callback. `ToolApprovalRequest` snapshots the exact immutable
@@ -1250,15 +1282,17 @@ format, and ordered tool definitions are forwarded through the existing
 objective and an ordered tuple of acceptance criteria. The public
 `AgentSession.task_spec` property is read-only and defaults to `None`.
 
-The task specification is not currently forwarded through `ChatRequest`,
-inserted into prompts, translated by provider adapters, evaluated by the tool
-loop, or used to control session lifecycle. Those behaviors belong to future
-task orchestration rather than the base session boundary.
+The base session does not automatically forward the task specification through
+`ChatRequest`, translate it in provider adapters, evaluate it in the tool loop,
+or use it to control session lifecycle. Application controllers may consume
+the metadata explicitly; the deterministic coding controller includes its
+objective and ordered acceptance criteria in each model-facing phase prompt.
 
 The synchronous `send()` operation rejects blank content and re-entrant sends,
 sets the status to `completing`, and selects direct provider completion or the
-existing `run_tool_calling_loop()`. It forwards the maximum-round limit and an
-optional observer without implementing another tool loop.
+existing `run_tool_calling_loop()`. It accepts optional per-send tool names and
+a per-send round limit, forwards an optional observer, and does not implement
+another tool loop. Per-send values never mutate the session defaults.
 
 Conversation updates are transactional. A successful send appends the user
 message and final assistant text exactly once and returns to `ready`; internal
@@ -1274,9 +1308,66 @@ persistence, serialization, concurrency, cancellation, asynchronous APIs, RAG,
 MCP, VS Code, or voice input. The additive isolated-session factory binds one
 such session to one validated worktree without changing those boundaries.
 
-## Orchestration Boundary
+## Deterministic Coding Controller
 
-The orchestrator should coordinate sessions and tasks.
+`run_autonomous_coding_task()` is an implemented single-session application
+controller. It owns a typed `CodingPhase`, bounded `CodingWorkflowLimits`, and
+accumulated tool evidence. Every model-facing prompt repeats the sanitized
+original objective and ordered `TaskSpec` acceptance criteria. Model-facing
+work is restricted to:
+
+* `DISCOVER`: existing read-only repository/workspace tools, with a four-round
+  maximum. Successful rounds produce typed evidence containing only bounded
+  safe workspace-relative paths and allowlisted metadata. Item, per-item
+  character, and combined character limits prevent tool output from becoming
+  unbounded. A normal completion also contributes a bounded sanitized
+  discovery summary.
+* `EDIT`: read-only tools plus controlled patch, replacement, and transaction
+  actions. Its prompt carries the explicit discovery evidence even when the
+  DISCOVER send exhausted its round limit and its conversation turn was rolled
+  back.
+* `REPAIR`: the same tools as EDIT, with the original objective, failed
+  validation names and exit codes, bounded redacted output, safe changed paths,
+  and current counters repeated in every prompt.
+
+The controller invokes `run_ruff_format`, `run_ruff_check`, and `run_pytest`
+against `"."` in that exact order through the registered preview, explicit
+approval, and execution interfaces. Any error or non-zero exit code enters
+REPAIR. A successful repair must contain a new successful workspace action,
+after which the complete validation sequence runs again. Two EDIT completion
+continuations, two repair attempts, and two completion continuations per repair
+are the v1 defaults.
+
+If one EDIT or REPAIR send raises the exact maximum-tool-round error, the
+controller inspects only tool rounds from that call. A successful approved
+workspace change advances to validation with a deterministic fallback summary.
+Otherwise the send consumes one existing bounded completion continuation and
+the next prompt states the exhaustion reason. Other completion errors remain
+terminal.
+
+After the latest validation sequence succeeds, the controller invokes
+`inspect_git_status` and `inspect_git_diff`. DONE requires a successful
+workspace action, a non-empty tracked/staged Git diff, successful latest Ruff
+format/check/pytest results, and successful final Git inspections. A model
+response cannot select DONE or override these gates. Terminal failures raise a
+phase-specific `CompletionError`, and the isolated workflow cannot plan a
+commit unless the result phase is DONE.
+
+`AutonomousCodingResult` preserves tool rounds, exact `ToolResult` snapshots,
+executed and approved tool names, validation runs, Git inspection evidence, and
+assistant summary. It also exposes final phase, workspace-change evidence,
+repair attempts, and completion continuations for stable CLI rendering.
+
+The v1 controller remains Python-specific. Its final diff gate uses the
+existing Git diff inspection, so a task whose only changes are new untracked
+files cannot reach DONE until a future inspection contract represents those
+contents.
+
+## Broader Orchestration Boundary
+
+Broader multi-session orchestration remains planned. It should coordinate
+sessions and tasks without weakening the implemented deterministic coding
+controller.
 
 It should not:
 

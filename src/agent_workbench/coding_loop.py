@@ -1,47 +1,59 @@
-"""Run one bounded supervised autonomous coding task."""
+"""Run one externally controlled deterministic coding workflow."""
 
+import re
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import StrEnum
+from pathlib import PurePosixPath
 
-from agent_workbench.errors import ConfigurationError
-from agent_workbench.messages import ToolInteractionRound
+from agent_workbench.errors import CompletionError, ConfigurationError
+from agent_workbench.messages import ChatResponse, ToolInteractionRound
 from agent_workbench.session import AgentSession
 from agent_workbench.tasks import TaskSpec
-from agent_workbench.tools import ToolApprovalHandler, ToolApprovalDecision
 from agent_workbench.tool_calling import ToolRoundObserver
+from agent_workbench.tool_registry import ToolRegistry
+from agent_workbench.tools import (
+    JSONObject,
+    ToolApprovalDecision,
+    ToolApprovalHandler,
+    ToolInvocation,
+    ToolResult,
+)
 
 
 DEFAULT_CODING_ACCEPTANCE_CRITERIA = (
     "Implement the requested behavior with bounded workspace changes.",
-    "Run Ruff static analysis and resolve introduced issues.",
+    "Run Ruff formatting and static analysis and resolve introduced issues.",
     "Run pytest and resolve introduced regressions.",
     "Inspect the final Git status and diff before reporting completion.",
 )
 
 DEFAULT_AUTONOMOUS_MAX_TOOL_ROUNDS = 16
-MAX_AUTONOMOUS_COMPLETION_CONTINUATIONS = 1
+DEFAULT_DISCOVER_MAX_TOOL_ROUNDS = 4
+DEFAULT_EDIT_COMPLETION_CONTINUATIONS = 2
+DEFAULT_MAX_REPAIR_ATTEMPTS = 2
+DEFAULT_REPAIR_COMPLETION_CONTINUATIONS = 2
+MAX_DISCOVERY_EVIDENCE_ITEMS = 12
+MAX_DISCOVERY_EVIDENCE_ITEM_CHARACTERS = 800
+MAX_DISCOVERY_EVIDENCE_CHARACTERS = 4_000
+MAX_DISCOVERY_SUMMARY_CHARACTERS = 1_000
+MAX_REPAIR_OUTPUT_CHARACTERS = 4_000
 
-_REQUIRED_CODING_TOOLS = frozenset(
+_READ_ONLY_TOOL_NAMES = frozenset(
     {
         "list_files",
         "read_file",
+        "search_text",
+        "search_symbols",
         "inspect_git_status",
         "inspect_git_diff",
-        "apply_text_replacement",
-        "apply_workspace_changes",
-        "run_ruff_check",
-        "run_pytest",
     }
 )
-
-_VALIDATION_TOOL_NAMES = frozenset(
-    {
-        "run_ruff_format",
-        "run_ruff_check",
-        "run_pytest",
-    }
+_VALIDATION_TOOL_NAMES = (
+    "run_ruff_format",
+    "run_ruff_check",
+    "run_pytest",
 )
-
 _WORKSPACE_CHANGE_TOOL_NAMES = frozenset(
     {
         "apply_file_patch",
@@ -49,11 +61,70 @@ _WORKSPACE_CHANGE_TOOL_NAMES = frozenset(
         "apply_workspace_changes",
     }
 )
+_VERIFY_TOOL_NAMES = (
+    "inspect_git_status",
+    "inspect_git_diff",
+)
+_REQUIRED_CODING_TOOLS = frozenset(
+    {
+        "list_files",
+        "read_file",
+        *_VALIDATION_TOOL_NAMES,
+        *_VERIFY_TOOL_NAMES,
+    }
+)
+_MAXIMUM_ROUNDS_ERROR = "The maximum number of tool execution rounds was exceeded."
+_MAXIMUM_ROUNDS_CHANGE_SUMMARY = (
+    "A successful workspace change was applied before the model-facing "
+    "phase exhausted its tool-round budget."
+)
+_ABSOLUTE_PATH_PATTERN = re.compile(r"(?<![\w.])/(?:[^\s\x00]+)")
+_SENSITIVE_LINE_PATTERN = re.compile(
+    r"(?i)(?:^|[^a-z])(?:api[_-]?key|password|secret|token|\.env)(?:[^a-z]|$)"
+)
+
+
+class CodingPhase(StrEnum):
+    """Represent one controller-owned deterministic workflow phase."""
+
+    DISCOVER = "DISCOVER"
+    EDIT = "EDIT"
+    VALIDATE = "VALIDATE"
+    REPAIR = "REPAIR"
+    VERIFY = "VERIFY"
+    DONE = "DONE"
+
+
+@dataclass(frozen=True, slots=True)
+class CodingWorkflowLimits:
+    """Store typed limits for bounded model-facing workflow phases."""
+
+    discover_tool_rounds: int = DEFAULT_DISCOVER_MAX_TOOL_ROUNDS
+    edit_completion_continuations: int = DEFAULT_EDIT_COMPLETION_CONTINUATIONS
+    repair_attempts: int = DEFAULT_MAX_REPAIR_ATTEMPTS
+    repair_completion_continuations: int = DEFAULT_REPAIR_COMPLETION_CONTINUATIONS
+
+    def __post_init__(self) -> None:
+        """Require positive limits without accepting booleans."""
+
+        for value in (
+            self.discover_tool_rounds,
+            self.edit_completion_continuations,
+            self.repair_attempts,
+            self.repair_completion_continuations,
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ConfigurationError(
+                    "coding workflow limits must be positive integers."
+                )
+
+
+DEFAULT_CODING_WORKFLOW_LIMITS = CodingWorkflowLimits()
 
 
 @dataclass(frozen=True, slots=True)
 class ValidationRun:
-    """Record one validation command observed during an autonomous task."""
+    """Record one controller-invoked validation command."""
 
     tool_name: str
     result_status: str
@@ -62,15 +133,29 @@ class ValidationRun:
 
 
 @dataclass(frozen=True, slots=True)
+class _DiscoveryEvidence:
+    """Store one bounded safe summary of a successful discovery result."""
+
+    tool_name: str
+    paths: tuple[str, ...]
+    metadata: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class AutonomousCodingResult:
-    """Summarize one completed supervised autonomous coding task."""
+    """Summarize one completed deterministic coding workflow."""
 
     task_spec: TaskSpec
     assistant_summary: str
+    final_phase: CodingPhase
+    workspace_change_applied: bool
+    repair_attempt_count: int
+    completion_continuation_count: int
     tool_round_count: int
     executed_tool_names: tuple[str, ...]
     approved_action_names: tuple[str, ...]
     validation_runs: tuple[ValidationRun, ...]
+    tool_results: tuple[ToolResult, ...]
     inspected_git_status: bool
     inspected_git_diff: bool
     last_workspace_change_sequence_index: int | None = None
@@ -78,18 +163,12 @@ class AutonomousCodingResult:
     latest_git_diff_sequence_index: int | None = None
 
     @property
-    def workspace_change_applied(self) -> bool:
-        """Return whether one approved workspace mutation completed successfully."""
-
-        return self.last_workspace_change_sequence_index is not None
-
-    @property
     def validation_succeeded(self) -> bool:
-        """Return whether required validations passed after the latest change."""
+        """Return whether every latest required validation passed."""
 
         return all(
             _validation_succeeded_after_latest_change(self, tool_name)
-            for tool_name in ("run_ruff_check", "run_pytest")
+            for tool_name in _VALIDATION_TOOL_NAMES
         )
 
     @property
@@ -111,6 +190,24 @@ class AutonomousCodingResult:
         )
 
 
+@dataclass(slots=True)
+class _WorkflowState:
+    """Own mutable evidence while the deterministic controller advances."""
+
+    task_spec: TaskSpec
+    limits: CodingWorkflowLimits
+    phase: CodingPhase = CodingPhase.DISCOVER
+    rounds: list[ToolInteractionRound] = field(default_factory=list)
+    approved_action_names: list[str] = field(default_factory=list)
+    approved_action_ids: set[str] = field(default_factory=set)
+    discovery_evidence: list[_DiscoveryEvidence] = field(default_factory=list)
+    discovery_summary: str = ""
+    assistant_summary: str = ""
+    repair_attempt_count: int = 0
+    completion_continuation_count: int = 0
+    controller_invocation_count: int = 0
+
+
 def run_autonomous_coding_task(
     session: AgentSession,
     prompt: str,
@@ -118,8 +215,138 @@ def run_autonomous_coding_task(
     tool_approval_handler: ToolApprovalHandler,
     tool_round_observer: ToolRoundObserver | None = None,
     acceptance_criteria: Iterable[str] = DEFAULT_CODING_ACCEPTANCE_CRITERIA,
+    limits: CodingWorkflowLimits = DEFAULT_CODING_WORKFLOW_LIMITS,
 ) -> AutonomousCodingResult:
-    """Run one prompt through the complete bounded coding tool loop."""
+    """Run one deterministic discover, edit, validate, repair, and verify flow."""
+
+    task_spec, registry, available_tools = _validate_inputs(
+        session=session,
+        prompt=prompt,
+        tool_approval_handler=tool_approval_handler,
+        tool_round_observer=tool_round_observer,
+        acceptance_criteria=acceptance_criteria,
+        limits=limits,
+    )
+    state = _WorkflowState(task_spec=task_spec, limits=limits)
+
+    def observe_tool_round(round_: ToolInteractionRound) -> None:
+        state.rounds.append(round_)
+        if tool_round_observer is not None:
+            tool_round_observer(round_)
+
+    def handle_tool_approval(request):
+        decision = tool_approval_handler(request)
+        if decision is ToolApprovalDecision.APPROVE:
+            state.approved_action_names.append(request.invocation.tool_name)
+            state.approved_action_ids.add(request.invocation.id)
+        return decision
+
+    _run_discover_phase(
+        session,
+        state,
+        available_tools,
+        observe_tool_round,
+        handle_tool_approval,
+    )
+    _run_model_change_phase(
+        session,
+        state,
+        available_tools,
+        observe_tool_round,
+        handle_tool_approval,
+        phase=CodingPhase.EDIT,
+        continuation_limit=limits.edit_completion_continuations,
+    )
+
+    state.phase = CodingPhase.VALIDATE
+    validation_results = _run_validation_phase(
+        registry,
+        state,
+        observe_tool_round,
+        handle_tool_approval,
+    )
+    failed_validations = _failed_validations(validation_results)
+    while failed_validations:
+        if state.repair_attempt_count >= limits.repair_attempts:
+            raise _workflow_failure(
+                state,
+                CodingPhase.REPAIR,
+                "validation still failed after the configured repair limit",
+            )
+
+        state.repair_attempt_count += 1
+        changed = _run_model_change_phase(
+            session,
+            state,
+            available_tools,
+            observe_tool_round,
+            handle_tool_approval,
+            phase=CodingPhase.REPAIR,
+            continuation_limit=limits.repair_completion_continuations,
+            failed_validations=failed_validations,
+        )
+        if not changed and state.repair_attempt_count >= limits.repair_attempts:
+            raise _workflow_failure(
+                state,
+                CodingPhase.REPAIR,
+                "repair completed without a successful new workspace change",
+            )
+        if not changed:
+            continue
+
+        state.phase = CodingPhase.VALIDATE
+        validation_results = _run_validation_phase(
+            registry,
+            state,
+            observe_tool_round,
+            handle_tool_approval,
+        )
+        failed_validations = _failed_validations(validation_results)
+
+    state.phase = CodingPhase.VERIFY
+    verification_results = _run_verify_phase(
+        registry,
+        state,
+        observe_tool_round,
+        handle_tool_approval,
+    )
+    _require_verification_success(state, verification_results)
+
+    result = _build_result(state, final_phase=CodingPhase.DONE)
+    if not result.workspace_change_applied:
+        raise _workflow_failure(
+            state,
+            CodingPhase.VERIFY,
+            "no successful workspace change was observed",
+        )
+    if not result.validation_succeeded:
+        raise _workflow_failure(
+            state,
+            CodingPhase.VALIDATE,
+            "latest required validation evidence is incomplete or unsuccessful",
+        )
+    if (
+        not result.inspected_git_status_after_change
+        or not result.inspected_git_diff_after_change
+    ):
+        raise _workflow_failure(
+            state,
+            CodingPhase.VERIFY,
+            "final Git inspection evidence is incomplete or unsuccessful",
+        )
+    return result
+
+
+def _validate_inputs(
+    *,
+    session: object,
+    prompt: object,
+    tool_approval_handler: object,
+    tool_round_observer: object,
+    acceptance_criteria: object,
+    limits: object,
+) -> tuple[TaskSpec, ToolRegistry, frozenset[str]]:
+    """Validate controller inputs and return immutable available tool names."""
 
     if not isinstance(session, AgentSession):
         raise ConfigurationError("autonomous coding requires an AgentSession.")
@@ -131,6 +358,10 @@ def run_autonomous_coding_task(
         raise ConfigurationError(
             "autonomous coding tool round observer must be callable."
         )
+    if not isinstance(limits, CodingWorkflowLimits):
+        raise ConfigurationError(
+            "autonomous coding requires validated workflow limits."
+        )
 
     registry = session.tool_registry
     if registry is None:
@@ -138,7 +369,7 @@ def run_autonomous_coding_task(
             "autonomous coding requires an action-enabled tool registry."
         )
 
-    available_tools = {definition.name for definition in registry.definitions}
+    available_tools = frozenset(definition.name for definition in registry.definitions)
     missing_tools = sorted(_REQUIRED_CODING_TOOLS - available_tools)
     if missing_tools:
         raise ConfigurationError(
@@ -146,82 +377,300 @@ def run_autonomous_coding_task(
             + ", ".join(missing_tools)
             + "."
         )
-
-    task_spec = TaskSpec(
-        objective=prompt,
-        acceptance_criteria=acceptance_criteria,
-    )
-    observed_rounds: list[ToolInteractionRound] = []
-    approved_action_names: list[str] = []
-    approved_action_ids: set[str] = set()
-
-    def observe_tool_round(round_: ToolInteractionRound) -> None:
-        observed_rounds.append(round_)
-        if tool_round_observer is not None:
-            tool_round_observer(round_)
-
-    def handle_tool_approval(request):
-        decision = tool_approval_handler(request)
-
-        if decision is ToolApprovalDecision.APPROVE:
-            approved_action_names.append(request.invocation.tool_name)
-            approved_action_ids.add(request.invocation.id)
-
-        return decision
-
-    response = session.send(
-        _build_coding_prompt(task_spec),
-        tool_round_observer=observe_tool_round,
-        tool_approval_handler=handle_tool_approval,
-        recover_approval_preview_errors=True,
-    )
-
-    for _ in range(MAX_AUTONOMOUS_COMPLETION_CONTINUATIONS):
-        result = _build_autonomous_coding_result(
-            task_spec=task_spec,
-            assistant_summary=response.text,
-            observed_rounds=observed_rounds,
-            approved_action_names=approved_action_names,
-            approved_action_ids=approved_action_ids,
+    if not available_tools.intersection(_WORKSPACE_CHANGE_TOOL_NAMES):
+        raise ConfigurationError(
+            "autonomous coding session is missing a workspace action tool."
         )
-        missing_gates = _missing_completion_gates(result)
-        if not missing_gates:
-            return result
 
+    try:
+        task_spec = TaskSpec(
+            objective=prompt,
+            acceptance_criteria=acceptance_criteria,
+        )
+    except ConfigurationError:
+        raise ConfigurationError(
+            "autonomous coding task specification is invalid."
+        ) from None
+
+    return task_spec, registry, available_tools
+
+
+def _run_discover_phase(
+    session: AgentSession,
+    state: _WorkflowState,
+    available_tools: frozenset[str],
+    observer: ToolRoundObserver,
+    approval_handler: ToolApprovalHandler,
+) -> None:
+    """Run bounded read-only discovery and always advance to EDIT."""
+
+    state.phase = CodingPhase.DISCOVER
+    phase_start = len(state.rounds)
+    response: ChatResponse | None = None
+    try:
         response = session.send(
-            _build_completion_continuation_prompt(missing_gates),
-            tool_round_observer=observe_tool_round,
-            tool_approval_handler=handle_tool_approval,
+            _build_phase_prompt(
+                state,
+                outstanding=(
+                    "Inspect only the repository information needed for the objective.",
+                    "Do not edit files or run validation.",
+                    "Return a concise discovery completion when inspection is sufficient.",
+                ),
+            ),
+            allowed_tool_names=available_tools.intersection(_READ_ONLY_TOOL_NAMES),
+            max_tool_rounds=state.limits.discover_tool_rounds,
+            tool_round_observer=observer,
+            tool_approval_handler=approval_handler,
             recover_approval_preview_errors=True,
         )
+    except CompletionError as exc:
+        if str(exc) != _MAXIMUM_ROUNDS_ERROR:
+            raise _workflow_failure(
+                state,
+                CodingPhase.DISCOVER,
+                f"discovery completion failed: {exc}",
+            ) from None
+    finally:
+        _capture_discovery_evidence(state, state.rounds[phase_start:])
 
-    return _build_autonomous_coding_result(
-        task_spec=task_spec,
-        assistant_summary=response.text,
-        observed_rounds=observed_rounds,
-        approved_action_names=approved_action_names,
-        approved_action_ids=approved_action_ids,
+    if response is not None:
+        state.discovery_summary = _bounded_prompt_summary(response.text)
+
+
+def _run_model_change_phase(
+    session: AgentSession,
+    state: _WorkflowState,
+    available_tools: frozenset[str],
+    observer: ToolRoundObserver,
+    approval_handler: ToolApprovalHandler,
+    *,
+    phase: CodingPhase,
+    continuation_limit: int,
+    failed_validations: tuple[tuple[str, ToolResult], ...] = (),
+) -> bool:
+    """Require a successful workspace action during EDIT or one REPAIR attempt."""
+
+    state.phase = phase
+    local_continuations = 0
+    outstanding = (
+        "Apply at least one successful controlled workspace change.",
+        "Use repository evidence already gathered instead of restarting discovery.",
+        "Do not run validation or Git verification; the controller owns those phases.",
+    )
+
+    while True:
+        call_start = len(state.rounds)
+        prompt = (
+            _build_repair_prompt(state, failed_validations, outstanding)
+            if phase is CodingPhase.REPAIR
+            else _build_phase_prompt(state, outstanding=outstanding)
+        )
+        try:
+            response = session.send(
+                prompt,
+                allowed_tool_names=available_tools.intersection(
+                    _READ_ONLY_TOOL_NAMES | _WORKSPACE_CHANGE_TOOL_NAMES
+                ),
+                tool_round_observer=observer,
+                tool_approval_handler=approval_handler,
+                recover_approval_preview_errors=True,
+            )
+        except CompletionError as exc:
+            if str(exc) != _MAXIMUM_ROUNDS_ERROR:
+                raise _workflow_failure(
+                    state,
+                    phase,
+                    f"model-facing phase failed: {exc}",
+                ) from None
+            current_call_rounds = state.rounds[call_start:]
+            if _rounds_contain_successful_change(
+                current_call_rounds,
+                state.approved_action_ids,
+            ):
+                state.assistant_summary = _MAXIMUM_ROUNDS_CHANGE_SUMMARY
+                return True
+            incomplete_reason = (
+                "the model-facing call exhausted its tool-round budget without "
+                "completing the required workspace change"
+            )
+        else:
+            state.assistant_summary = response.text
+            current_call_rounds = state.rounds[call_start:]
+            if _rounds_contain_successful_change(
+                current_call_rounds,
+                state.approved_action_ids,
+            ):
+                return True
+            incomplete_reason = "no successful new workspace change was observed"
+
+        if local_continuations >= continuation_limit:
+            if phase is CodingPhase.EDIT:
+                raise _workflow_failure(
+                    state,
+                    phase,
+                    f"completion continuation limit reached after {incomplete_reason}",
+                )
+            return False
+
+        local_continuations += 1
+        state.completion_continuation_count += 1
+        outstanding = (
+            f"{phase.value} is incomplete because {incomplete_reason}.",
+            "Apply a controlled workspace change now.",
+            "Assistant prose is not evidence of a workspace change.",
+        )
+
+
+def _run_validation_phase(
+    registry: ToolRegistry,
+    state: _WorkflowState,
+    observer: ToolRoundObserver,
+    approval_handler: ToolApprovalHandler,
+) -> tuple[tuple[str, ToolResult], ...]:
+    """Invoke the complete fixed Python validation sequence."""
+
+    results = []
+    for tool_name in _VALIDATION_TOOL_NAMES:
+        try:
+            result = _execute_controller_invocation(
+                registry,
+                state,
+                tool_name,
+                {"path": "."},
+                observer,
+                approval_handler,
+            )
+        except CompletionError as exc:
+            raise _workflow_failure(
+                state,
+                CodingPhase.VALIDATE,
+                f"{tool_name} could not execute: {exc}",
+            ) from None
+        results.append((tool_name, result))
+    return tuple(results)
+
+
+def _run_verify_phase(
+    registry: ToolRegistry,
+    state: _WorkflowState,
+    observer: ToolRoundObserver,
+    approval_handler: ToolApprovalHandler,
+) -> tuple[tuple[str, ToolResult], ...]:
+    """Invoke final Git status and diff inspection in fixed order."""
+
+    results = []
+    for tool_name in _VERIFY_TOOL_NAMES:
+        try:
+            result = _execute_controller_invocation(
+                registry,
+                state,
+                tool_name,
+                {},
+                observer,
+                approval_handler,
+            )
+        except CompletionError as exc:
+            raise _workflow_failure(
+                state,
+                CodingPhase.VERIFY,
+                f"{tool_name} could not execute: {exc}",
+            ) from None
+        results.append((tool_name, result))
+    return tuple(results)
+
+
+def _execute_controller_invocation(
+    registry: ToolRegistry,
+    state: _WorkflowState,
+    tool_name: str,
+    arguments: JSONObject,
+    observer: ToolRoundObserver,
+    approval_handler: ToolApprovalHandler,
+) -> ToolResult:
+    """Use the registered preview, approval, and execution path directly."""
+
+    state.controller_invocation_count += 1
+    invocation = ToolInvocation(
+        id=f"controller-{state.controller_invocation_count}-{tool_name}",
+        tool_name=tool_name,
+        arguments=arguments,
+    )
+    if registry.requires_approval(invocation):
+        approval_request = registry.create_approval_request(invocation)
+        try:
+            decision = approval_handler(approval_request)
+        except Exception:
+            raise CompletionError("Tool approval handler failed.") from None
+        if decision is ToolApprovalDecision.DENY:
+            raise CompletionError("Tool action approval was denied.")
+        if decision is not ToolApprovalDecision.APPROVE:
+            raise CompletionError("Tool approval decision is invalid.")
+
+    result = registry.execute(invocation)
+    round_ = ToolInteractionRound(
+        response=ChatResponse(tool_invocations=(invocation,)),
+        results=(result,),
+    )
+    observer(round_)
+    return result
+
+
+def _failed_validations(
+    results: Iterable[tuple[str, ToolResult]],
+) -> tuple[tuple[str, ToolResult], ...]:
+    """Return required validations whose actual latest result did not pass."""
+
+    return tuple(
+        (tool_name, result)
+        for tool_name, result in results
+        if result.status != "success" or _validation_exit_code(result.output) != 0
     )
 
 
-def _build_autonomous_coding_result(
-    *,
-    task_spec: TaskSpec,
-    assistant_summary: str,
-    observed_rounds: Iterable[ToolInteractionRound],
-    approved_action_names: Iterable[str],
-    approved_action_ids: Iterable[str],
-) -> AutonomousCodingResult:
-    """Build one aggregate result from every observed coding tool round."""
+def _require_verification_success(
+    state: _WorkflowState,
+    results: tuple[tuple[str, ToolResult], ...],
+) -> None:
+    """Require successful Git inspection and a non-empty final diff."""
 
-    rounds = tuple(observed_rounds)
-    approved_ids = frozenset(approved_action_ids)
-    executed_tool_names: list[str] = []
-    validation_runs: list[ValidationRun] = []
-    sequence_index = 0
-    last_workspace_change_sequence_index: int | None = None
-    latest_git_status_sequence_index: int | None = None
-    latest_git_diff_sequence_index: int | None = None
+    result_by_name = dict(results)
+    for tool_name in _VERIFY_TOOL_NAMES:
+        result = result_by_name[tool_name]
+        if result.status != "success":
+            raise _workflow_failure(
+                state,
+                CodingPhase.VERIFY,
+                f"{tool_name} returned an error",
+            )
+
+    diff_output = result_by_name["inspect_git_diff"].output
+    if not isinstance(diff_output, dict):
+        raise _workflow_failure(
+            state,
+            CodingPhase.VERIFY,
+            "inspect_git_diff returned invalid evidence",
+        )
+    unstaged = diff_output.get("unstaged")
+    staged = diff_output.get("staged")
+    if not isinstance(unstaged, str) or not isinstance(staged, str):
+        raise _workflow_failure(
+            state,
+            CodingPhase.VERIFY,
+            "inspect_git_diff returned invalid evidence",
+        )
+    if not unstaged.strip() and not staged.strip():
+        raise _workflow_failure(
+            state,
+            CodingPhase.VERIFY,
+            "final Git diff is empty",
+        )
+
+
+def _rounds_contain_successful_change(
+    rounds: Iterable[ToolInteractionRound],
+    approved_action_ids: set[str],
+) -> bool:
+    """Return whether rounds prove one approved effective workspace mutation."""
 
     for round_ in rounds:
         for invocation, result in zip(
@@ -229,14 +678,49 @@ def _build_autonomous_coding_result(
             round_.results,
             strict=True,
         ):
+            if (
+                invocation.tool_name in _WORKSPACE_CHANGE_TOOL_NAMES
+                and invocation.id in approved_action_ids
+                and result.status == "success"
+                and _workspace_change_result_applied(
+                    invocation.tool_name,
+                    invocation.arguments,
+                    result.output,
+                )
+            ):
+                return True
+    return False
+
+
+def _build_result(
+    state: _WorkflowState,
+    *,
+    final_phase: CodingPhase,
+) -> AutonomousCodingResult:
+    """Aggregate immutable evidence from every model and controller tool round."""
+
+    executed_tool_names: list[str] = []
+    validation_runs: list[ValidationRun] = []
+    tool_results: list[ToolResult] = []
+    sequence_index = 0
+    last_workspace_change_sequence_index: int | None = None
+    latest_git_status_sequence_index: int | None = None
+    latest_git_diff_sequence_index: int | None = None
+
+    for round_ in state.rounds:
+        for invocation, result in zip(
+            round_.response.tool_invocations,
+            round_.results,
+            strict=True,
+        ):
             sequence_index += 1
             executed_tool_names.append(invocation.tool_name)
-            result_status = str(result.status)
+            tool_results.append(result)
 
             if (
                 invocation.tool_name in _WORKSPACE_CHANGE_TOOL_NAMES
-                and invocation.id in approved_ids
-                and result_status == "success"
+                and invocation.id in state.approved_action_ids
+                and result.status == "success"
                 and _workspace_change_result_applied(
                     invocation.tool_name,
                     invocation.arguments,
@@ -249,7 +733,7 @@ def _build_autonomous_coding_result(
                 validation_runs.append(
                     ValidationRun(
                         tool_name=invocation.tool_name,
-                        result_status=result_status,
+                        result_status=str(result.status),
                         exit_code=_validation_exit_code(result.output),
                         sequence_index=sequence_index,
                     )
@@ -257,59 +741,350 @@ def _build_autonomous_coding_result(
 
             if (
                 invocation.tool_name == "inspect_git_status"
-                and result_status == "success"
+                and result.status == "success"
             ):
                 latest_git_status_sequence_index = sequence_index
             if (
                 invocation.tool_name == "inspect_git_diff"
-                and result_status == "success"
+                and result.status == "success"
             ):
                 latest_git_diff_sequence_index = sequence_index
 
+    workspace_change_applied = last_workspace_change_sequence_index is not None
     return AutonomousCodingResult(
-        task_spec=task_spec,
-        assistant_summary=assistant_summary,
-        tool_round_count=len(rounds),
+        task_spec=state.task_spec,
+        assistant_summary=state.assistant_summary,
+        final_phase=final_phase,
+        workspace_change_applied=workspace_change_applied,
+        repair_attempt_count=state.repair_attempt_count,
+        completion_continuation_count=state.completion_continuation_count,
+        tool_round_count=len(state.rounds),
         executed_tool_names=tuple(executed_tool_names),
-        approved_action_names=tuple(approved_action_names),
+        approved_action_names=tuple(state.approved_action_names),
         validation_runs=tuple(validation_runs),
+        tool_results=tuple(tool_results),
         inspected_git_status="inspect_git_status" in executed_tool_names,
         inspected_git_diff="inspect_git_diff" in executed_tool_names,
-        last_workspace_change_sequence_index=(last_workspace_change_sequence_index),
+        last_workspace_change_sequence_index=last_workspace_change_sequence_index,
         latest_git_status_sequence_index=latest_git_status_sequence_index,
         latest_git_diff_sequence_index=latest_git_diff_sequence_index,
     )
 
 
-def _missing_completion_gates(
-    result: AutonomousCodingResult,
-) -> tuple[str, ...]:
-    """Return incomplete mandatory gates in deterministic order."""
+def _build_phase_prompt(
+    state: _WorkflowState,
+    *,
+    outstanding: Iterable[str],
+) -> str:
+    """Build an explicit bounded model-facing phase prompt."""
 
-    missing: list[str] = []
+    completed = _completed_evidence_lines(state)
+    acceptance_criteria = _numbered_lines(
+        _sanitize_prompt_text(criterion)
+        for criterion in state.task_spec.acceptance_criteria
+    )
+    return (
+        "Continue one externally controlled deterministic coding workflow.\n\n"
+        f"Original objective:\n{_sanitize_prompt_text(state.task_spec.objective)}\n\n"
+        "Acceptance criteria:\n"
+        f"{acceptance_criteria}\n\n"
+        f"Current phase: {state.phase.value}\n\n"
+        "Completed phase evidence:\n"
+        f"{_numbered_lines(completed)}\n\n"
+        "Outstanding requirements:\n"
+        f"{_numbered_lines(outstanding)}\n\n"
+        "Current attempt counters:\n"
+        f"- Repair attempts: {state.repair_attempt_count}/"
+        f"{state.limits.repair_attempts}\n"
+        f"- Completion continuations: {state.completion_continuation_count}\n"
+        "Only the controller can advance phases or declare DONE."
+    )
 
-    if not result.workspace_change_applied:
-        missing.append("successful approved workspace change")
 
-    for tool_name, gate_name in (
-        (
-            "run_ruff_check",
-            "successful run_ruff_check after the latest workspace change",
-        ),
-        (
-            "run_pytest",
-            "successful run_pytest after the latest workspace change",
-        ),
+def _build_repair_prompt(
+    state: _WorkflowState,
+    failed_validations: tuple[tuple[str, ToolResult], ...],
+    outstanding: Iterable[str],
+) -> str:
+    """Build one bounded repair prompt with fresh explicit failure evidence."""
+
+    failure_lines = []
+    for tool_name, result in failed_validations:
+        exit_code = _validation_exit_code(result.output)
+        failure_lines.append(
+            f"{tool_name}: status={result.status}, "
+            f"exit_code={exit_code if exit_code is not None else 'unavailable'}"
+        )
+        output = result.output
+        if isinstance(output, dict):
+            for stream_name in ("stdout", "stderr"):
+                stream = output.get(stream_name)
+                if isinstance(stream, str) and stream:
+                    failure_lines.append(
+                        f"{tool_name} {stream_name}: {_sanitize_repair_output(stream)}"
+                    )
+
+    changed_paths = _safe_changed_paths(state.rounds)
+    path_evidence = ", ".join(changed_paths) if changed_paths else "unavailable"
+    base = _build_phase_prompt(state, outstanding=outstanding)
+    return (
+        f"{base}\n\n"
+        f"Repair attempt: {state.repair_attempt_count}/"
+        f"{state.limits.repair_attempts}\n"
+        "Failed validation evidence:\n"
+        f"{_numbered_lines(failure_lines)}\n"
+        f"Current changed-file paths: {path_evidence}\n"
+        "This repair attempt requires another successful controlled workspace "
+        "change before validation can run again."
+    )
+
+
+def _completed_evidence_lines(state: _WorkflowState) -> tuple[str, ...]:
+    """Return bounded accumulated phase evidence without tool output bodies."""
+
+    result = _build_result(state, final_phase=state.phase)
+    lines = [
+        f"Observed tool rounds: {result.tool_round_count}",
+        "Workspace change applied: "
+        f"{'yes' if result.workspace_change_applied else 'no'}",
+    ]
+    if result.executed_tool_names:
+        lines.append("Executed tools: " + ", ".join(result.executed_tool_names[-16:]))
+    lines.extend(
+        f"Discovery evidence: {_format_discovery_evidence(evidence)}"
+        for evidence in state.discovery_evidence
+    )
+    if state.discovery_summary:
+        lines.append(f"Discovery summary: {state.discovery_summary}")
+    if result.validation_runs:
+        latest = result.validation_runs[-len(_VALIDATION_TOOL_NAMES) :]
+        lines.append(
+            "Latest validations: "
+            + ", ".join(
+                f"{run.tool_name}={run.result_status}/"
+                f"{run.exit_code if run.exit_code is not None else 'unavailable'}"
+                for run in latest
+            )
+        )
+    return tuple(lines)
+
+
+def _capture_discovery_evidence(
+    state: _WorkflowState,
+    rounds: Iterable[ToolInteractionRound],
+) -> None:
+    """Retain bounded path and metadata evidence even for rolled-back turns."""
+
+    combined_characters = sum(
+        len(_format_discovery_evidence(evidence))
+        for evidence in state.discovery_evidence
+    )
+    for round_ in rounds:
+        for invocation, result in zip(
+            round_.response.tool_invocations,
+            round_.results,
+            strict=True,
+        ):
+            if (
+                len(state.discovery_evidence) >= MAX_DISCOVERY_EVIDENCE_ITEMS
+                or result.status != "success"
+                or not isinstance(result.output, dict)
+            ):
+                continue
+            evidence = _bounded_discovery_evidence(
+                invocation.tool_name,
+                result.output,
+            )
+            formatted = _format_discovery_evidence(evidence)
+            if (
+                not evidence.paths
+                and not evidence.metadata
+                or combined_characters + len(formatted)
+                > MAX_DISCOVERY_EVIDENCE_CHARACTERS
+            ):
+                continue
+            state.discovery_evidence.append(evidence)
+            combined_characters += len(formatted)
+
+
+def _bounded_discovery_evidence(
+    tool_name: str,
+    output: JSONObject,
+) -> _DiscoveryEvidence:
+    """Extract only safe paths and scalar metadata within one item limit."""
+
+    paths = _discovery_output_paths(output)
+    metadata = _discovery_output_metadata(output)
+    bounded_paths: list[str] = []
+    bounded_metadata: list[str] = []
+
+    for path in paths:
+        candidate = _DiscoveryEvidence(
+            tool_name=tool_name,
+            paths=tuple([*bounded_paths, path]),
+            metadata=tuple(bounded_metadata),
+        )
+        if len(_format_discovery_evidence(candidate)) > (
+            MAX_DISCOVERY_EVIDENCE_ITEM_CHARACTERS
+        ):
+            break
+        bounded_paths.append(path)
+
+    for item in metadata:
+        candidate = _DiscoveryEvidence(
+            tool_name=tool_name,
+            paths=tuple(bounded_paths),
+            metadata=tuple([*bounded_metadata, item]),
+        )
+        if len(_format_discovery_evidence(candidate)) > (
+            MAX_DISCOVERY_EVIDENCE_ITEM_CHARACTERS
+        ):
+            break
+        bounded_metadata.append(item)
+
+    return _DiscoveryEvidence(
+        tool_name=tool_name,
+        paths=tuple(bounded_paths),
+        metadata=tuple(bounded_metadata),
+    )
+
+
+def _discovery_output_paths(output: JSONObject) -> tuple[str, ...]:
+    """Return deterministic safe workspace paths without result body text."""
+
+    candidates: list[str] = []
+    direct_path = output.get("path")
+    if isinstance(direct_path, str):
+        candidates.append(direct_path)
+    for collection_name in ("entries", "matches"):
+        collection = output.get(collection_name)
+        if not isinstance(collection, list):
+            continue
+        for item in collection:
+            if isinstance(item, dict):
+                candidate = item.get("path")
+                if isinstance(candidate, str):
+                    candidates.append(candidate)
+
+    return tuple(
+        dict.fromkeys(
+            path
+            for path in candidates
+            if _is_safe_prompt_path(path) and _sanitize_prompt_text(path) == path
+        )
+    )
+
+
+def _discovery_output_metadata(output: JSONObject) -> tuple[str, ...]:
+    """Return allowlisted scalar metadata and bounded collection counts."""
+
+    values: list[str] = []
+    for key in (
+        "size_bytes",
+        "line_start",
+        "line_end",
+        "total_lines",
+        "files_inspected",
+        "files_skipped",
+        "truncated",
     ):
-        if not _validation_succeeded_after_latest_change(result, tool_name):
-            missing.append(gate_name)
+        value = output.get(key)
+        if isinstance(value, bool) or isinstance(value, int):
+            values.append(f"{key}={value}")
+    for key in ("entries", "matches"):
+        value = output.get(key)
+        if isinstance(value, list):
+            values.append(f"{key}={len(value)}")
+    return tuple(values)
 
-    if not result.inspected_git_status_after_change:
-        missing.append("inspect_git_status after the latest workspace change")
-    if not result.inspected_git_diff_after_change:
-        missing.append("inspect_git_diff after the latest workspace change")
 
-    return tuple(missing)
+def _format_discovery_evidence(evidence: _DiscoveryEvidence) -> str:
+    """Format one already bounded discovery evidence item."""
+
+    paths = ", ".join(evidence.paths) if evidence.paths else "none"
+    value = f"{evidence.tool_name} | paths: {paths}"
+    if evidence.metadata:
+        value += " | metadata: " + ", ".join(evidence.metadata)
+    return value
+
+
+def _numbered_lines(lines: Iterable[str]) -> str:
+    """Format bounded evidence or requirements in deterministic order."""
+
+    values = tuple(lines)
+    if not values:
+        return "1. None yet."
+    return "\n".join(f"{index}. {value}" for index, value in enumerate(values, start=1))
+
+
+def _safe_changed_paths(
+    rounds: Iterable[ToolInteractionRound],
+) -> tuple[str, ...]:
+    """Extract only safe relative paths from successful workspace results."""
+
+    paths: set[str] = set()
+    for round_ in rounds:
+        for invocation, result in zip(
+            round_.response.tool_invocations,
+            round_.results,
+            strict=True,
+        ):
+            if (
+                invocation.tool_name not in _WORKSPACE_CHANGE_TOOL_NAMES
+                or result.status != "success"
+                or not isinstance(result.output, dict)
+            ):
+                continue
+            candidate = result.output.get("path")
+            if isinstance(candidate, str) and _is_safe_prompt_path(candidate):
+                paths.add(candidate)
+            changes = result.output.get("changes")
+            if isinstance(changes, list):
+                for change in changes:
+                    if not isinstance(change, dict):
+                        continue
+                    candidate = change.get("path")
+                    if isinstance(candidate, str) and _is_safe_prompt_path(candidate):
+                        paths.add(candidate)
+    return tuple(sorted(paths))
+
+
+def _is_safe_prompt_path(path: str) -> bool:
+    """Return whether one workspace-relative path is safe for a model prompt."""
+
+    if not path or path.startswith("/") or "\\" in path or "\x00" in path:
+        return False
+    pure_path = PurePosixPath(path)
+    return (
+        ".." not in pure_path.parts
+        and ".env" not in pure_path.parts
+        and not pure_path.is_absolute()
+    )
+
+
+def _sanitize_repair_output(output: str) -> str:
+    """Bound and redact validation output before placing it in a repair prompt."""
+
+    return _sanitize_prompt_text(output)[:MAX_REPAIR_OUTPUT_CHARACTERS]
+
+
+def _bounded_prompt_summary(text: str) -> str:
+    """Return one sanitized single-line bounded model summary."""
+
+    sanitized = _sanitize_prompt_text(text)
+    return " ".join(sanitized.split())[:MAX_DISCOVERY_SUMMARY_CHARACTERS]
+
+
+def _sanitize_prompt_text(text: str) -> str:
+    """Redact sensitive lines and absolute paths from model-facing text."""
+
+    safe_lines = []
+    for line in text.splitlines():
+        if _SENSITIVE_LINE_PATTERN.search(line):
+            safe_lines.append("[redacted sensitive content]")
+        else:
+            safe_lines.append(_ABSOLUTE_PATH_PATTERN.sub("[absolute-path]", line))
+    return "\n".join(safe_lines)
 
 
 def _workspace_change_result_applied(
@@ -329,7 +1104,6 @@ def _workspace_change_result_applied(
             for change in changes
         ):
             return True
-
         changed_lines = output.get("total_changed_lines")
     else:
         if (
@@ -337,7 +1111,6 @@ def _workspace_change_result_applied(
             and arguments.get("create_if_missing") is True
         ):
             return True
-
         changed_lines = output.get("changed_lines")
 
     return (
@@ -386,70 +1159,26 @@ def _evidence_follows_latest_change(
     )
 
 
-def _build_completion_continuation_prompt(
-    missing_gates: Iterable[str],
-) -> str:
-    """Build one deterministic bounded completion-continuation prompt."""
-
-    gates = tuple(missing_gates)
-    formatted_gates = "\n".join(
-        f"{index}. {gate}" for index, gate in enumerate(gates, start=1)
-    )
-    return (
-        "Continue the same supervised autonomous coding task.\n"
-        "The previous response ended before mandatory completion evidence "
-        "was gathered.\n"
-        f"Missing completion gates:\n{formatted_gates}\n"
-        "Use the available tools now. Validation and Git inspection evidence "
-        "must follow the latest completed approved workspace write. Do not "
-        "repeat already completed work unnecessarily. Do not provide a final "
-        "response until the missing gates have been attempted."
-    )
-
-
-def _build_coding_prompt(task_spec: TaskSpec) -> str:
-    """Create one deterministic task and execution-protocol prompt."""
-
-    criteria = "\n".join(
-        f"{index}. {criterion}"
-        for index, criterion in enumerate(
-            task_spec.acceptance_criteria,
-            start=1,
-        )
-    )
-
-    return (
-        "Complete one supervised autonomous coding task.\n\n"
-        f"Objective:\n{task_spec.objective}\n\n"
-        f"Acceptance criteria:\n{criteria}\n\n"
-        "Execution protocol:\n"
-        "1. Inspect the workspace and relevant files before editing.\n"
-        "2. Use the available read-only tools to understand existing behavior.\n"
-        "3. Complete at least one approved workspace change required by the "
-        "objective. Prefer apply_text_replacement for small exact edits to "
-        "existing files, using the sha256 value from the most recent read_file "
-        "result; use complete-content actions only when necessary. Inspection "
-        "and validation without a successful approved change do not complete "
-        "a coding task.\n"
-        "4. Request each approval-required action separately.\n"
-        "5. Run run_ruff_check and run_pytest after making changes.\n"
-        "6. If validation fails, inspect the output, correct the implementation, "
-        "and rerun validation within the available tool-round limit.\n"
-        "7. Call inspect_git_status with {} and inspect_git_diff with {} "
-        "before the final response.\n"
-        "8. Summarize the changes, validation results, and unresolved issues.\n"
-        "Do not claim success unless the observed validation results support it."
-    )
-
-
 def _validation_exit_code(output: object) -> int | None:
     """Extract one safe non-boolean validation exit code."""
 
     if not isinstance(output, dict):
         return None
-
     exit_code = output.get("exit_code")
     if isinstance(exit_code, bool) or not isinstance(exit_code, int):
         return None
-
     return exit_code
+
+
+def _workflow_failure(
+    state: _WorkflowState,
+    phase: CodingPhase,
+    reason: str,
+) -> CompletionError:
+    """Return one phase-specific terminal error with current attempt counts."""
+
+    return CompletionError(
+        f"Deterministic coding failed in phase {phase.value}: {reason}. "
+        f"repair_attempts={state.repair_attempt_count}, "
+        f"completion_continuations={state.completion_continuation_count}."
+    )

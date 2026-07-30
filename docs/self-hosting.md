@@ -1,11 +1,13 @@
 # Self-Hosting Agent Workbench Development
 
 This playbook uses the local `gpt-oss:20b` model for one bounded autonomous
-coding task inside a separately approved Git worktree. The model may inspect,
-edit, format, lint, test, and review the isolated workspace. Worktree creation,
-controlled actions, and the final local commit remain explicitly approved. The
-workflow preserves the worktree and local branch after success. Pushes and Pull
-Requests remain manual.
+coding task inside a separately approved Git worktree. The model may inspect
+and request controlled edits. The application controller, rather than the
+model, runs Ruff format, Ruff check, pytest, Git status, and Git diff in fixed
+phases. Worktree creation, controlled actions, executable validation, and the
+final local commit remain explicitly approved. The workflow preserves the
+worktree and local branch after success. Pushes and Pull Requests remain
+manual.
 
 The primary repository must be completely clean before launch. Do not use this
 workflow as a substitute for external review of security-sensitive or
@@ -19,21 +21,33 @@ repository-lifecycle changes.
 3. Choose one bounded atomic task, one exact commit message, one absent sibling
    worktree path, and one new local isolated branch.
 4. Launch the complete isolated autonomous workflow.
-5. Require repository and named-file inspection before editing.
+5. Let the bounded read-only DISCOVER phase inspect repository and named files.
 6. Prefer `apply_text_replacement` for each small exact edit to an existing
    file, using the SHA-256 returned by `read_file`. Use one
    `apply_workspace_changes` transaction when several file changes must succeed
    together or when creation or complete-content replacement is required.
 7. Review every complete action preview and diff.
-8. Approve Ruff format, Ruff check, and pytest separately.
-9. Require successful Ruff and pytest evidence plus Git status and complete diff
-   inspection.
+8. Approve the controller-invoked Ruff format, Ruff check, and pytest sequence
+   separately. The target is always `"."` in v1.
+9. Require controller-owned DONE evidence: successful latest Ruff format, Ruff
+   check, and pytest results, successful Git status and complete diff
+   inspection, and a non-empty final tracked/staged diff.
 10. Review the immutable commit preview, exact CLI-supplied message, exact path
     set, and every complete diff.
 11. Approve the isolated local commit once.
 12. Require the workflow to verify the new commit and a clean isolated worktree.
 13. Preserve the worktree, local branch, and commit for external review.
 14. Push and create a Pull Request manually only after external review.
+
+Every DISCOVER, EDIT, and REPAIR prompt, including continuations, receives the
+original ordered acceptance criteria. The controller carries bounded sanitized
+discovery paths, metadata, and a normal discovery summary into later phases;
+that evidence remains available when a maximum-round DISCOVER turn is not
+committed to session history. If one EDIT or REPAIR send exhausts its
+tool-round budget, a successful approved change can still advance to
+validation. Without a change, the controller consumes one of the existing two
+bounded completion continuations and states the exhaustion reason. Unrelated
+completion errors remain terminal.
 
 ## Recommended launch command
 
@@ -79,38 +93,34 @@ conventions, tests, and Git state. Do not read .env, secrets, .git contents,
 or outside paths. Do not use the network, install dependencies, modify
 unrelated files, or request arbitrary commands.
 
-Use test-driven development:
-1. Add or update focused tests first.
-2. Run <FOCUSED_TESTS> and explicitly confirm RED.
+Use the existing test conventions:
+1. Inspect the implementation and its tests during DISCOVER.
+2. Add or update focused tests together with the smallest implementation
+   change when the objective requires them.
 3. Prefer apply_text_replacement for small exact edits to existing files,
    using the SHA-256 returned by read_file. Use one apply_workspace_changes
    transaction when several changes must succeed together or complete-content
    replacement is necessary.
 4. Wait for operator approval before every write action.
 5. Implement only the smallest correct change.
-6. Run <FOCUSED_TESTS> and explicitly confirm GREEN.
+6. Do not restart broad discovery during EDIT or REPAIR.
 
 Request at most one effectful tool per response. Wait for approval before
-every effectful action. After focused GREEN, request these validations
-separately and in order:
-1. run_ruff_format for "."
-2. run_ruff_check for "."
-3. run_pytest for the focused target
-4. run_pytest for "."
+every effectful action. Do not request validation or Git verification tools:
+the controller withholds them during model-facing phases and invokes them
+itself in the fixed order Ruff format, Ruff check, pytest, Git status, Git
+diff. If validation fails, use the bounded REPAIR evidence to make another
+controlled change. Do not weaken tests or validation. Do not independently
+request Git commit, push, merge, branch deletion, reset, restore, clean, or
+stash. Do not use multiple effectful actions in one response.
 
-Then inspect Git status and the complete Git diff. Do not weaken tests or
-validation. Do not independently request Git commit, push, merge, branch
-deletion, reset, restore, clean, or stash. Do not use multiple effectful
-actions in one response.
-
-Stop and report:
-- focused RED result;
-- focused GREEN result;
-- complete test count;
-- Ruff results;
+The final assistant summary may report:
+- exact changes;
+- controller-supplied validation results;
 - exact changed files;
-- complete diff review findings;
 - remaining risks.
+
+Only controller evidence, not this summary, determines success.
 ```
 
 The operator supplies `<COMMIT_MESSAGE>` through `--commit-message` before the
@@ -136,7 +146,7 @@ private paths, or `.env` values in the task prompt or commit message.
 ### Validation approval
 
 - The action is the expected fixed Ruff or pytest tool.
-- The target is exactly `"."` or the explicitly approved focused target.
+- The target is exactly `"."`.
 - No caller flags, arbitrary command, environment, or unexpected path appears.
 - Only one effectful action is present in the response.
 
@@ -193,6 +203,25 @@ paths, or unrelated repository content.
 Never use reset, restore, clean, stash, or forced removal without deliberate
 manual analysis of the exact preserved state.
 
+## Automated evidence and real-model benchmarks
+
+The implemented regression battery uses scripted providers and real temporary
+Git repositories. It deterministically proves phase progression, edit
+continuations (including maximum-tool-round recovery), bounded cross-phase
+discovery evidence, ordered acceptance criteria, validation-driven repair, the
+repair limit, false completion rejection, and the final diff gate. Automated
+tests do not call Ollama or any paid/cloud provider.
+
+Those tests validate controller behavior, not local-model capability. Manual
+benchmarks of this deterministic workflow with `gpt-oss:20b` or another real
+local model remain future evaluation work. Record model name, task fixture,
+approval decisions, phase counters, validation results, and final diff when
+such a benchmark is run.
+
+V1 uses the existing tracked/staged Git diff inspection. A task that creates
+only new untracked files cannot reach DONE; include a tracked-file change or
+wait for a future diff contract that represents untracked contents.
+
 ## Tasks suitable for `gpt-oss:20b`
 
 - Immutable data models.
@@ -220,10 +249,12 @@ Keep each task small enough to inspect in one complete transaction preview.
 - Merge or conflict automation.
 - Any security-boundary change.
 
-## `COMMIT-842` validation evidence
+## Historical pre-controller `COMMIT-842` validation evidence
 
-The milestone was validated with a fresh temporary repository and the real
-local `gpt-oss:20b` model. Worktree creation pinned a clean primary HEAD. The
+Before the deterministic controller was implemented, the isolated commit
+milestone was validated with a fresh temporary repository and the real local
+`gpt-oss:20b` model. This is historical manual evidence, not a benchmark of the
+current phase controller. Worktree creation pinned a clean primary HEAD. The
 model read the two implementation files and their test, changed exactly
 `demo/labels.py` and `demo/math_ops.py` in one approved transaction, ran Ruff
 format, Ruff check, and pytest successfully, and inspected status and diff.
