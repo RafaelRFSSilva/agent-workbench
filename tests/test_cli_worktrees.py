@@ -2,7 +2,7 @@
 
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import ANY, Mock
 
 import pytest
 
@@ -296,30 +296,19 @@ def test_main_delegates_complete_isolated_workflow_once(
         tool_approval_handler=_prompt_for_tool_approval,
         commit_approval_handler=_prompt_for_isolated_commit_approval,
         tool_round_observer=expected_observer,
+        progress_event_observer=ANY,
         max_tool_rounds=AUTONOMOUS_MAX_TOOL_ROUNDS,
     )
+    assert callable(workflow.call_args.kwargs["progress_event_observer"])
     create_session.assert_not_called()
     output = capsys.readouterr().out
-    assert "Assistant: Corrected and validated the implementation." in output
-    assert "Isolated autonomous workflow result:" in output
-    assert "Worktree: ../isolated" in output
-    assert "Branch: agent/task" in output
-    assert "New isolated HEAD: " + "b" * 40 in output
-    evidence = (
-        "  Final phase: DONE\n"
-        "  Tool rounds: 6\n"
-        "  Workspace change applied: yes\n"
-        "  Repair attempts: 1\n"
-        "  Completion continuations: 2\n"
-        "  Validation succeeded: yes\n"
-        "  Git status inspected: yes\n"
-        "  Git diff inspected: yes\n"
+    assert output == (
+        "[ISOLATED] Created local commit on agent/task with 2 changed files\n"
+        "[ISOLATED] Worktree clean; primary workspace unchanged; "
+        "worktree and local branch preserved\n"
     )
-    assert evidence in output
-    assert "Final worktree clean: yes" in output
-    assert "Primary working tree unchanged" in output
-    assert "Worktree and local branch preserved" in output
-    assert "No merge, push, worktree removal, or branch deletion" in output
+    assert "Corrected and validated" not in output
+    assert "b" * 40 not in output
 
 
 def test_main_forwards_custom_tool_round_limit_to_isolated_workflow(
@@ -420,22 +409,21 @@ def test_main_reports_isolated_workflow_failure_without_fallback(
 
     create_session.assert_not_called()
     output = capsys.readouterr().out
-    assert "Isolated autonomous workflow error:" in output
+    assert "[FAILED] Isolated autonomous workflow failed:" in output
     assert "preserved for manual recovery" in output
     assert "Traceback" not in output
-    assert "Isolated autonomous workflow result:" not in output
+    assert "[ISOLATED]" not in output
 
 
 @pytest.mark.parametrize(
-    ("workspace_change_applied", "expected"),
-    [
-        (True, "yes"),
-        (False, "no"),
-    ],
+    "workspace_change_applied",
+    [True, False],
 )
-def test_workspace_change_applied_line_in_cli_output(
-    monkeypatch, capsys, workspace_change_applied, expected
+def test_isolated_output_does_not_reconstruct_progress_from_final_result(
+    monkeypatch, capsys, workspace_change_applied
 ):
+    """Rely on streamed controller events instead of a verbose result dump."""
+
     runtime = configuration(
         workspace_root=Path("/source"),
         enable_actions=True,
@@ -495,7 +483,6 @@ def test_workspace_change_applied_line_in_cli_output(
     )
 
     output = capsys.readouterr().out
-    assert f"Workspace change applied: {expected}" in output
-    idx_ws = output.index(f"Workspace change applied: {expected}")
-    idx_val = output.index("Validation succeeded:")
-    assert idx_ws < idx_val
+    assert "Workspace change applied:" not in output
+    assert "Validation succeeded:" not in output
+    assert output.startswith("[ISOLATED] Created local commit")

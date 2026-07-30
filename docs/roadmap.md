@@ -29,6 +29,9 @@ Agent Workbench currently provides:
 - Supervised local Git worktree creation, isolated session construction,
   complete approved local commits, dirty-state preservation, and clean-only
   approved removal.
+- Deterministic autonomous coding with concise typed progress, formatter scope
+  limited to successful approved Python changes, project-wide lint/tests, and
+  unexpected-path rejection before DONE.
 - Automated tests, Ruff checks, and GitHub Actions.
 
 The current application manages one conversation at a time.
@@ -178,6 +181,8 @@ requiring every file to be attached manually.
 
 - [x] Add patch-based single-file updates.
 - [x] Add approved formatter execution.
+- [x] Constrain controller-owned formatting to sorted successful approved
+  changed Python paths.
 - [x] Add approved static-analysis execution.
 - [x] Add approved test execution.
 - [x] Add explicit confirmation for fixed commands.
@@ -616,9 +621,13 @@ Git verification itself, requires a real workspace action and non-empty final
 diff, and bounds discovery, action failures, edit continuations, repair
 evidence, and repair attempts. Existing-file whole rewrites use a latest-read
 SHA guard, and repair prompts preserve every safe validation failure and
-dynamic runtime requirement. Scripted providers and real temporary Git
-repositories cover representative success and failure paths without calling
-Ollama or paid/cloud providers.
+dynamic runtime requirement. Mutable formatting is restricted to successful
+approved changed Python paths; read-only status checks reject unexpected paths
+after formatting and before DONE. Typed controller events provide concise
+direct and isolated CLI progress while tool traces and complete assistant prose
+remain opt-in. Scripted providers and real temporary Git repositories cover
+representative success, repair, and preserved-state failure paths without
+calling Ollama or paid/cloud providers.
 
 The next implementation milestone is:
 

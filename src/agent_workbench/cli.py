@@ -12,6 +12,9 @@ from agent_workbench.arguments import (
 )
 from agent_workbench.coding_loop import (
     AutonomousCodingResult,
+    CodingProgressEvent,
+    CodingProgressKind,
+    CodingPhase,
     run_autonomous_coding_task,
 )
 from agent_workbench.config import load_environment
@@ -175,6 +178,7 @@ def _run_configured_cli(
             session,
             task_prompt,
             show_tool_traces=runtime_configuration.show_tool_traces,
+            show_assistant_summary=runtime_configuration.show_assistant_summary,
         )
         return
 
@@ -194,16 +198,18 @@ def _run_autonomous_task(
     task_prompt: str,
     *,
     show_tool_traces: bool,
+    show_assistant_summary: bool,
 ) -> None:
     """Run one supervised autonomous task and display its final result."""
 
-    def display_approved_actions(round_: ToolInteractionRound) -> None:
-        _display_approved_action_completion(
-            round_,
-            session.tool_registry,
-        )
+    observer = _display_tool_round if show_tool_traces else None
+    terminal_failure_displayed = False
 
-    observer = _display_tool_round if show_tool_traces else display_approved_actions
+    def display_progress(event: CodingProgressEvent) -> None:
+        nonlocal terminal_failure_displayed
+        _display_coding_progress(event)
+        if event.kind is CodingProgressKind.TERMINAL_FAILURE:
+            terminal_failure_displayed = True
 
     try:
         result = run_autonomous_coding_task(
@@ -211,6 +217,7 @@ def _run_autonomous_task(
             task_prompt,
             tool_approval_handler=_prompt_for_tool_approval,
             tool_round_observer=observer,
+            progress_event_observer=display_progress,
         )
     except (
         CompletionError,
@@ -218,25 +225,15 @@ def _run_autonomous_task(
         ValueError,
         WorkspacePathError,
     ) as exc:
-        print(f"Autonomous task error: {exc}")
+        if not terminal_failure_displayed:
+            print(
+                "[FAILED] Autonomous coding could not start: "
+                f"{exc}; workspace preserved for manual recovery"
+            )
         return
 
-    print(f"\nAssistant: {result.assistant_summary}\n")
-    print("Autonomous task result:")
-    _display_coding_evidence(result)
-
-    if result.validation_runs:
-        print("  Validation runs:")
-        for validation in result.validation_runs:
-            exit_code = (
-                str(validation.exit_code)
-                if validation.exit_code is not None
-                else "[unavailable]"
-            )
-            print(
-                f"    - {validation.tool_name}: "
-                f"{validation.result_status}, exit code {exit_code}"
-            )
+    if show_assistant_summary:
+        print(f"\nAssistant summary:\n{result.assistant_summary}")
 
 
 def _run_isolated_autonomous_task(
@@ -262,6 +259,14 @@ def _run_isolated_autonomous_task(
         return
 
     observer = _display_tool_round if runtime_configuration.show_tool_traces else None
+    terminal_failure_displayed = False
+
+    def display_progress(event: CodingProgressEvent) -> None:
+        nonlocal terminal_failure_displayed
+        _display_coding_progress(event)
+        if event.kind is CodingProgressKind.TERMINAL_FAILURE:
+            terminal_failure_displayed = True
+
     try:
         result = run_isolated_autonomous_workflow(
             SessionId("cli-session"),
@@ -274,6 +279,7 @@ def _run_isolated_autonomous_task(
             tool_approval_handler=_prompt_for_tool_approval,
             commit_approval_handler=_prompt_for_isolated_commit_approval,
             tool_round_observer=observer,
+            progress_event_observer=display_progress,
             max_tool_rounds=runtime_configuration.max_tool_rounds,
         )
     except (
@@ -282,33 +288,117 @@ def _run_isolated_autonomous_task(
         ValueError,
         WorkspacePathError,
     ) as exc:
-        print(f"Isolated autonomous workflow error: {exc}")
+        if not terminal_failure_displayed:
+            print(
+                "[FAILED] Isolated autonomous workflow failed: "
+                f"{exc}; workspace preserved for manual recovery"
+            )
         return
 
-    _display_isolated_autonomous_result(result)
+    _display_isolated_autonomous_result(
+        result,
+        show_assistant_summary=runtime_configuration.show_assistant_summary,
+    )
 
 
 def _display_isolated_autonomous_result(
     result: IsolatedAutonomousWorkflowResult,
+    *,
+    show_assistant_summary: bool = False,
 ) -> None:
     """Display the verified isolated commit and preserved recovery state."""
 
     coding_result = result.coding_result
     commit_result = result.commit_result
-    print(f"\nAssistant: {coding_result.assistant_summary}\n")
-    print("Isolated autonomous workflow result:")
-    print(f"  Worktree: {result.worktree.target_display}")
-    print(f"  Branch: {commit_result.branch_name}")
-    print(f"  New isolated HEAD: {commit_result.new_head}")
-    print(f"  Committed paths: {commit_result.operation_count}")
-    _display_coding_evidence(coding_result)
+    if show_assistant_summary:
+        print(f"\nAssistant summary:\n{coding_result.assistant_summary}")
     print(
-        "  Final worktree clean: "
-        f"{'yes' if result.final_worktree_state.clean else 'no'}"
+        f"[ISOLATED] Created local commit on {commit_result.branch_name} "
+        f"with {commit_result.operation_count} changed "
+        f"{'file' if commit_result.operation_count == 1 else 'files'}"
     )
-    print("  Primary working tree unchanged.")
-    print("  Worktree and local branch preserved.")
-    print("  No merge, push, worktree removal, or branch deletion was performed.")
+    print(
+        "[ISOLATED] Worktree clean; primary workspace unchanged; "
+        "worktree and local branch preserved"
+    )
+
+
+def _display_coding_progress(event: CodingProgressEvent) -> None:
+    """Render one concise stable controller-owned progress line."""
+
+    label = event.phase.value
+    if event.phase is CodingPhase.REPAIR and event.repair_attempt:
+        label = f"REPAIR {event.repair_attempt}/{event.max_repair_attempts}"
+
+    if event.kind is CodingProgressKind.PHASE_STARTED:
+        messages = {
+            CodingPhase.DISCOVER: "Inspecting workspace",
+            CodingPhase.EDIT: "Applying controlled workspace changes",
+            CodingPhase.VALIDATE: "Running controller-owned validation",
+            CodingPhase.VERIFY: "Inspecting final workspace changes",
+        }
+        message = messages.get(event.phase)
+    elif event.kind is CodingProgressKind.PHASE_COMPLETED:
+        message = (
+            "Inspection complete"
+            if event.phase is CodingPhase.DISCOVER
+            else "Phase complete"
+        )
+    elif event.kind is CodingProgressKind.WORKSPACE_CHANGED:
+        message = f"Changed {event.path or '[unavailable]'}"
+    elif event.kind is CodingProgressKind.ACTION_FAILED:
+        target = f" for {event.path}" if event.path is not None else ""
+        message = f"Controlled action failed{target}: {event.reason or 'unavailable'}"
+    elif event.kind is CodingProgressKind.VALIDATION_RESULT:
+        message = _format_validation_progress(event)
+    elif event.kind is CodingProgressKind.REPAIR_STARTED:
+        message = "Resolving validation failures"
+    elif event.kind is CodingProgressKind.CHANGED_PATH_COUNT:
+        count = event.changed_path_count or 0
+        message = f"{count} changed {'file' if count == 1 else 'files'}"
+    elif event.kind is CodingProgressKind.DONE:
+        message = "Task completed successfully"
+    elif event.kind is CodingProgressKind.TERMINAL_FAILURE:
+        attempts = (
+            f"; repair attempts {event.repair_attempt}/{event.max_repair_attempts}"
+            if event.max_repair_attempts
+            else ""
+        )
+        preserved = (
+            "; workspace preserved for manual recovery"
+            if event.workspace_preserved
+            else ""
+        )
+        print(
+            f"[FAILED] {event.phase.value}: {event.reason or 'unavailable'}"
+            f"{attempts}{preserved}"
+        )
+        return
+    else:
+        message = None
+
+    if message is not None:
+        print(f"[{label}] {message}")
+
+
+def _format_validation_progress(event: CodingProgressEvent) -> str:
+    """Render one validation result without exposing command output."""
+
+    names = {
+        "run_ruff_format": "Ruff format",
+        "run_ruff_check": "Ruff check",
+        "run_pytest": "Pytest",
+    }
+    name = names.get(event.tool_name or "", "Validation")
+    if event.skipped:
+        return f"{name} skipped: no approved changed Python files"
+    passed = event.result_status == "success" and event.exit_code == 0
+    status = "passed" if passed else "failed"
+    if event.validation_summary:
+        return f"{name} {status}: {event.validation_summary}"
+    if event.exit_code is not None and not passed:
+        return f"{name} {status}: exit code {event.exit_code}"
+    return f"{name} {status}"
 
 
 def _display_coding_evidence(result: AutonomousCodingResult) -> None:

@@ -102,7 +102,7 @@ DISCOVER (model, read-only, at most four tool rounds)
    ↓
 EDIT (model, read-only plus controlled workspace actions)
    ↓
-VALIDATE (controller: Ruff format → Ruff check → pytest)
+VALIDATE (controller: format approved Python paths → check project → pytest)
    ↓ failed
 REPAIR (model, read-only plus controlled workspace actions)
    └──────────────→ VALIDATE
@@ -112,8 +112,9 @@ VERIFY (controller: Git status → Git diff)
 DONE
 ```
 
-Only successful tool results, validation exit codes, and final Git inspection
-can advance this workflow. Assistant text is never completion evidence.
+Only successful tool results, validation exit codes, exact changed-path checks,
+and final Git inspection can advance this workflow. Assistant text is never
+completion evidence.
 
 ## Package Structure
 
@@ -1387,13 +1388,26 @@ the model to resolve every listed failure and dynamic runtime requirement,
 make another controlled change, perform a complete file read before
 `apply_file_rewrite`, and leave Ruff and pytest execution to the controller.
 
-The controller invokes `run_ruff_format`, `run_ruff_check`, and `run_pytest`
-against `"."` in that exact order through the registered preview, explicit
-approval, and execution interfaces. Any error or non-zero exit code enters
-REPAIR. A successful repair must contain a new successful workspace action,
-after which the complete validation sequence runs again. Two EDIT completion
-continuations, two repair attempts, and two completion continuations per repair
-are the v1 defaults.
+Before DISCOVER, the controller captures typed safe changed-path evidence from
+read-only Git status. For validation it invokes `run_ruff_format` separately
+for each existing Python path produced by successful approved workspace
+actions, in deterministic sorted order. Baseline-dirty paths are not formatter
+targets unless the current task also changed that exact path. When no changed
+Python path exists, an immutable `ValidationRun` records a typed skip without
+executing Ruff format. `run_ruff_check` and `run_pytest` continue to target
+`"."` and inspect the complete project.
+
+Every Ruff format invocation is followed by hidden read-only Git status
+inspection. The controller rejects safe unexpected paths explicitly and
+rejects additional unsafe path evidence without exposing it. The allowed set
+is exactly the baseline changed paths union the paths from successful approved
+workspace actions. The same check runs against final status before DONE. No
+failure path stages, resets, restores, cleans, or deletes workspace state.
+
+Any validation error or non-zero exit code enters REPAIR. A successful repair
+must contain a new successful workspace action, after which the complete
+validation sequence runs again. Two EDIT completion continuations, two repair
+attempts, and two completion continuations per repair are the v1 defaults.
 
 If one EDIT or REPAIR send raises the exact maximum-tool-round error, the
 controller inspects only tool rounds from that call. A successful approved
@@ -1405,15 +1419,26 @@ terminal.
 After the latest validation sequence succeeds, the controller invokes
 `inspect_git_status` and `inspect_git_diff`. DONE requires a successful
 workspace action, non-empty tracked, staged, or safe untracked Git diff
-evidence, successful latest Ruff format/check/pytest results, and successful
-final Git inspections. A model response cannot select DONE or override these
-gates. Terminal failures raise a phase-specific `CompletionError`, and the
-isolated workflow cannot plan a commit unless the result phase is DONE.
+evidence, successful or safely skipped latest Ruff format evidence, successful
+latest Ruff check and pytest results, and successful final Git inspections. A
+model response cannot select DONE or override these gates. Terminal failures
+raise a phase-specific `CompletionError`, and the isolated workflow cannot plan
+a commit unless the result phase is DONE.
+
+`CodingProgressEvent` and `CodingProgressKind` form a provider-independent
+application observer boundary. The controller emits phase start/completion,
+successful safe changed paths, bounded action failures, structured validation
+outcomes, repair counters, final changed-file count, DONE, and one
+preserved-workspace terminal failure. The CLI renders these as stable plain
+text. It does not infer progress from model prose or parse provider protocol
+records. Raw tool traces require `--show-tool-traces`, and complete assistant
+prose requires `--show-assistant-summary`; approval previews remain visible.
 
 `AutonomousCodingResult` preserves tool rounds, exact `ToolResult` snapshots,
-executed and approved tool names, validation runs, Git inspection evidence, and
-assistant summary. It also exposes final phase, workspace-change evidence,
-repair attempts, and completion continuations for stable CLI rendering.
+executed and approved tool names, validation runs (including target paths and
+formatter skips), baseline paths, Git inspection evidence, and assistant
+summary. It also exposes final phase, workspace-change evidence, repair
+attempts, and completion continuations for machine-facing consumers.
 
 The v1 controller remains Python-specific. Untracked-only tasks can reach DONE
 when every required new file has safe bounded text evidence. A task containing

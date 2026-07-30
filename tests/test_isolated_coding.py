@@ -193,12 +193,14 @@ def test_runs_isolated_task_and_creates_verified_local_commit(
         *,
         tool_approval_handler,
         tool_round_observer,
+        progress_event_observer,
         acceptance_criteria,
     ):
         assert session is not None
         assert prompt == "Correct the add implementation."
         assert callable(tool_approval_handler)
         assert tool_round_observer is None
+        assert progress_event_observer is None
         assert tuple(acceptance_criteria) == (
             "Implement the requested behavior with bounded workspace changes.",
             "Run Ruff formatting and static analysis and resolve introduced issues.",

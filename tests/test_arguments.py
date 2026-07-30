@@ -598,6 +598,14 @@ def test_parse_cli_arguments_enables_tool_traces() -> None:
     assert arguments.show_tool_traces is True
 
 
+def test_parse_cli_arguments_enables_assistant_summary() -> None:
+    """Expose complete autonomous assistant prose only through explicit opt-in."""
+
+    arguments = parse_cli_arguments(["--show-assistant-summary"])
+
+    assert arguments.show_assistant_summary is True
+
+
 def test_runtime_configuration_preserves_tool_enablement() -> None:
     """Carry the explicit tool setting into runtime configuration."""
 
@@ -624,6 +632,20 @@ def test_runtime_configuration_preserves_tool_trace_enablement() -> None:
     )
 
     assert configuration.show_tool_traces is True
+
+
+def test_runtime_configuration_preserves_assistant_summary_enablement() -> None:
+    """Carry the explicit autonomous summary setting into runtime configuration."""
+
+    configuration = resolve_runtime_configuration(
+        CLIArguments(
+            provider_name="ollama",
+            model_name="gpt-oss:20b",
+            show_assistant_summary=True,
+        )
+    )
+
+    assert configuration.show_assistant_summary is True
 
 
 def test_runtime_configuration_preserves_workspace_root() -> None:
@@ -829,6 +851,9 @@ def test_runtime_configuration_disables_tools_by_default() -> None:
         ],
         [
             "--show-tool-traces",
+        ],
+        [
+            "--show-assistant-summary",
         ],
         [
             "--commit-message",
