@@ -445,8 +445,8 @@ def test_repeated_unsafe_tool_batches_fail_after_one_recovery() -> None:
     assert "secret" not in str(raised_error.value)
 
 
-def test_recovers_one_repeated_inspection_batch_without_reexecuting_it() -> None:
-    """Withhold inspection tools for one recovery without duplicate execution."""
+def test_rejects_one_repeated_inspection_and_keeps_all_tools_available() -> None:
+    """Return a duplicate result while preserving every safe alternative."""
 
     inspection_executions: list[dict[str, object]] = []
     calculator_executions: list[dict[str, object]] = []
@@ -504,7 +504,7 @@ def test_recovers_one_repeated_inspection_batch_without_reexecuting_it() -> None
         provider,
         request,
         registry,
-        max_tool_rounds=2,
+        max_tool_rounds=3,
         tool_round_observer=observed_rounds.append,
     )
 
@@ -513,19 +513,28 @@ def test_recovers_one_repeated_inspection_batch_without_reexecuting_it() -> None
     assert calculator_executions == [{"expression": "2 + 2"}]
     assert tuple(round_.response for round_ in observed_rounds) == (
         first_response,
+        repeated_response,
         recovery_response,
     )
     assert len(provider.requests) == 4
 
     recovery_request = provider.requests[2]
     assert recovery_request.messages is request.messages
-    assert recovery_request.tools == (calculator,)
+    assert recovery_request.tools is request.tools
     assert request.tools == (read_file, calculator)
-    assert recovery_request.tool_interactions == (observed_rounds[0],)
-    assert recovery_request.system_prompt is not None
-    assert recovery_request.system_prompt.startswith("Base instructions.\n\n")
-    assert "immediately preceding completed round" in recovery_request.system_prompt
-    assert "secret-repeat.py" not in recovery_request.system_prompt
+    assert recovery_request.tool_interactions == tuple(observed_rounds[:2])
+    assert recovery_request.system_prompt == request.system_prompt
+    assert observed_rounds[1].results == (
+        ToolResult(
+            invocation_id="repeated-with-new-id",
+            status="error",
+            error=(
+                "Duplicate inspection rejected: the same read-only invocation "
+                "already completed successfully. Use the existing result, choose "
+                "a different inspection, or produce the next controlled edit."
+            ),
+        ),
+    )
 
     continued_request = provider.requests[3]
     assert continued_request.system_prompt == request.system_prompt
@@ -631,7 +640,7 @@ def test_repaired_repeated_inspections_stop_at_tool_round_limit() -> None:
     with pytest.raises(
         CompletionError,
         match="maximum number of tool execution rounds was exceeded",
-    ):
+    ) as raised_error:
         run_tool_calling_loop(
             provider,
             ChatRequest(messages=[], tools=(read_file,)),
@@ -647,10 +656,16 @@ def test_repaired_repeated_inspections_stop_at_tool_round_limit() -> None:
         == 1
     )
     assert all(request.tools == (read_file,) for request in provider.requests)
+    assert "requested_inspection=read_file" in str(raised_error.value)
+    assert "tool_round_count=2/2" in str(raised_error.value)
+    assert "duplicate_count=1" in str(raised_error.value)
+    assert "inspection_streak_count=2" in str(raised_error.value)
+    assert "response_repair_attempt_count=1" in str(raised_error.value)
+    assert "alternative_inspection_tools_available=true" in str(raised_error.value)
 
 
-def test_repeated_inspection_recovery_withholds_every_inspection_definition() -> None:
-    """Temporarily remove every read-only inspection definition from recovery."""
+def test_repeated_inspection_keeps_every_inspection_definition() -> None:
+    """Keep every read-only inspection definition after rejecting a duplicate."""
 
     read_file = create_read_file_definition()
     calculator = create_calculator_definition()
@@ -704,16 +719,17 @@ def test_repeated_inspection_recovery_withholds_every_inspection_definition() ->
         provider,
         request,
         registry,
-        max_tool_rounds=1,
+        max_tool_rounds=2,
     )
 
     assert result.text == "Use the existing inspection result."
-    assert provider.requests[2].tools == (calculator,)
+    assert provider.requests[2].tools is request.tools
+    assert provider.requests[2].tool_interactions[-1].results[0].status == "error"
     assert request.tools == (read_file, *inspection_definitions, calculator)
 
 
-def test_repeated_inspection_batch_fails_after_one_recovery() -> None:
-    """Stop when one corrective retry repeats the same inspection again."""
+def test_infinitely_repeated_inspection_stops_with_lifecycle_diagnostics() -> None:
+    """Count rejected duplicates and stop with sanitized bounded diagnostics."""
 
     executions: list[dict[str, object]] = []
     observed_rounds: list[ToolInteractionRound] = []
@@ -738,24 +754,39 @@ def test_repeated_inspection_batch_fails_after_one_recovery() -> None:
             repeated_response("first"),
             repeated_response("second"),
             repeated_response("third"),
+            repeated_response("fourth"),
         ]
     )
 
     with pytest.raises(
         CompletionError,
-        match="repeatedly requested the same read-only inspection tool-call batch",
+        match=(
+            r"maximum number of tool execution rounds was exceeded.*"
+            r"requested_inspection=read_file.*"
+            r"tool_round_count=3/3.*"
+            r"duplicate_count=3.*"
+            r"inspection_streak_count=0.*"
+            r"response_repair_attempt_count=0.*"
+            r"alternative_inspection_tools_available=true"
+        ),
     ) as raised_error:
         run_tool_calling_loop(
             provider,
-            ChatRequest(messages=[]),
+            ChatRequest(messages=[], tools=(read_file,)),
             registry,
             max_tool_rounds=3,
             tool_round_observer=observed_rounds.append,
         )
 
-    assert len(provider.requests) == 3
+    assert len(provider.requests) == 4
     assert executions == [{"path": "secret-repeat.py"}]
-    assert len(observed_rounds) == 1
+    assert len(observed_rounds) == 3
+    assert [round_.results[0].status for round_ in observed_rounds] == [
+        "success",
+        "error",
+        "error",
+    ]
+    assert all(request.tools == (read_file,) for request in provider.requests)
     assert "secret-repeat.py" not in str(raised_error.value)
 
 
@@ -801,6 +832,106 @@ def test_allows_inspection_with_different_arguments_in_consecutive_rounds() -> N
         {"path": "first.py"},
         {"path": "second.py"},
     ]
+
+
+def test_duplicate_signature_distinguishes_tool_names() -> None:
+    """Execute different inspection tools even when their arguments match."""
+
+    executions: list[str] = []
+    read_file = create_read_file_definition()
+    search_text = ToolDefinition(
+        name="search_text",
+        description="Search text in one file.",
+        input_schema=read_file.input_schema,
+    )
+    registry = ToolRegistry()
+    registry.register(
+        read_file,
+        lambda arguments: executions.append("read_file") or {"content": "value"},
+    )
+    registry.register(
+        search_text,
+        lambda arguments: executions.append("search_text") or {"matches": []},
+    )
+    provider = FakeProvider(
+        [
+            create_tool_response(
+                ToolInvocation(
+                    id="read",
+                    tool_name="read_file",
+                    arguments={"path": "module.py"},
+                )
+            ),
+            create_tool_response(
+                ToolInvocation(
+                    id="search",
+                    tool_name="search_text",
+                    arguments={"path": "module.py"},
+                )
+            ),
+            ChatResponse(text="Completed."),
+        ]
+    )
+
+    result = run_tool_calling_loop(
+        provider,
+        ChatRequest(messages=[], tools=(read_file, search_text)),
+        registry,
+        max_tool_rounds=2,
+    )
+
+    assert result.text == "Completed."
+    assert executions == ["read_file", "search_text"]
+
+
+def test_noninspection_progress_allows_a_fresh_matching_inspection() -> None:
+    """Allow the same inspection again after a non-inspection operation."""
+
+    executions: list[str] = []
+    read_file = create_read_file_definition()
+    calculator = create_calculator_definition()
+    registry = ToolRegistry()
+    registry.register(
+        read_file,
+        lambda arguments: executions.append("read_file") or {"content": "value"},
+    )
+    registry.register(
+        calculator,
+        lambda arguments: executions.append("calculator") or {"value": 4},
+    )
+
+    def invocation(identifier: str, tool_name: str) -> ChatResponse:
+        arguments = (
+            {"path": "module.py"}
+            if tool_name == "read_file"
+            else {"expression": "2 + 2"}
+        )
+        return create_tool_response(
+            ToolInvocation(
+                id=identifier,
+                tool_name=tool_name,
+                arguments=arguments,
+            )
+        )
+
+    provider = FakeProvider(
+        [
+            invocation("first-read", "read_file"),
+            invocation("progress", "calculator"),
+            invocation("fresh-read", "read_file"),
+            ChatResponse(text="Completed."),
+        ]
+    )
+
+    result = run_tool_calling_loop(
+        provider,
+        ChatRequest(messages=[], tools=(read_file, calculator)),
+        registry,
+        max_tool_rounds=3,
+    )
+
+    assert result.text == "Completed."
+    assert executions == ["read_file", "calculator", "read_file"]
 
 
 def test_allows_repeated_inspection_after_an_error_result() -> None:
@@ -857,8 +988,8 @@ def test_allows_repeated_inspection_after_an_error_result() -> None:
     ) == ("error", "success")
 
 
-def test_allows_nonconsecutive_reuse_of_an_inspection_batch() -> None:
-    """Compare inspections only with the immediately preceding completed round."""
+def test_rejects_nonconsecutive_reuse_before_noninspection_progress() -> None:
+    """Reject a completed signature even after a different inspection."""
 
     executions: list[dict[str, object]] = []
     read_file = create_read_file_definition()
@@ -897,8 +1028,8 @@ def test_allows_nonconsecutive_reuse_of_an_inspection_batch() -> None:
     assert executions == [
         {"path": "first.py"},
         {"path": "second.py"},
-        {"path": "first.py"},
     ]
+    assert provider.requests[3].tool_interactions[-1].results[0].status == "error"
 
 
 def test_recovers_repeated_inspection_from_preexisting_tool_history() -> None:
@@ -956,11 +1087,11 @@ def test_recovers_repeated_inspection_from_preexisting_tool_history() -> None:
     assert result.text == "Use the previous result."
     assert executions == []
     assert len(provider.requests) == 2
-    assert provider.requests[1].tool_interactions == (previous_round,)
-    assert provider.requests[1].tools == ()
+    assert provider.requests[1].tool_interactions[:-1] == (previous_round,)
+    assert provider.requests[1].tool_interactions[-1].results[0].status == "error"
+    assert provider.requests[1].tools == (read_file,)
     assert request.tools == (read_file,)
-    assert provider.requests[1].system_prompt is not None
-    assert "secret-repeat.py" not in provider.requests[1].system_prompt
+    assert provider.requests[1].system_prompt == request.system_prompt
 
 
 def test_executes_the_maximum_safe_tool_batch() -> None:
@@ -1695,7 +1826,15 @@ def test_rejects_second_inspection_requested_while_tools_are_withheld() -> None:
 
     with pytest.raises(
         CompletionError,
-        match="repeatedly requested a read-only inspection tool",
+        match=(
+            r"repeatedly requested a read-only inspection tool.*"
+            r"requested_inspection=read_file.*"
+            r"tool_round_count=16/17.*"
+            r"duplicate_count=0.*"
+            r"inspection_streak_count=16.*"
+            r"response_repair_attempt_count=0.*"
+            r"alternative_inspection_tools_available=false"
+        ),
     ):
         run_tool_calling_loop(
             provider,
@@ -1712,8 +1851,8 @@ def test_rejects_second_inspection_requested_while_tools_are_withheld() -> None:
     assert "first-forbidden.py" not in provider.requests[17].system_prompt
 
 
-def test_repeated_batch_recovery_rejects_different_withheld_inspection() -> None:
-    """Enforce withheld tools even when the provider changes inspection args."""
+def test_duplicate_rejection_allows_a_different_inspection() -> None:
+    """Execute a different inspection immediately after one duplicate rejection."""
 
     read_executions: list[dict[str, object]] = []
     calculator_executions: list[dict[str, object]] = []
@@ -1772,14 +1911,17 @@ def test_repeated_batch_recovery_rejects_different_withheld_inspection() -> None
         provider,
         request,
         registry,
-        max_tool_rounds=2,
+        max_tool_rounds=4,
     )
 
     assert result is final_response
-    assert read_executions == [{"path": "first.py"}]
+    assert read_executions == [
+        {"path": "first.py"},
+        {"path": "different.py"},
+    ]
     assert calculator_executions == [{"expression": "2 + 2"}]
-    assert provider.requests[2].tools == (calculator,)
-    assert provider.requests[3].tools == (calculator,)
+    assert provider.requests[2].tools is request.tools
+    assert provider.requests[3].tools is request.tools
     assert provider.requests[4].tools is request.tools
 
 
