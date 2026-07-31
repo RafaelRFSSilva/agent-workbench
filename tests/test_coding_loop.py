@@ -23,6 +23,8 @@ from agent_workbench.coding_loop import (
     CodingProgressKind,
     CodingPhase,
     CodingWorkflowLimits,
+    _bounded_validation_failure_evidence,
+    _format_validation_failure_evidence,
     _sanitize_prompt_text,
     _sanitize_validation_output,
     run_autonomous_coding_task,
@@ -39,7 +41,11 @@ from agent_workbench.messages import ChatRequest, ChatResponse
 from agent_workbench.session import AgentSession, SessionId
 from agent_workbench.symbol_tools import register_symbol_tools
 from agent_workbench.tool_registry import ToolRegistry
-from agent_workbench.tools import ToolApprovalDecision, ToolInvocation
+from agent_workbench.tools import (
+    ToolApprovalDecision,
+    ToolInvocation,
+    ToolResult,
+)
 from agent_workbench.validation_tools import register_validation_tools
 from agent_workbench.workspace import Workspace
 from agent_workbench.workspace_actions import register_workspace_action_tools
@@ -2548,6 +2554,241 @@ def test_repair_validation_output_is_deterministically_bounded(
     assert len(stdout_excerpt) <= MAX_REPAIR_VALIDATION_FIELD_CHARACTERS
     assert len(stderr_excerpt) <= MAX_REPAIR_VALIDATION_FIELD_CHARACTERS
     assert result.final_phase is CodingPhase.DONE
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        pytest.param(
+            {"exit_code": 1, "stdout": "failure", "stderr": ""},
+            id="missing",
+        ),
+        pytest.param(
+            {
+                "exit_code": 1,
+                "stdout": "failure",
+                "stderr": "",
+                "command": None,
+            },
+            id="none",
+        ),
+        pytest.param(
+            {
+                "exit_code": 1,
+                "stdout": "failure",
+                "stderr": "",
+                "command": [],
+            },
+            id="empty-list",
+        ),
+        pytest.param(
+            {
+                "exit_code": 1,
+                "stdout": "failure",
+                "stderr": "",
+                "command": "python -m pytest",
+            },
+            id="string",
+        ),
+        pytest.param(
+            {
+                "exit_code": 1,
+                "stdout": "failure",
+                "stderr": "",
+                "command": ["python", 3],
+            },
+            id="mixed-list",
+        ),
+        pytest.param(
+            {
+                "exit_code": 1,
+                "stdout": "failure",
+                "stderr": "",
+                "command": {"program": "python"},
+            },
+            id="object",
+        ),
+    ],
+)
+def test_validation_failure_command_falls_back_when_unavailable_or_malformed(
+    output: dict[str, object],
+) -> None:
+    """Render one deterministic fallback for unavailable command data."""
+
+    result = ToolResult(
+        invocation_id="validation",
+        status="success",
+        output=output,
+    )
+
+    rendered = _format_validation_failure_evidence(
+        _bounded_validation_failure_evidence((("run_pytest", result),))
+    )
+
+    assert "result_status=success" in rendered
+    assert "command=[unavailable]" in rendered
+    assert "exit_code=1" in rendered
+    assert "stdout_excerpt:\nfailure" in rendered
+    assert "stderr_excerpt:\n[empty]" in rendered
+
+
+def test_validation_failure_commands_render_as_ordered_compact_json() -> None:
+    """Preserve validation ordering and render commands without shell quoting."""
+
+    failures = (
+        (
+            "run_ruff_check",
+            ToolResult(
+                invocation_id="ruff",
+                status="success",
+                output={
+                    "command": [
+                        "python",
+                        "-m",
+                        "ruff",
+                        "check",
+                        "--no-cache",
+                        "--color",
+                        "never",
+                        ".",
+                    ],
+                    "exit_code": 1,
+                    "stdout": "module.py:1:1: F401 unused import",
+                    "stderr": "",
+                },
+            ),
+        ),
+        (
+            "run_pytest",
+            ToolResult(
+                invocation_id="pytest",
+                status="success",
+                output={
+                    "command": [
+                        "python",
+                        "-m",
+                        "pytest",
+                        "-q",
+                        "--color=no",
+                        "-p",
+                        "no:cacheprovider",
+                        ".",
+                    ],
+                    "exit_code": 1,
+                    "stdout": "FAILED test_module.py::test_add",
+                    "stderr": "AssertionError: expected 3",
+                },
+            ),
+        ),
+    )
+
+    rendered = _format_validation_failure_evidence(
+        _bounded_validation_failure_evidence(failures)
+    )
+
+    assert rendered == (
+        "Validation failure 1:\n"
+        "tool_name=run_ruff_check\n"
+        "result_status=success\n"
+        'command=["python","-m","ruff","check","--no-cache","--color",'
+        '"never","."]\n'
+        "exit_code=1\n"
+        "stdout_excerpt:\n"
+        "module.py:1:1: F401 unused import\n"
+        "stderr_excerpt:\n"
+        "[empty]\n"
+        "\n"
+        "Validation failure 2:\n"
+        "tool_name=run_pytest\n"
+        "result_status=success\n"
+        'command=["python","-m","pytest","-q","--color=no","-p",'
+        '"no:cacheprovider","."]\n'
+        "exit_code=1\n"
+        "stdout_excerpt:\n"
+        "FAILED test_module.py::test_add\n"
+        "stderr_excerpt:\n"
+        "AssertionError: expected 3"
+    )
+
+
+def test_validation_failure_command_counts_toward_existing_evidence_budget() -> None:
+    """Keep command metadata and streams within the combined repair budget."""
+
+    result = ToolResult(
+        invocation_id="validation",
+        status="success",
+        output={
+            "command": [
+                "python",
+                "-m",
+                "pytest",
+                "-q",
+                "--color=no",
+            ],
+            "exit_code": 1,
+            "stdout": "STDOUT-START\n" + ("x" * 20_000),
+            "stderr": "STDERR-START\n" + ("y" * 20_000),
+        },
+    )
+
+    rendered = _format_validation_failure_evidence(
+        _bounded_validation_failure_evidence((("run_pytest", result),))
+    )
+
+    assert len(rendered) <= MAX_REPAIR_VALIDATION_EVIDENCE_CHARACTERS
+    assert 'command=["python","-m","pytest","-q","--color=no"]' in rendered
+    assert rendered.count("[truncated]") == 2
+    assert "STDOUT-START" in rendered
+    assert "STDERR-START" in rendered
+
+
+def test_oversized_validation_command_cannot_exceed_evidence_budget() -> None:
+    """Reject an oversized command without hiding a later bounded command."""
+
+    oversized_result = ToolResult(
+        invocation_id="oversized-command",
+        status="success",
+        output={
+            "command": ["python", "x" * 20_000],
+            "exit_code": 1,
+            "stdout": "ruff failure",
+            "stderr": "",
+        },
+    )
+    bounded_result = ToolResult(
+        invocation_id="bounded-command",
+        status="success",
+        output={
+            "command": ["python", "-m", "pytest", "-q"],
+            "exit_code": 1,
+            "stdout": "pytest failure",
+            "stderr": "AssertionError",
+        },
+    )
+
+    rendered = _format_validation_failure_evidence(
+        _bounded_validation_failure_evidence(
+            (
+                ("run_ruff_check", oversized_result),
+                ("run_pytest", bounded_result),
+            )
+        )
+    )
+
+    records = rendered.split("\n\n")
+
+    assert len(rendered) <= MAX_REPAIR_VALIDATION_EVIDENCE_CHARACTERS
+    assert len(records) == 2
+
+    assert "tool_name=run_ruff_check" in records[0]
+    assert "command=[unavailable]" in records[0]
+    assert "ruff failure" in records[0]
+    assert ("x" * 100) not in records[0]
+
+    assert "tool_name=run_pytest" in records[1]
+    assert 'command=["python","-m","pytest","-q"]' in records[1]
+    assert "pytest failure" in records[1]
+    assert "AssertionError" in records[1]
 
 
 def test_second_repair_resolves_every_failure_and_reaches_done(
