@@ -100,6 +100,7 @@ def test_init_command_parses_supported_explicit_options() -> None:
             "--max-output-tokens",
             "2048",
             "--isolated",
+            "--dry-run",
             "--enable-tools",
             "--enable-actions",
         ]
@@ -114,6 +115,7 @@ def test_init_command_parses_supported_explicit_options() -> None:
     assert arguments.top_p == 0.8
     assert arguments.max_output_tokens == 2048
     assert arguments.isolated is True
+    assert arguments.dry_run is True
     assert arguments.enable_tools is True
     assert arguments.enable_actions is True
 
@@ -132,8 +134,22 @@ def test_init_command_defaults_booleans_on_and_accepts_explicit_disabling() -> N
 
     assert defaults.enable_tools is True
     assert defaults.enable_actions is True
+    assert defaults.dry_run is False
     assert disabled.enable_tools is False
     assert disabled.enable_actions is False
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [["--dry-run"], ["--setup", "--dry-run"], ["code", "--dry-run"]],
+)
+def test_non_init_commands_reject_dry_run(argv: list[str]) -> None:
+    """Keep project initialization preview semantics scoped to init."""
+
+    with pytest.raises(SystemExit) as raised:
+        parse_cli_arguments(argv)
+
+    assert raised.value.code == 2
 
 
 def test_parse_cli_arguments_rejects_unsupported_provider() -> None:

@@ -1,6 +1,7 @@
 """Interactive command-line interface for Agent Workbench."""
 
 import json
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -25,6 +26,7 @@ from agent_workbench.config import (
     create_project_configuration,
     discover_project_configuration,
     load_environment,
+    render_project_configuration,
 )
 from agent_workbench.errors import (
     CompletionError,
@@ -222,10 +224,16 @@ def _initialize_project(arguments: CLIArguments) -> None:
         isolated=arguments.isolated,
     )
     try:
-        create_project_configuration(Path.cwd(), configuration)
+        if arguments.dry_run:
+            content = render_project_configuration(configuration)
+        else:
+            create_project_configuration(Path.cwd(), configuration)
     except ConfigurationError as exc:
         print(f"Configuration error: {exc}")
         raise SystemExit(1) from None
+    if arguments.dry_run:
+        sys.stdout.write(content)
+        return
     print(f"Created {PROJECT_CONFIG_CONTEXT}")
 
 

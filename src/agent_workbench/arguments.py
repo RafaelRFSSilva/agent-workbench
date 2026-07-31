@@ -70,6 +70,7 @@ class CLIArguments:
     worktree_path: Path | None = None
     worktree_branch: str | None = None
     isolated: bool = False
+    dry_run: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -558,6 +559,11 @@ def _parse_init_arguments(argv: Sequence[str]) -> CLIArguments:
         action="store_true",
         help="Require explicit isolated-worktree options for coding.",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the project configuration without creating files.",
+    )
     parsed_arguments = parser.parse_args(argv)
     provider_name = cast(ProviderName, parsed_arguments.provider)
     model_name = parsed_arguments.model
@@ -570,6 +576,7 @@ def _parse_init_arguments(argv: Sequence[str]) -> CLIArguments:
         provider_name=provider_name,
         model_name=model_name,
         init=True,
+        dry_run=parsed_arguments.dry_run,
         agent_name=parsed_arguments.agent,
         max_tool_rounds=parsed_arguments.max_tool_rounds,
         temperature=parsed_arguments.temperature,
