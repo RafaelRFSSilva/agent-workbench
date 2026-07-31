@@ -1,5 +1,6 @@
 """Run one externally controlled deterministic coding workflow."""
 
+import json
 import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
@@ -276,6 +277,7 @@ class _ValidationFailureEvidence:
 
     tool_name: str
     result_status: str
+    command: tuple[str, ...] | None
     exit_code: int | None
     stdout_excerpt: str
     stderr_excerpt: str
@@ -1564,6 +1566,7 @@ def _bounded_validation_failure_evidence(
     for index, (tool_name, result) in enumerate(failed_validations):
         stdout = ""
         stderr = ""
+        command: tuple[str, ...] | None = None
         if isinstance(result.output, dict):
             raw_stdout = result.output.get("stdout")
             raw_stderr = result.output.get("stderr")
@@ -1571,6 +1574,13 @@ def _bounded_validation_failure_evidence(
                 stdout = _sanitize_validation_output(raw_stdout)
             if isinstance(raw_stderr, str):
                 stderr = _sanitize_validation_output(raw_stderr)
+            raw_command = result.output.get("command")
+            if (
+                isinstance(raw_command, list)
+                and raw_command
+                and all(isinstance(argument, str) for argument in raw_command)
+            ):
+                command = tuple(raw_command)
         if not stderr and result.error:
             stderr = _sanitize_validation_output(result.error)
 
@@ -1578,6 +1588,7 @@ def _bounded_validation_failure_evidence(
             _ValidationFailureEvidence(
                 tool_name=tool_name,
                 result_status=str(result.status),
+                command=command,
                 exit_code=_validation_exit_code(result.output),
                 stdout_excerpt="",
                 stderr_excerpt="",
@@ -1604,6 +1615,7 @@ def _bounded_validation_failure_evidence(
         evidence[evidence_index] = _ValidationFailureEvidence(
             tool_name=current.tool_name,
             result_status=current.result_status,
+            command=current.command,
             exit_code=current.exit_code,
             stdout_excerpt=(
                 excerpt if stream_name == "stdout" else current.stdout_excerpt
@@ -1637,10 +1649,20 @@ def _format_validation_failure_evidence(
     records = []
     for index, item in enumerate(evidence, start=1):
         exit_code = str(item.exit_code) if item.exit_code is not None else "unavailable"
+        command = (
+            json.dumps(
+                item.command,
+                ensure_ascii=True,
+                separators=(",", ":"),
+            )
+            if item.command is not None
+            else "[unavailable]"
+        )
         records.append(
             f"Validation failure {index}:\n"
             f"tool_name={item.tool_name}\n"
             f"result_status={item.result_status}\n"
+            f"command={command}\n"
             f"exit_code={exit_code}\n"
             "stdout_excerpt:\n"
             f"{item.stdout_excerpt or '[empty]'}\n"
