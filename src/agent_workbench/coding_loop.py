@@ -70,6 +70,7 @@ _WORKSPACE_CHANGE_TOOL_NAMES = frozenset(
         "apply_file_patch",
         "apply_file_rewrite",
         "apply_text_replacement",
+        "apply_line_range_replacement",
         "apply_workspace_changes",
     }
 )
@@ -95,6 +96,20 @@ _COMPLETE_FILE_REWRITE_GUIDANCE = (
     "construct a whole-file rewrite from a partial line-range read. Use the "
     "latest file SHA from that complete latest read. replacement_content must "
     "contain the complete resulting file."
+)
+_CONTROLLED_EDIT_SELECTION_GUIDANCE = (
+    "Controlled edit selection:\n"
+    "- Use exact-content replacement (apply_text_replacement) when the exact "
+    "current fragment is known and reasonably small.\n"
+    "- After inspecting the current file, use apply_line_range_replacement for "
+    "a known range, particularly in a large file. Lines are one-based and "
+    "inclusive; pass the exact current file SHA-256 from read_file.\n"
+    "- Never guess a hash or uninspected line numbers. Use apply_file_patch only "
+    "with complete exact current content or for creation, and apply_file_rewrite "
+    "only for a true whole-file change after a complete read. Never use a "
+    "whole-file rewrite to avoid an exact-content mismatch. Use "
+    "apply_workspace_changes only when changes must succeed together.\n"
+    "- Never weaken tests or validation."
 )
 _ABSOLUTE_PATH_PATTERN = re.compile(r"(?<![\w.])/(?:[^\s\x00]+)")
 _GENERIC_SENSITIVE_LINE_PATTERN = re.compile(
@@ -1497,6 +1512,7 @@ def _build_phase_prompt(
         f"{action_failure_section}\n\n"
         "Outstanding requirements:\n"
         f"{_numbered_lines(outstanding)}\n\n"
+        f"{_CONTROLLED_EDIT_SELECTION_GUIDANCE}\n\n"
         "Current attempt counters:\n"
         f"- Repair attempts: {state.repair_attempt_count}/"
         f"{state.limits.repair_attempts}\n"

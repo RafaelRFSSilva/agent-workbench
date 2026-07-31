@@ -1,6 +1,8 @@
 """Tests for AgentSession construction inside verified Git worktrees."""
 
 from dataclasses import FrozenInstanceError
+import hashlib
+import os
 from pathlib import Path
 import subprocess
 
@@ -179,6 +181,7 @@ def test_isolated_factory_preserves_exact_registry_order_and_freshness(
                 "apply_file_patch",
                 "apply_file_rewrite",
                 "apply_text_replacement",
+                "apply_line_range_replacement",
                 "apply_workspace_changes",
                 "run_ruff_format",
                 "run_ruff_check",
@@ -250,6 +253,67 @@ def test_read_write_and_git_tools_are_bound_only_to_isolated_worktree(
     assert diff.status == "success"
     assert "value = 'changed'" in diff.output["unstaged"]
     assert "source-only.txt" not in status.output["status"]
+
+
+def test_line_range_stale_handoff_preserves_source_head_and_index(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Reject isolated inode substitution without changing either Git state."""
+
+    source, handle = create_handle(tmp_path)
+    isolated = create_isolated_agent_session(
+        SessionId("stale-line-range"),
+        configuration(source, enable_actions=True),
+        handle,
+    )
+    registry = isolated.session.tool_registry
+    assert registry is not None
+    target = handle.worktree_path / "src" / "module.py"
+    original = target.read_bytes()
+    source_head = run_git(source, "rev-parse", "HEAD").stdout.strip()
+    isolated_head = run_git(handle.worktree_path, "rev-parse", "HEAD").stdout.strip()
+    index_path = Path(
+        run_git(handle.worktree_path, "rev-parse", "--git-path", "index").stdout.strip()
+    )
+    index_before = index_path.read_bytes()
+    invocation = ToolInvocation(
+        id="stale-line-range",
+        tool_name="apply_line_range_replacement",
+        arguments={
+            "path": "src/module.py",
+            "start_line": 1,
+            "end_line": 1,
+            "replacement_content": "value = 'changed'\n",
+            "expected_file_sha256": hashlib.sha256(original).hexdigest(),
+        },
+    )
+    registry.create_approval_request(invocation)
+
+    def substitute_during_handoff(_patch) -> None:
+        substitute = target.with_name("substitute.py")
+        substitute.write_bytes(original)
+        os.replace(substitute, target)
+
+    monkeypatch.setattr(
+        "agent_workbench.workspace_actions._before_atomic_replace_final_check",
+        substitute_during_handoff,
+    )
+
+    result = registry.execute(invocation)
+
+    assert result.status == "error"
+    assert result.error == "Tool execution failed."
+    assert target.read_bytes() == original
+    assert run_git(source, "rev-parse", "HEAD").stdout.strip() == source_head
+    assert (
+        run_git(handle.worktree_path, "rev-parse", "HEAD").stdout.strip()
+        == isolated_head
+    )
+    assert index_path.read_bytes() == index_before
+    assert run_git(source, "status", "--short").stdout == ""
+    assert run_git(handle.worktree_path, "status", "--short").stdout == ""
+    assert list(handle.worktree_path.glob(".agent-workbench-patch-*")) == []
 
 
 def test_source_relative_context_is_reloaded_from_isolated_worktree(

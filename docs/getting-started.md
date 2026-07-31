@@ -605,13 +605,14 @@ six read-only workspace tools:
 1. `apply_file_patch`
 2. `apply_file_rewrite`
 3. `apply_text_replacement`
-4. `apply_workspace_changes`
-5. `run_ruff_format`
-6. `run_ruff_check`
-7. `run_pytest`
+4. `apply_line_range_replacement`
+5. `apply_workspace_changes`
+6. `run_ruff_format`
+7. `run_ruff_check`
+8. `run_pytest`
 
 When the calculator is also enabled it remains first, followed by the six
-read-only tools and these seven actions.
+read-only tools and these eight actions.
 
 Every action displays an informed preview and asks:
 
@@ -674,6 +675,26 @@ complete unified diff before approval. Execution then rereads and revalidates
 the file before reusing the same atomic update and permission-preservation
 boundary as `apply_file_patch`.
 
+Use `apply_line_range_replacement` after inspecting a known range, especially
+in a large existing file. Its exact closed input shape is:
+
+```json
+{
+  "path": "relative/path.py",
+  "start_line": 120,
+  "end_line": 124,
+  "replacement_content": "exact replacement for the selected lines",
+  "expected_file_sha256": "sha256 from the latest read_file result"
+}
+```
+
+Lines are one-based and inclusive. Every field is required and the complete
+current file SHA-256 must match. The action rejects additional fields, invalid
+or out-of-range coordinates, stale hashes, fuzzy matching, and automatic
+fallback to a whole-file rewrite. It preserves surrounding content, shows the
+complete unified diff, and revalidates before atomic replacement. Never guess
+the hash or line numbers; inspect the current file first.
+
 Use `apply_workspace_changes` when several creations or updates must succeed
 together. Its exact closed input shape is:
 
@@ -734,14 +755,17 @@ deletes unexpected paths; the workspace remains available for manual recovery.
 Suggested request:
 
 ```text
-Inspect the relevant files. Prefer apply_text_replacement for small exact
-edits to existing files. Before a whole-file change, call read_file for the
-complete file, then use apply_file_rewrite with that complete read's SHA and
-the complete resulting file. For changes that must succeed together, request
-one apply_workspace_changes transaction with complete expected and replacement
-content for every file. Request approval before every write or validation
-action, run Ruff and pytest, inspect the final Git status and diff, and
-summarize the result. Do not commit or push.
+Inspect the relevant files. Use apply_text_replacement when the exact current
+fragment is known and reasonably small. After inspection, use
+apply_line_range_replacement for a known one-based inclusive range,
+particularly in a large file, with the exact current read_file SHA-256. Never
+guess a hash or uninspected line numbers. Before a true whole-file change, call
+read_file for the complete file, then use apply_file_rewrite with that read's
+SHA and the complete resulting file; never use it to avoid an exact-content
+mismatch. Use apply_workspace_changes when changes must succeed together.
+Request approval before every write or validation action, run Ruff and pytest,
+inspect the final Git status and diff, and summarize the result. Never weaken
+tests or validation. Do not commit or push.
 ```
 
 ## Run a Controlled Workflow in an Isolated Worktree

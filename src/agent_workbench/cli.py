@@ -2,6 +2,7 @@
 
 import json
 import sys
+import unicodedata
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -623,8 +624,21 @@ def _prompt_for_tool_approval(
         "apply_file_patch",
         "apply_file_rewrite",
         "apply_text_replacement",
+        "apply_line_range_replacement",
     } and isinstance(preview, dict):
-        print(f"  Path: {preview.get('path', '[unavailable]')}")
+        path, path_was_escaped = _render_terminal_safe_text(
+            preview.get("path"),
+            allow_newlines=False,
+            allow_tabs=False,
+        )
+        diff, diff_was_escaped = _render_terminal_safe_text(
+            preview.get("diff"),
+            allow_newlines=True,
+            allow_tabs=True,
+        )
+        if path_was_escaped or diff_was_escaped:
+            print("  Note: Terminal control characters are shown as escaped text.")
+        print(f"  Path: {path}")
         print(f"  Operation: {preview.get('operation', '[unavailable]')}")
         print(
             "  Bytes: "
@@ -637,9 +651,14 @@ def _prompt_for_tool_approval(
                 "  Literal occurrences: "
                 f"{preview.get('occurrences_replaced', '[unavailable]')}"
             )
+        elif tool_name == "apply_line_range_replacement":
+            print(
+                "  Selected line range: "
+                f"{preview.get('start_line', '[unavailable]')}–"
+                f"{preview.get('end_line', '[unavailable]')}"
+            )
         print("  Complete diff:")
-        diff = preview.get("diff")
-        print(diff if isinstance(diff, str) else "[unavailable]")
+        print(diff)
     elif tool_name == "apply_workspace_changes" and isinstance(preview, dict):
         print("  Transactional workspace change")
         print(f"  Files: {preview.get('operation_count', '[unavailable]')}")
@@ -656,7 +675,21 @@ def _prompt_for_tool_approval(
                 if not isinstance(change, dict):
                     print("  Change: [unavailable]")
                     continue
-                print(f"  Path: {change.get('path', '[unavailable]')}")
+                path, path_was_escaped = _render_terminal_safe_text(
+                    change.get("path"),
+                    allow_newlines=False,
+                    allow_tabs=False,
+                )
+                diff, diff_was_escaped = _render_terminal_safe_text(
+                    change.get("diff"),
+                    allow_newlines=True,
+                    allow_tabs=True,
+                )
+                if path_was_escaped or diff_was_escaped:
+                    print(
+                        "  Note: Terminal control characters are shown as escaped text."
+                    )
+                print(f"  Path: {path}")
                 print(f"    Operation: {change.get('operation', '[unavailable]')}")
                 print(
                     "    Bytes: "
@@ -667,8 +700,7 @@ def _prompt_for_tool_approval(
                     f"    Changed lines: {change.get('changed_lines', '[unavailable]')}"
                 )
                 print("    Complete diff:")
-                diff = change.get("diff")
-                print(diff if isinstance(diff, str) else "[unavailable]")
+                print(diff)
         else:
             print("  Changes: [unavailable]")
         print("  Rollback covers handled in-process failures when rollback succeeds.")
@@ -710,6 +742,55 @@ def _prompt_for_tool_approval(
         return ToolApprovalDecision.APPROVE
 
     return ToolApprovalDecision.DENY
+
+
+def _render_terminal_safe_text(
+    value: object,
+    *,
+    allow_newlines: bool,
+    allow_tabs: bool,
+) -> tuple[str, bool]:
+    """Render untrusted text without executable terminal control characters."""
+
+    if not isinstance(value, str):
+        return "[unavailable]", False
+
+    rendered: list[str] = []
+    was_escaped = False
+    index = 0
+    while index < len(value):
+        character = value[index]
+        codepoint = ord(character)
+        if (
+            character == "\r"
+            and allow_newlines
+            and index + 1 < len(value)
+            and value[index + 1] == "\n"
+        ):
+            rendered.append("\n")
+            was_escaped = True
+            index += 2
+            continue
+        if character == "\n" and allow_newlines:
+            rendered.append(character)
+        elif character == "\t" and allow_tabs:
+            rendered.append(character)
+        elif codepoint < 0x20 or codepoint == 0x7F:
+            rendered.append(f"\\x{codepoint:02x}")
+            was_escaped = True
+        elif 0x80 <= codepoint <= 0x9F:
+            rendered.append(f"\\u{codepoint:04x}")
+            was_escaped = True
+        elif unicodedata.category(character) in {"Cf", "Zl", "Zp"}:
+            rendered.append(
+                f"\\u{codepoint:04x}" if codepoint <= 0xFFFF else f"\\U{codepoint:08x}"
+            )
+            was_escaped = True
+        else:
+            rendered.append(character)
+        index += 1
+
+    return "".join(rendered), was_escaped
 
 
 def _display_approved_action_completion(
@@ -782,6 +863,19 @@ def _trace_arguments(invocation) -> object:
             ),
             "replacement_text_bytes": _utf8_byte_count(
                 arguments.get("replacement_text"),
+            ),
+            "expected_file_sha256_present": isinstance(
+                arguments.get("expected_file_sha256"),
+                str,
+            ),
+        }
+    if invocation.tool_name == "apply_line_range_replacement":
+        return {
+            "path": arguments.get("path"),
+            "start_line": arguments.get("start_line"),
+            "end_line": arguments.get("end_line"),
+            "replacement_content_bytes": _utf8_byte_count(
+                arguments.get("replacement_content"),
             ),
             "expected_file_sha256_present": isinstance(
                 arguments.get("expected_file_sha256"),

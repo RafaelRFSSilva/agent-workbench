@@ -20,6 +20,7 @@ from agent_workbench.workspace import Workspace
 from agent_workbench.workspace_actions import (
     APPLY_FILE_PATCH_DEFINITION,
     APPLY_FILE_REWRITE_DEFINITION,
+    APPLY_LINE_RANGE_REPLACEMENT_DEFINITION,
     APPLY_TEXT_REPLACEMENT_DEFINITION,
     APPLY_WORKSPACE_CHANGES_DEFINITION,
     MAX_CHANGED_LINES,
@@ -32,10 +33,12 @@ from agent_workbench.workspace_actions import (
     MAX_TRANSACTION_REPLACEMENT_BYTES,
     apply_file_patch,
     apply_file_rewrite,
+    apply_line_range_replacement,
     apply_text_replacement,
     apply_workspace_changes,
     preview_file_patch,
     preview_file_rewrite,
+    preview_line_range_replacement,
     preview_text_replacement,
     preview_workspace_changes,
     register_workspace_action_tools,
@@ -128,6 +131,30 @@ def file_rewrite_arguments(
     }
 
 
+def line_range_replacement_arguments(
+    *,
+    path: str = "module.py",
+    start_line: int = 1,
+    end_line: int = 1,
+    replacement: str = "value = 2\n",
+    file_content: str = "value = 1\n",
+    expected_sha256: str | None = None,
+) -> dict[str, object]:
+    """Create one valid SHA-guarded line-range replacement mapping."""
+
+    return {
+        "path": path,
+        "start_line": start_line,
+        "end_line": end_line,
+        "replacement_content": replacement,
+        "expected_file_sha256": (
+            expected_sha256
+            if expected_sha256 is not None
+            else hashlib.sha256(file_content.encode("utf-8")).hexdigest()
+        ),
+    }
+
+
 def transaction_arguments(
     *changes: dict[str, object],
 ) -> dict[str, object]:
@@ -209,6 +236,46 @@ def invoke_text_replacement(
     )
 
 
+def invoke_line_range_replacement(
+    registry: ToolRegistry,
+    arguments: dict[str, object],
+    *,
+    decision: ToolApprovalDecision | None,
+    before_approval=None,
+) -> None:
+    """Run one line-range replacement through the provider-independent loop."""
+
+    provider = FakeProvider(
+        [
+            ChatResponse(
+                text="",
+                tool_invocations=(
+                    ToolInvocation(
+                        id="line-range-1",
+                        tool_name="apply_line_range_replacement",
+                        arguments=arguments,
+                    ),
+                ),
+            ),
+            ChatResponse(text="Done."),
+        ]
+    )
+
+    def decide(request):
+        if before_approval is not None:
+            before_approval()
+        assert decision is not None
+        return decision
+
+    run_tool_calling_loop(
+        provider,
+        ChatRequest(messages=[]),
+        registry,
+        max_tool_rounds=1,
+        tool_approval_handler=None if decision is None else decide,
+    )
+
+
 def test_registration_preserves_existing_tools_and_exact_definition(
     tmp_path: Path,
 ) -> None:
@@ -234,12 +301,13 @@ def test_registration_preserves_existing_tools_and_exact_definition(
         APPLY_FILE_PATCH_DEFINITION,
         APPLY_FILE_REWRITE_DEFINITION,
         APPLY_TEXT_REPLACEMENT_DEFINITION,
+        APPLY_LINE_RANGE_REPLACEMENT_DEFINITION,
         APPLY_WORKSPACE_CHANGES_DEFINITION,
     )
     assert APPLY_FILE_PATCH_DEFINITION.name == "apply_file_patch"
     assert APPLY_FILE_PATCH_DEFINITION.description == (
         "Apply one approved optimistic UTF-8 file patch inside the authorized "
-        "workspace."
+        "workspace when complete exact current content is known or creating a file."
     )
     assert APPLY_FILE_PATCH_DEFINITION.input_schema == {
         "type": "object",
@@ -257,6 +325,34 @@ def test_registration_preserves_existing_tools_and_exact_definition(
             id="patch",
             tool_name="apply_file_patch",
             arguments=patch_arguments(),
+        )
+    )
+    assert APPLY_LINE_RANGE_REPLACEMENT_DEFINITION.input_schema == {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string"},
+            "start_line": {"type": "integer", "minimum": 1},
+            "end_line": {"type": "integer", "minimum": 1},
+            "replacement_content": {"type": "string"},
+            "expected_file_sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$",
+            },
+        },
+        "required": [
+            "path",
+            "start_line",
+            "end_line",
+            "replacement_content",
+            "expected_file_sha256",
+        ],
+        "additionalProperties": False,
+    }
+    assert registry.requires_approval(
+        ToolInvocation(
+            id="line-range",
+            tool_name="apply_line_range_replacement",
+            arguments=line_range_replacement_arguments(),
         )
     )
     assert APPLY_FILE_REWRITE_DEFINITION.name == "apply_file_rewrite"
@@ -286,8 +382,8 @@ def test_registration_preserves_existing_tools_and_exact_definition(
     )
     assert APPLY_TEXT_REPLACEMENT_DEFINITION.name == "apply_text_replacement"
     assert APPLY_TEXT_REPLACEMENT_DEFINITION.description == (
-        "Replace a bounded exact literal text fragment in one existing UTF-8 "
-        "file using the SHA-256 digest from read_file."
+        "Replace a reasonably small exact current literal fragment in one "
+        "existing UTF-8 file using the exact SHA-256 from read_file."
     )
     assert APPLY_TEXT_REPLACEMENT_DEFINITION.input_schema == {
         "type": "object",
@@ -321,6 +417,48 @@ def test_registration_preserves_existing_tools_and_exact_definition(
             arguments=text_replacement_arguments(),
         )
     )
+
+
+def test_line_range_model_contract_documents_range_and_required_sha(
+    tmp_path: Path,
+) -> None:
+    """Expose one closed model-facing schema with explicit line semantics."""
+
+    root, workspace = create_workspace(tmp_path)
+    target = root / "module.py"
+    target.write_text("old\n", encoding="utf-8")
+    registry = ToolRegistry()
+    register_workspace_action_tools(registry, workspace)
+    schema = APPLY_LINE_RANGE_REPLACEMENT_DEFINITION.input_schema
+
+    assert "one-based inclusive" in (
+        APPLY_LINE_RANGE_REPLACEMENT_DEFINITION.description
+    )
+    assert "SHA-256" in APPLY_LINE_RANGE_REPLACEMENT_DEFINITION.description
+    assert schema["required"] == [
+        "path",
+        "start_line",
+        "end_line",
+        "replacement_content",
+        "expected_file_sha256",
+    ]
+    assert schema["additionalProperties"] is False
+
+    invalid = ToolInvocation(
+        id="unsupported-line-range",
+        tool_name="apply_line_range_replacement",
+        arguments={
+            **line_range_replacement_arguments(file_content="old\n"),
+            "expected_content": "old\n",
+        },
+    )
+    validation_error = registry.argument_validation_error(invalid)
+    assert validation_error is not None
+    assert "1 unsupported field" in validation_error
+    assert "additional fields are not allowed" in validation_error
+    with pytest.raises(CompletionError, match="argument validation failed"):
+        registry.create_approval_request(invalid)
+    assert target.read_text(encoding="utf-8") == "old\n"
 
 
 @pytest.mark.parametrize(
@@ -1035,6 +1173,38 @@ def test_content_size_and_changed_line_limits(tmp_path: Path) -> None:
             preview_file_patch(workspace, arguments)
 
 
+@pytest.mark.parametrize(
+    ("original", "replacement"),
+    [("value\r\n", "value\n"), ("value\n", "value\r\n")],
+)
+def test_patch_and_rewrite_count_line_ending_only_changes(
+    tmp_path: Path,
+    original: str,
+    replacement: str,
+) -> None:
+    """Use line-terminator-aware accounting in patch and rewrite previews."""
+
+    root, workspace = create_workspace(tmp_path)
+    target = root / "module.py"
+    target.write_bytes(original.encode("utf-8"))
+
+    patch_preview = preview_file_patch(
+        workspace,
+        patch_arguments(expected=original, replacement=replacement),
+    )
+    rewrite_preview = preview_file_rewrite(
+        workspace,
+        file_rewrite_arguments(
+            file_content=original,
+            replacement=replacement,
+        ),
+    )
+
+    assert patch_preview["changed_lines"] == 2
+    assert rewrite_preview["changed_lines"] == 2
+    assert target.read_bytes() == original.encode("utf-8")
+
+
 def test_complete_preview_size_limit_rejects_instead_of_truncating(
     tmp_path: Path,
     monkeypatch,
@@ -1568,6 +1738,604 @@ def test_text_replacement_rechecks_complete_content_after_approval(
     assert target.read_text(encoding="utf-8") == "concurrent\n"
 
 
+@pytest.mark.parametrize(
+    ("original", "start_line", "end_line", "replacement", "expected"),
+    [
+        ("old\nkeep\n", 1, 1, "new\n", "new\nkeep\n"),
+        ("one\ntwo\nthree\nfour\n", 2, 3, "middle\n", "one\nmiddle\nfour\n"),
+        ("first\nlast", 2, 2, "final", "first\nfinal"),
+        (
+            "before\nreplace\nafter\n",
+            2,
+            2,
+            "new one\nnew two\n",
+            "before\nnew one\nnew two\nafter\n",
+        ),
+    ],
+)
+def test_line_range_replacement_applies_exact_inclusive_range(
+    tmp_path: Path,
+    original: str,
+    start_line: int,
+    end_line: int,
+    replacement: str,
+    expected: str,
+) -> None:
+    """Replace one or more complete lines without changing surrounding bytes."""
+
+    root, workspace = create_workspace(tmp_path)
+    target = root / "module.py"
+    target.write_text(original, encoding="utf-8", newline="")
+    target.chmod(0o640)
+
+    result = apply_line_range_replacement(
+        workspace,
+        line_range_replacement_arguments(
+            start_line=start_line,
+            end_line=end_line,
+            replacement=replacement,
+            file_content=original,
+        ),
+    )
+
+    assert result["path"] == "module.py"
+    assert result["operation"] == "update"
+    assert result["start_line"] == start_line
+    assert result["end_line"] == end_line
+    assert "diff" not in result
+    assert target.read_bytes() == expected.encode("utf-8")
+    assert stat.S_IMODE(target.stat().st_mode) == 0o640
+    assert list(root.glob(".agent-workbench-patch-*")) == []
+
+
+def test_line_range_replacement_changes_middle_of_large_file_only(
+    tmp_path: Path,
+) -> None:
+    """Splice a known middle range without rewriting either surrounding region."""
+
+    root, workspace = create_workspace(tmp_path)
+    lines = [f"line {index:04d}\r\n" for index in range(1, 2_001)]
+    original = "".join(lines)
+    target = root / "large.txt"
+    target.write_bytes(original.encode("utf-8"))
+
+    apply_line_range_replacement(
+        workspace,
+        line_range_replacement_arguments(
+            path="large.txt",
+            start_line=1_000,
+            end_line=1_001,
+            replacement="replacement a\r\nreplacement b\r\n",
+            file_content=original,
+        ),
+    )
+
+    expected = (
+        "".join(lines[:999])
+        + "replacement a\r\nreplacement b\r\n"
+        + "".join(lines[1_001:])
+    ).encode("utf-8")
+    assert target.read_bytes() == expected
+
+
+def test_line_range_replacement_preview_is_complete_and_non_mutating(
+    tmp_path: Path,
+) -> None:
+    """Show exact range, byte counts, changed lines, and the complete diff."""
+
+    root, workspace = create_workspace(tmp_path)
+    original = "first\nold one\nold two\nlast\n"
+    target = root / "src" / "module.py"
+    target.parent.mkdir()
+    target.write_text(original, encoding="utf-8")
+
+    preview = preview_line_range_replacement(
+        workspace,
+        line_range_replacement_arguments(
+            path="src/./module.py",
+            start_line=2,
+            end_line=3,
+            replacement="new one\nnew two\n",
+            file_content=original,
+        ),
+    )
+
+    assert preview == {
+        "path": "src/module.py",
+        "operation": "update",
+        "old_size_bytes": 27,
+        "new_size_bytes": 27,
+        "changed_lines": 4,
+        "start_line": 2,
+        "end_line": 3,
+        "diff": (
+            "--- a/src/module.py\n"
+            "+++ b/src/module.py\n"
+            "@@ -1,4 +1,4 @@\n"
+            " first\n"
+            "-old one\n"
+            "-old two\n"
+            "+new one\n"
+            "+new two\n"
+            " last\n"
+        ),
+    }
+    assert target.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        (
+            {"path": "module.py"},
+            "requires path, start_line, end_line, replacement_content",
+        ),
+        (
+            {
+                **line_range_replacement_arguments(),
+                "unsupported": True,
+            },
+            "requires path, start_line, end_line, replacement_content",
+        ),
+        (
+            line_range_replacement_arguments(start_line=0),
+            "start_line must be an integer greater than or equal to 1",
+        ),
+        (
+            line_range_replacement_arguments(start_line=2, end_line=1),
+            "end_line must be greater than or equal to start_line",
+        ),
+        (
+            line_range_replacement_arguments(expected_sha256="INVALID"),
+            "64 lowercase hexadecimal",
+        ),
+    ],
+)
+def test_line_range_replacement_rejects_invalid_arguments_without_writing(
+    tmp_path: Path,
+    arguments: dict[str, object],
+    message: str,
+) -> None:
+    """Reject invalid ranges, hashes, and closed-schema violations."""
+
+    root, workspace = create_workspace(tmp_path)
+    target = root / "module.py"
+    target.write_text("value = 1\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        preview_line_range_replacement(workspace, arguments)
+
+    assert target.read_text(encoding="utf-8") == "value = 1\n"
+
+
+def test_line_range_replacement_rejects_range_beyond_file(tmp_path: Path) -> None:
+    """Reject an inclusive end line outside the current exact file."""
+
+    root, workspace = create_workspace(tmp_path)
+    target = root / "module.py"
+    target.write_text("one\ntwo\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="line range exceeds the current file"):
+        preview_line_range_replacement(
+            workspace,
+            line_range_replacement_arguments(
+                start_line=2,
+                end_line=3,
+                file_content="one\ntwo\n",
+            ),
+        )
+
+    assert target.read_text(encoding="utf-8") == "one\ntwo\n"
+
+
+@pytest.mark.parametrize(
+    ("path", "message"),
+    [
+        ("missing.py", "target does not exist"),
+        ("directory", "requires a regular file"),
+        ("external.py", "does not allow symlink paths"),
+        ("/outside.py", "path must be relative"),
+        ("../outside.py", "path must not contain traversal"),
+        ("binary.py", "requires valid UTF-8"),
+    ],
+)
+def test_line_range_replacement_reuses_safe_existing_file_boundary(
+    tmp_path: Path,
+    path: str,
+    message: str,
+) -> None:
+    """Reject missing, directory, symlink, escape, and invalid UTF-8 targets."""
+
+    root, workspace = create_workspace(tmp_path)
+    outside = tmp_path / "outside.py"
+    outside.write_text("old\n", encoding="utf-8")
+    (root / "external.py").symlink_to(outside)
+    (root / "directory").mkdir()
+    (root / "binary.py").write_bytes(b"\xff")
+
+    with pytest.raises(ValueError, match=message):
+        preview_line_range_replacement(
+            workspace,
+            line_range_replacement_arguments(
+                path=path,
+                expected_sha256=(
+                    hashlib.sha256(b"\xff").hexdigest() if path == "binary.py" else None
+                ),
+            ),
+        )
+
+    assert outside.read_text(encoding="utf-8") == "old\n"
+
+
+def test_line_range_replacement_rejects_stale_sha_without_writing(
+    tmp_path: Path,
+) -> None:
+    """Require the exact current complete-file SHA before preview and apply."""
+
+    root, workspace = create_workspace(tmp_path)
+    target = root / "module.py"
+    target.write_text("old\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="expected_file_sha256 does not match"):
+        preview_line_range_replacement(
+            workspace,
+            line_range_replacement_arguments(expected_sha256="0" * 64),
+        )
+
+    assert target.read_text(encoding="utf-8") == "old\n"
+
+
+def test_line_range_replacement_enforces_file_changed_line_and_preview_limits(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Bound replacement content, resulting file, changed lines, and preview."""
+
+    root, workspace = create_workspace(tmp_path)
+    target = root / "module.py"
+    target.write_text("old\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="replacement_content exceeds"):
+        preview_line_range_replacement(
+            workspace,
+            line_range_replacement_arguments(
+                replacement="x" * (MAX_PATCH_CONTENT_BYTES + 1),
+                file_content="old\n",
+            ),
+        )
+
+    monkeypatch.setattr("agent_workbench.workspace_actions.MAX_CHANGED_LINES", 1)
+    with pytest.raises(ValueError, match="changed-line"):
+        preview_line_range_replacement(
+            workspace,
+            line_range_replacement_arguments(file_content="old\n"),
+        )
+
+    monkeypatch.setattr(
+        "agent_workbench.workspace_actions.MAX_CHANGED_LINES", MAX_CHANGED_LINES
+    )
+    monkeypatch.setattr("agent_workbench.workspace_actions.MAX_PATCH_PREVIEW_BYTES", 8)
+    with pytest.raises(ValueError, match="preview"):
+        preview_line_range_replacement(
+            workspace,
+            line_range_replacement_arguments(file_content="old\n"),
+        )
+
+    assert target.read_text(encoding="utf-8") == "old\n"
+
+
+def test_line_range_replacement_enforces_real_file_and_500_changed_line_limits(
+    tmp_path: Path,
+) -> None:
+    """Preserve the shared 100 KiB file and 500 changed-line boundaries."""
+
+    root, workspace = create_workspace(tmp_path)
+    target = root / "module.py"
+    oversized = b"x" * (MAX_PATCH_CONTENT_BYTES + 1)
+    target.write_bytes(oversized)
+
+    with pytest.raises(ValueError, match="workspace file exceeds"):
+        preview_line_range_replacement(
+            workspace,
+            line_range_replacement_arguments(
+                expected_sha256=hashlib.sha256(oversized).hexdigest()
+            ),
+        )
+
+    original = "".join(f"old {index}\n" for index in range(251))
+    replacement = "".join(f"new {index}\n" for index in range(251))
+    target.write_text(original, encoding="utf-8")
+    with pytest.raises(ValueError, match="500-changed-line limit"):
+        preview_line_range_replacement(
+            workspace,
+            line_range_replacement_arguments(
+                start_line=1,
+                end_line=251,
+                replacement=replacement,
+                file_content=original,
+            ),
+        )
+
+    assert target.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.parametrize(
+    ("old_ending", "new_ending"),
+    [("\r\n", "\n"), ("\n", "\r\n")],
+)
+def test_line_range_replacement_counts_and_limits_line_ending_only_changes(
+    tmp_path: Path,
+    old_ending: str,
+    new_ending: str,
+) -> None:
+    """Report bounded terminator changes and reject 501-line conversions."""
+
+    root, workspace = create_workspace(tmp_path)
+    target = root / "module.py"
+    bounded_original = "".join(f"line {index}{old_ending}" for index in range(3))
+    bounded_replacement = "".join(f"line {index}{new_ending}" for index in range(3))
+    target.write_bytes(bounded_original.encode("utf-8"))
+
+    preview = preview_line_range_replacement(
+        workspace,
+        line_range_replacement_arguments(
+            start_line=1,
+            end_line=3,
+            replacement=bounded_replacement,
+            file_content=bounded_original,
+        ),
+    )
+
+    assert preview["changed_lines"] == 6
+    assert target.read_bytes() == bounded_original.encode("utf-8")
+
+    broad_original = "".join(f"line {index}{old_ending}" for index in range(501))
+    broad_replacement = "".join(f"line {index}{new_ending}" for index in range(501))
+    target.write_bytes(broad_original.encode("utf-8"))
+
+    with pytest.raises(
+        ValueError,
+        match=r"^line-range replacement exceeds the 500-changed-line limit\.$",
+    ):
+        preview_line_range_replacement(
+            workspace,
+            line_range_replacement_arguments(
+                start_line=1,
+                end_line=501,
+                replacement=broad_replacement,
+                file_content=broad_original,
+            ),
+        )
+
+    assert target.read_bytes() == broad_original.encode("utf-8")
+
+
+@pytest.mark.parametrize("decision", [None, ToolApprovalDecision.DENY])
+def test_line_range_replacement_missing_or_denied_approval_never_writes(
+    tmp_path: Path,
+    decision: ToolApprovalDecision | None,
+) -> None:
+    """Keep the exact target unchanged unless its complete preview is approved."""
+
+    root, workspace = create_workspace(tmp_path)
+    target = root / "module.py"
+    target.write_text("old\n", encoding="utf-8")
+    registry = ToolRegistry()
+    register_workspace_action_tools(registry, workspace)
+
+    with pytest.raises(CompletionError):
+        invoke_line_range_replacement(
+            registry,
+            line_range_replacement_arguments(file_content="old\n"),
+            decision=decision,
+        )
+
+    assert target.read_text(encoding="utf-8") == "old\n"
+
+
+def test_line_range_replacement_preview_failure_never_requests_or_writes(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Fail closed when the complete approval preview cannot be produced."""
+
+    root, workspace = create_workspace(tmp_path)
+    target = root / "module.py"
+    target.write_text("old\n", encoding="utf-8")
+    registry = ToolRegistry()
+    register_workspace_action_tools(registry, workspace)
+    monkeypatch.setattr("agent_workbench.workspace_actions.MAX_PATCH_PREVIEW_BYTES", 8)
+
+    with pytest.raises(CompletionError, match="Approval preview failed"):
+        invoke_line_range_replacement(
+            registry,
+            line_range_replacement_arguments(file_content="old\n"),
+            decision=ToolApprovalDecision.APPROVE,
+        )
+
+    assert target.read_text(encoding="utf-8") == "old\n"
+
+
+def test_line_range_replacement_successful_approval_mutates_once(
+    tmp_path: Path,
+) -> None:
+    """Apply the exact previewed line range after one explicit approval."""
+
+    root, workspace = create_workspace(tmp_path)
+    target = root / "module.py"
+    target.write_text("before\nold\nafter\n", encoding="utf-8")
+    registry = ToolRegistry()
+    register_workspace_action_tools(registry, workspace)
+
+    invoke_line_range_replacement(
+        registry,
+        line_range_replacement_arguments(
+            start_line=2,
+            end_line=2,
+            replacement="new\n",
+            file_content="before\nold\nafter\n",
+        ),
+        decision=ToolApprovalDecision.APPROVE,
+    )
+
+    assert target.read_text(encoding="utf-8") == "before\nnew\nafter\n"
+
+
+def test_line_range_replacement_approved_action_rechecks_stale_file(
+    tmp_path: Path,
+) -> None:
+    """Revalidate the exact approved file immediately before atomic mutation."""
+
+    root, workspace = create_workspace(tmp_path)
+    target = root / "module.py"
+    target.write_text("old\n", encoding="utf-8")
+    registry = ToolRegistry()
+    register_workspace_action_tools(registry, workspace)
+
+    invoke_line_range_replacement(
+        registry,
+        line_range_replacement_arguments(file_content="old\n"),
+        decision=ToolApprovalDecision.APPROVE,
+        before_approval=lambda: target.write_text("concurrent\n", encoding="utf-8"),
+    )
+
+    assert target.read_text(encoding="utf-8") == "concurrent\n"
+
+
+@pytest.mark.parametrize(
+    "change_kind",
+    ["content", "identical-inode", "chmod", "symlink", "deletion"],
+)
+def test_line_range_approved_snapshot_rejects_identity_and_metadata_changes(
+    tmp_path: Path,
+    change_kind: str,
+) -> None:
+    """Bind approval to exact bytes, inode, mode, timestamps, and file type."""
+
+    root, workspace = create_workspace(tmp_path)
+    target = root / "module.py"
+    target.write_bytes(b"old\n")
+    target.chmod(0o640)
+    original_inode = target.stat().st_ino
+    outside = tmp_path / "outside.py"
+    outside.write_bytes(b"outside\n")
+    registry = ToolRegistry()
+    register_workspace_action_tools(registry, workspace)
+
+    def change_approved_target() -> None:
+        if change_kind == "content":
+            target.write_bytes(b"concurrent\n")
+        elif change_kind == "identical-inode":
+            substitute = root / "substitute.py"
+            substitute.write_bytes(b"old\n")
+            substitute.chmod(0o640)
+            os.replace(substitute, target)
+            assert target.stat().st_ino != original_inode
+        elif change_kind == "chmod":
+            target.chmod(0o600)
+        elif change_kind == "symlink":
+            target.unlink()
+            target.symlink_to(outside)
+        else:
+            target.unlink()
+
+    invoke_line_range_replacement(
+        registry,
+        line_range_replacement_arguments(file_content="old\n"),
+        decision=ToolApprovalDecision.APPROVE,
+        before_approval=change_approved_target,
+    )
+
+    if change_kind == "content":
+        assert target.read_bytes() == b"concurrent\n"
+    elif change_kind == "identical-inode":
+        assert target.read_bytes() == b"old\n"
+        assert target.stat().st_ino != original_inode
+    elif change_kind == "chmod":
+        assert target.read_bytes() == b"old\n"
+        assert stat.S_IMODE(target.stat().st_mode) == 0o600
+    elif change_kind == "symlink":
+        assert target.is_symlink()
+        assert outside.read_bytes() == b"outside\n"
+    else:
+        assert not target.exists()
+    assert list(root.glob(".agent-workbench-patch-*")) == []
+
+
+@pytest.mark.parametrize("change_kind", ["content", "identical-inode"])
+def test_line_range_final_handoff_rejects_descriptor_and_path_changes(
+    tmp_path: Path,
+    monkeypatch,
+    change_kind: str,
+) -> None:
+    """Reject deterministic changes after the initial final-handoff read."""
+
+    root, workspace = create_workspace(tmp_path)
+    target = root / "module.py"
+    target.write_bytes(b"old\n")
+    target.chmod(0o640)
+    original_inode = target.stat().st_ino
+
+    def change_during_handoff(_patch) -> None:
+        if change_kind == "content":
+            target.write_bytes(b"concurrent\n")
+        else:
+            substitute = root / "substitute.py"
+            substitute.write_bytes(b"old\n")
+            substitute.chmod(0o640)
+            os.replace(substitute, target)
+            assert target.stat().st_ino != original_inode
+
+    monkeypatch.setattr(
+        "agent_workbench.workspace_actions._before_atomic_replace_final_check",
+        change_during_handoff,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"^apply_file_patch target changed before replacement\.$",
+    ):
+        apply_line_range_replacement(
+            workspace,
+            line_range_replacement_arguments(file_content="old\n"),
+        )
+
+    if change_kind == "content":
+        assert target.read_bytes() == b"concurrent\n"
+    else:
+        assert target.read_bytes() == b"old\n"
+        assert target.stat().st_ino != original_inode
+    assert list(root.glob(".agent-workbench-patch-*")) == []
+
+
+def test_line_range_final_handoff_unchanged_target_succeeds(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Keep the target descriptor open through a successful final check."""
+
+    root, workspace = create_workspace(tmp_path)
+    target = root / "module.py"
+    target.write_bytes(b"old\n")
+    target.chmod(0o751)
+    checks = []
+    monkeypatch.setattr(
+        "agent_workbench.workspace_actions._before_atomic_replace_final_check",
+        lambda patch: checks.append(patch.relative_path),
+    )
+
+    result = apply_line_range_replacement(
+        workspace,
+        line_range_replacement_arguments(file_content="old\n"),
+    )
+
+    assert result["path"] == "module.py"
+    assert checks == ["module.py"]
+    assert target.read_bytes() == b"value = 2\n"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o751
+    assert list(root.glob(".agent-workbench-patch-*")) == []
+
+
 def test_transaction_registration_uses_exact_closed_nested_schema(
     tmp_path: Path,
 ) -> None:
@@ -1582,6 +2350,7 @@ def test_transaction_registration_uses_exact_closed_nested_schema(
         APPLY_FILE_PATCH_DEFINITION,
         APPLY_FILE_REWRITE_DEFINITION,
         APPLY_TEXT_REPLACEMENT_DEFINITION,
+        APPLY_LINE_RANGE_REPLACEMENT_DEFINITION,
         APPLY_WORKSPACE_CHANGES_DEFINITION,
     )
     assert APPLY_WORKSPACE_CHANGES_DEFINITION.name == "apply_workspace_changes"

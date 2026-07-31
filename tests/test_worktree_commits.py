@@ -77,6 +77,27 @@ def create_isolated_worktree(
     return source, handle
 
 
+def create_isolated_worktree_with_tracked_content(
+    tmp_path: Path,
+    content: bytes,
+) -> tuple[Path, WorktreeHandle]:
+    """Create an isolated worktree with exact committed tracked-file bytes."""
+
+    source = create_repository(tmp_path / "source")
+    tracked = source / "tracked.txt"
+    if tracked.read_bytes() != content:
+        tracked.write_bytes(content)
+        run_git(source, "add", "tracked.txt")
+        run_git(source, "commit", "-m", "line-ending baseline")
+    target = tmp_path / "isolated"
+    plan = plan_git_worktree(source, "agent/task", target)
+    handle = create_git_worktree(
+        plan,
+        lambda _request: ToolApprovalDecision.APPROVE,
+    )
+    return source, handle
+
+
 def index_bytes(worktree: Path) -> bytes:
     """Return the linked worktree's real index bytes."""
 
@@ -209,6 +230,57 @@ def test_plan_preserves_no_final_newline_information(tmp_path: Path) -> None:
 
     change = plan.preview["changes"][0]
     assert change["diff"].count("\\ No newline at end of file") == 1
+
+
+@pytest.mark.parametrize(
+    ("original", "replacement"),
+    [(b"tracked\r\n", b"tracked\n"), (b"tracked\n", b"tracked\r\n")],
+)
+def test_plan_counts_line_ending_only_changes(
+    tmp_path: Path,
+    original: bytes,
+    replacement: bytes,
+) -> None:
+    """Use the shared terminator-aware count in isolated commit planning."""
+
+    _, handle = create_isolated_worktree_with_tracked_content(tmp_path, original)
+    target = handle.worktree_path / "tracked.txt"
+    target.write_bytes(replacement)
+
+    plan = plan_isolated_commit(handle, "fix: line ending")
+
+    assert plan.total_changed_lines == 2
+    assert plan.preview["changes"][0]["changed_lines"] == 2
+    assert target.read_bytes() == replacement
+
+
+@pytest.mark.parametrize(
+    ("old_ending", "new_ending"),
+    [(b"\r\n", b"\n"), (b"\n", b"\r\n")],
+)
+def test_plan_rejects_501_line_ending_only_changes(
+    tmp_path: Path,
+    old_ending: bytes,
+    new_ending: bytes,
+) -> None:
+    """Enforce the exact 500-line limit for terminator-only commit changes."""
+
+    original = b"".join(f"line {index}".encode() + old_ending for index in range(501))
+    replacement = b"".join(
+        f"line {index}".encode() + new_ending for index in range(501)
+    )
+    _, handle = create_isolated_worktree_with_tracked_content(tmp_path, original)
+    target = handle.worktree_path / "tracked.txt"
+    target.write_bytes(replacement)
+
+    with pytest.raises(
+        ConfigurationError,
+        match=r"^isolated commit file exceeds the 500-changed-line limit\.$",
+    ):
+        plan_isolated_commit(handle, "fix: line endings")
+
+    assert target.read_bytes() == replacement
+    assert run_git(handle.worktree_path, "diff", "--cached", "--quiet").returncode == 0
 
 
 @pytest.mark.parametrize(

@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 
 from agent_workbench.errors import WorkspaceTransactionError
+from agent_workbench.line_changes import count_changed_lines
 from agent_workbench.tool_registry import ToolRegistry
 from agent_workbench.tools import JSONObject, ToolDefinition
 from agent_workbench.workspace import Workspace
@@ -50,7 +51,7 @@ APPLY_FILE_PATCH_DEFINITION = ToolDefinition(
     name="apply_file_patch",
     description=(
         "Apply one approved optimistic UTF-8 file patch inside the authorized "
-        "workspace."
+        "workspace when complete exact current content is known or creating a file."
     ),
     input_schema={
         "type": "object",
@@ -68,7 +69,8 @@ APPLY_FILE_PATCH_DEFINITION = ToolDefinition(
 APPLY_FILE_REWRITE_DEFINITION = ToolDefinition(
     name="apply_file_rewrite",
     description=(
-        "Rewrite one existing UTF-8 file using the SHA-256 digest from read_file."
+        "Rewrite one complete existing UTF-8 file using the SHA-256 from a "
+        "complete read_file; do not use it to bypass an exact-content mismatch."
     ),
     input_schema={
         "type": "object",
@@ -92,8 +94,8 @@ APPLY_FILE_REWRITE_DEFINITION = ToolDefinition(
 APPLY_TEXT_REPLACEMENT_DEFINITION = ToolDefinition(
     name="apply_text_replacement",
     description=(
-        "Replace a bounded exact literal text fragment in one existing UTF-8 "
-        "file using the SHA-256 digest from read_file."
+        "Replace a reasonably small exact current literal fragment in one "
+        "existing UTF-8 file using the exact SHA-256 from read_file."
     ),
     input_schema={
         "type": "object",
@@ -116,6 +118,36 @@ APPLY_TEXT_REPLACEMENT_DEFINITION = ToolDefinition(
             "path",
             "expected_text",
             "replacement_text",
+            "expected_file_sha256",
+        ],
+        "additionalProperties": False,
+    },
+)
+
+APPLY_LINE_RANGE_REPLACEMENT_DEFINITION = ToolDefinition(
+    name="apply_line_range_replacement",
+    description=(
+        "After read_file inspection, replace one exact one-based inclusive line "
+        "range in an existing UTF-8 file, particularly a large file, using the "
+        "exact current file SHA-256."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "path": {"type": "string"},
+            "start_line": {"type": "integer", "minimum": 1},
+            "end_line": {"type": "integer", "minimum": 1},
+            "replacement_content": {"type": "string"},
+            "expected_file_sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$",
+            },
+        },
+        "required": [
+            "path",
+            "start_line",
+            "end_line",
+            "replacement_content",
             "expected_file_sha256",
         ],
         "additionalProperties": False,
@@ -159,6 +191,20 @@ APPLY_WORKSPACE_CHANGES_DEFINITION = ToolDefinition(
 
 
 @dataclass(frozen=True, slots=True)
+class _FileSnapshot:
+    """Store controller-owned content and identity for one approved file."""
+
+    content: bytes
+    sha256: str
+    size: int
+    device: int
+    inode: int
+    mode: int
+    modified_ns: int
+    metadata_changed_ns: int
+
+
+@dataclass(frozen=True, slots=True)
 class _PreparedPatch:
     """Store one validated patch snapshot for preview or execution."""
 
@@ -172,6 +218,7 @@ class _PreparedPatch:
     changed_lines: int
     diff: str
     existing_mode: int | None
+    approved_snapshot: _FileSnapshot | None
 
     def metadata(self) -> JSONObject:
         """Return bounded provider-independent result metadata."""
@@ -202,6 +249,59 @@ class _PreparedTextReplacement:
         if include_diff:
             metadata["diff"] = self.patch.diff
         return metadata
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedLineRangeReplacement:
+    """Store one validated line range and its complete resulting file patch."""
+
+    patch: _PreparedPatch
+    start_line: int
+    end_line: int
+
+    def metadata(self, *, include_diff: bool) -> JSONObject:
+        """Return bounded result or complete range approval metadata."""
+
+        metadata = {
+            **self.patch.metadata(),
+            "start_line": self.start_line,
+            "end_line": self.end_line,
+        }
+        if include_diff:
+            metadata["diff"] = self.patch.diff
+        return metadata
+
+
+@dataclass(slots=True)
+class _LineRangeReplacementRegistration:
+    """Carry one controller-owned approved range snapshot into execution."""
+
+    workspace: Workspace
+    prepared_arguments: JSONObject | None = None
+    prepared: _PreparedLineRangeReplacement | None = None
+
+    def preview(self, arguments: JSONObject) -> JSONObject:
+        """Prepare and retain the exact snapshot represented by the preview."""
+
+        self.prepared_arguments = None
+        self.prepared = None
+        prepared = _prepare_line_range_replacement(self.workspace, arguments)
+        self.prepared_arguments = arguments.copy()
+        self.prepared = prepared
+        return prepared.metadata(include_diff=True)
+
+    def apply(self, arguments: JSONObject) -> JSONObject:
+        """Consume the approved snapshot, or prepare one for direct execution."""
+
+        prepared = (
+            self.prepared
+            if self.prepared is not None and arguments == self.prepared_arguments
+            else _prepare_line_range_replacement(self.workspace, arguments)
+        )
+        self.prepared_arguments = None
+        self.prepared = None
+        _replace_file_atomically(self.workspace, prepared.patch)
+        return prepared.metadata(include_diff=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -250,6 +350,8 @@ def register_workspace_action_tools(
 ) -> None:
     """Register the approved workspace patch tool."""
 
+    line_range_replacement = _LineRangeReplacementRegistration(workspace)
+
     registry.register(
         APPLY_FILE_PATCH_DEFINITION,
         lambda arguments: apply_file_patch(workspace, arguments),
@@ -273,6 +375,12 @@ def register_workspace_action_tools(
             workspace,
             arguments,
         ),
+    )
+    registry.register(
+        APPLY_LINE_RANGE_REPLACEMENT_DEFINITION,
+        line_range_replacement.apply,
+        requires_approval=True,
+        approval_preview=line_range_replacement.preview,
     )
     registry.register(
         APPLY_WORKSPACE_CHANGES_DEFINITION,
@@ -371,6 +479,28 @@ def apply_text_replacement(
     return prepared.metadata(include_diff=False)
 
 
+def preview_line_range_replacement(
+    workspace: Workspace,
+    arguments: object,
+) -> JSONObject:
+    """Validate a line range and return its complete deterministic preview."""
+
+    return _prepare_line_range_replacement(workspace, arguments).metadata(
+        include_diff=True,
+    )
+
+
+def apply_line_range_replacement(
+    workspace: Workspace,
+    arguments: object,
+) -> JSONObject:
+    """Revalidate and atomically replace one exact inclusive line range."""
+
+    prepared = _prepare_line_range_replacement(workspace, arguments)
+    _replace_file_atomically(workspace, prepared.patch)
+    return prepared.metadata(include_diff=False)
+
+
 def preview_workspace_changes(
     workspace: Workspace,
     arguments: object,
@@ -461,6 +591,7 @@ def _prepare_patch(
         "replacement_content",
         replacement_content,
     )
+    snapshot: _FileSnapshot | None = None
 
     if target_status is None:
         if not create_if_missing:
@@ -474,7 +605,8 @@ def _prepare_patch(
     else:
         if create_if_missing:
             raise ValueError("create_if_missing requires a missing target.")
-        old_bytes = _read_existing_file(target, target_status)
+        snapshot = _read_existing_file(target, target_status)
+        old_bytes = snapshot.content
         try:
             old_content = old_bytes.decode("utf-8")
         except UnicodeDecodeError:
@@ -482,9 +614,9 @@ def _prepare_patch(
         if old_content != expected_content:
             raise ValueError("apply_file_patch expected content does not match.")
         operation = "update"
-        existing_mode = stat.S_IMODE(target_status.st_mode)
+        existing_mode = snapshot.mode
 
-    changed_lines = _count_changed_lines(old_content, replacement_content)
+    changed_lines = count_changed_lines(old_content, replacement_content)
     if changed_lines > MAX_CHANGED_LINES:
         raise ValueError(f"patch exceeds the {MAX_CHANGED_LINES}-changed-line limit.")
 
@@ -513,6 +645,7 @@ def _prepare_patch(
         changed_lines=changed_lines,
         diff=diff,
         existing_mode=existing_mode,
+        approved_snapshot=snapshot,
     )
 
 
@@ -540,10 +673,11 @@ def _prepare_text_replacement(
         raise ValueError("apply_text_replacement target does not exist.")
 
     try:
-        old_bytes = _read_existing_file(target, target_status)
+        snapshot = _read_existing_file(target, target_status)
+        old_bytes = snapshot.content
     except ValueError as exc:
         raise _as_text_replacement_error(exc) from None
-    if hashlib.sha256(old_bytes).hexdigest() != expected_file_sha256:
+    if snapshot.sha256 != expected_file_sha256:
         raise ValueError(
             "apply_text_replacement expected_file_sha256 does not match "
             "the current file."
@@ -570,7 +704,7 @@ def _prepare_text_replacement(
         )
     except ValueError as exc:
         raise _as_text_replacement_error(exc) from None
-    changed_lines = _count_changed_lines(old_content, replacement_content)
+    changed_lines = count_changed_lines(old_content, replacement_content)
     if changed_lines > MAX_CHANGED_LINES:
         raise ValueError(
             f"text replacement exceeds the {MAX_CHANGED_LINES}-changed-line limit."
@@ -599,9 +733,102 @@ def _prepare_text_replacement(
             new_size_bytes=len(replacement_bytes),
             changed_lines=changed_lines,
             diff=diff,
-            existing_mode=stat.S_IMODE(target_status.st_mode),
+            existing_mode=snapshot.mode,
+            approved_snapshot=snapshot,
         ),
         occurrences_replaced=actual_occurrences,
+    )
+
+
+def _prepare_line_range_replacement(
+    workspace: Workspace,
+    arguments: object,
+) -> _PreparedLineRangeReplacement:
+    """Validate and prepare one SHA-guarded exact line-range replacement."""
+
+    (
+        path,
+        start_line,
+        end_line,
+        replacement_content,
+        expected_file_sha256,
+    ) = _get_line_range_replacement_arguments(arguments)
+    try:
+        _encode_patch_content("replacement_content", replacement_content)
+        target, relative_path, target_status = _resolve_write_target(workspace, path)
+    except ValueError as exc:
+        raise _as_line_range_replacement_error(exc) from None
+    if target_status is None:
+        raise ValueError("apply_line_range_replacement target does not exist.")
+
+    try:
+        snapshot = _read_existing_file(target, target_status)
+        old_bytes = snapshot.content
+    except ValueError as exc:
+        raise _as_line_range_replacement_error(exc) from None
+    if snapshot.sha256 != expected_file_sha256:
+        raise ValueError(
+            "apply_line_range_replacement expected_file_sha256 does not match "
+            "the current file."
+        )
+
+    try:
+        old_content = old_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError("apply_line_range_replacement requires valid UTF-8.") from None
+
+    lines = old_content.splitlines(keepends=True)
+    if end_line > len(lines):
+        raise ValueError(
+            "apply_line_range_replacement line range exceeds the current file."
+        )
+    replacement_file_content = (
+        "".join(lines[: start_line - 1])
+        + replacement_content
+        + "".join(lines[end_line:])
+    )
+    try:
+        replacement_bytes = _encode_patch_content(
+            "replacement_content",
+            replacement_file_content,
+        )
+    except ValueError as exc:
+        raise _as_line_range_replacement_error(exc) from None
+
+    changed_lines = count_changed_lines(old_content, replacement_file_content)
+    if changed_lines > MAX_CHANGED_LINES:
+        raise ValueError(
+            "line-range replacement exceeds the "
+            f"{MAX_CHANGED_LINES}-changed-line limit."
+        )
+    diff = _create_unified_diff(
+        relative_path,
+        old_content,
+        replacement_file_content,
+        operation="update",
+    )
+    if len(diff.encode("utf-8")) > MAX_PATCH_PREVIEW_BYTES:
+        raise ValueError(
+            "complete line-range replacement preview exceeds the "
+            f"{MAX_PATCH_PREVIEW_BYTES}-byte limit."
+        )
+
+    return _PreparedLineRangeReplacement(
+        patch=_PreparedPatch(
+            target=target,
+            relative_path=relative_path,
+            operation="update",
+            expected_content=old_content,
+            replacement_content=replacement_file_content,
+            old_size_bytes=len(old_bytes),
+            new_size_bytes=len(replacement_bytes),
+            changed_lines=changed_lines,
+            diff=diff,
+            existing_mode=snapshot.mode,
+            approved_snapshot=snapshot,
+        ),
+        start_line=start_line,
+        end_line=end_line,
     )
 
 
@@ -626,10 +853,11 @@ def _prepare_file_rewrite(
         raise ValueError("apply_file_rewrite target does not exist.")
 
     try:
-        old_bytes = _read_existing_file(target, target_status)
+        snapshot = _read_existing_file(target, target_status)
+        old_bytes = snapshot.content
     except ValueError as exc:
         raise _as_file_rewrite_error(exc) from None
-    if hashlib.sha256(old_bytes).hexdigest() != expected_file_sha256:
+    if snapshot.sha256 != expected_file_sha256:
         raise ValueError(
             "apply_file_rewrite expected_file_sha256 does not match the current file."
         )
@@ -639,7 +867,7 @@ def _prepare_file_rewrite(
     except UnicodeDecodeError:
         raise ValueError("apply_file_rewrite requires valid UTF-8.") from None
 
-    changed_lines = _count_changed_lines(old_content, replacement_content)
+    changed_lines = count_changed_lines(old_content, replacement_content)
     if changed_lines > MAX_CHANGED_LINES:
         raise ValueError(
             f"file rewrite exceeds the {MAX_CHANGED_LINES}-changed-line limit."
@@ -666,7 +894,8 @@ def _prepare_file_rewrite(
         new_size_bytes=len(replacement_bytes),
         changed_lines=changed_lines,
         diff=diff,
-        existing_mode=stat.S_IMODE(target_status.st_mode),
+        existing_mode=snapshot.mode,
+        approved_snapshot=snapshot,
     )
 
 
@@ -829,6 +1058,76 @@ def _get_text_replacement_arguments(
     )
 
 
+def _get_line_range_replacement_arguments(
+    arguments: object,
+) -> tuple[str, int, int, str, str]:
+    """Validate one closed SHA-guarded line-range argument object."""
+
+    required = {
+        "path",
+        "start_line",
+        "end_line",
+        "replacement_content",
+        "expected_file_sha256",
+    }
+    if not isinstance(arguments, dict) or set(arguments) != required:
+        raise ValueError(
+            "apply_line_range_replacement requires path, start_line, end_line, "
+            "replacement_content, and expected_file_sha256."
+        )
+
+    path = arguments["path"]
+    start_line = arguments["start_line"]
+    end_line = arguments["end_line"]
+    replacement_content = arguments["replacement_content"]
+    expected_file_sha256 = arguments["expected_file_sha256"]
+
+    if not isinstance(path, str):
+        raise ValueError("apply_line_range_replacement path must be a string.")
+    if (
+        not isinstance(start_line, int)
+        or isinstance(start_line, bool)
+        or start_line < 1
+    ):
+        raise ValueError(
+            "apply_line_range_replacement start_line must be an integer greater "
+            "than or equal to 1."
+        )
+    if not isinstance(end_line, int) or isinstance(end_line, bool):
+        raise ValueError(
+            "apply_line_range_replacement end_line must be an integer greater "
+            "than or equal to start_line."
+        )
+    if end_line < start_line:
+        raise ValueError(
+            "apply_line_range_replacement end_line must be greater than or equal "
+            "to start_line."
+        )
+    if not isinstance(replacement_content, str):
+        raise ValueError(
+            "apply_line_range_replacement replacement_content must be a string."
+        )
+    if (
+        not isinstance(expected_file_sha256, str)
+        or len(expected_file_sha256) != 64
+        or any(
+            character not in "0123456789abcdef" for character in expected_file_sha256
+        )
+    ):
+        raise ValueError(
+            "apply_line_range_replacement expected_file_sha256 must contain "
+            "64 lowercase hexadecimal characters."
+        )
+
+    return (
+        path,
+        start_line,
+        end_line,
+        replacement_content,
+        expected_file_sha256,
+    )
+
+
 def _get_file_rewrite_arguments(
     arguments: object,
 ) -> tuple[str, str, str]:
@@ -932,6 +1231,16 @@ def _as_text_replacement_error(error: ValueError) -> ValueError:
     patch_prefix = "apply_file_patch"
     if message.startswith(patch_prefix):
         message = "apply_text_replacement" + message[len(patch_prefix) :]
+    return ValueError(message)
+
+
+def _as_line_range_replacement_error(error: ValueError) -> ValueError:
+    """Rewrite shared patch diagnostics for the line-range action."""
+
+    message = str(error)
+    patch_prefix = "apply_file_patch"
+    if message.startswith(patch_prefix):
+        message = "apply_line_range_replacement" + message[len(patch_prefix) :]
     return ValueError(message)
 
 
@@ -1055,8 +1364,8 @@ def _resolve_write_target(
 def _read_existing_file(
     target: Path,
     target_status: os.stat_result,
-) -> bytes:
-    """Read one bounded regular file without exposing host paths."""
+) -> _FileSnapshot:
+    """Read one bounded file and capture exact no-follow identity metadata."""
 
     if not stat.S_ISREG(target_status.st_mode):
         raise ValueError("apply_file_patch requires a regular file.")
@@ -1080,9 +1389,20 @@ def _read_existing_file(
             target_status.st_ino,
         ):
             raise ValueError("apply_file_patch target changed while reading.")
-        with os.fdopen(descriptor, "rb") as source:
-            descriptor = None
-            content = source.read(MAX_PATCH_CONTENT_BYTES + 1)
+        if not _same_file_metadata(target_status, opened_status):
+            raise ValueError("apply_file_patch target changed while reading.")
+        chunks: list[bytes] = []
+        remaining = MAX_PATCH_CONTENT_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        content = b"".join(chunks)
+        final_status = os.fstat(descriptor)
+        if not _same_file_metadata(opened_status, final_status):
+            raise ValueError("apply_file_patch target changed while reading.")
     except ValueError:
         raise
     except OSError:
@@ -1094,25 +1414,70 @@ def _read_existing_file(
         raise ValueError(
             f"workspace file exceeds the {MAX_PATCH_CONTENT_BYTES}-byte limit."
         )
-    return content
+    return _snapshot_file(content, final_status)
 
 
-def _count_changed_lines(old_content: str, new_content: str) -> int:
-    """Count removed and added lines using deterministic sequence matching."""
+def _snapshot_file(content: bytes, status: os.stat_result) -> _FileSnapshot:
+    """Build immutable controller-owned state from verified file metadata."""
 
-    old_lines = old_content.splitlines()
-    new_lines = new_content.splitlines()
-    changed_lines = 0
-    for tag, old_start, old_end, new_start, new_end in difflib.SequenceMatcher(
-        None,
-        old_lines,
-        new_lines,
-        autojunk=False,
-    ).get_opcodes():
-        if tag != "equal":
-            changed_lines += old_end - old_start
-            changed_lines += new_end - new_start
-    return changed_lines
+    return _FileSnapshot(
+        content=content,
+        sha256=hashlib.sha256(content).hexdigest(),
+        size=status.st_size,
+        device=status.st_dev,
+        inode=status.st_ino,
+        mode=stat.S_IMODE(status.st_mode),
+        modified_ns=_status_time_ns(status, "st_mtime_ns", "st_mtime"),
+        metadata_changed_ns=_status_time_ns(status, "st_ctime_ns", "st_ctime"),
+    )
+
+
+def _status_time_ns(
+    status: os.stat_result,
+    nanosecond_name: str,
+    second_name: str,
+) -> int:
+    """Return a portable deterministic high-resolution timestamp value."""
+
+    nanoseconds = getattr(status, nanosecond_name, None)
+    if isinstance(nanoseconds, int):
+        return nanoseconds
+    return int(getattr(status, second_name) * 1_000_000_000)
+
+
+def _same_file_metadata(left: os.stat_result, right: os.stat_result) -> bool:
+    """Compare regular-file identity and stale-state metadata."""
+
+    return (
+        stat.S_ISREG(left.st_mode)
+        and stat.S_ISREG(right.st_mode)
+        and left.st_dev == right.st_dev
+        and left.st_ino == right.st_ino
+        and left.st_size == right.st_size
+        and stat.S_IMODE(left.st_mode) == stat.S_IMODE(right.st_mode)
+        and _status_time_ns(left, "st_mtime_ns", "st_mtime")
+        == _status_time_ns(right, "st_mtime_ns", "st_mtime")
+        and _status_time_ns(left, "st_ctime_ns", "st_ctime")
+        == _status_time_ns(right, "st_ctime_ns", "st_ctime")
+    )
+
+
+def _status_matches_snapshot(
+    status: os.stat_result,
+    snapshot: _FileSnapshot,
+) -> bool:
+    """Return whether metadata still represents the approved regular file."""
+
+    return (
+        stat.S_ISREG(status.st_mode)
+        and status.st_dev == snapshot.device
+        and status.st_ino == snapshot.inode
+        and status.st_size == snapshot.size
+        and stat.S_IMODE(status.st_mode) == snapshot.mode
+        and _status_time_ns(status, "st_mtime_ns", "st_mtime") == snapshot.modified_ns
+        and _status_time_ns(status, "st_ctime_ns", "st_ctime")
+        == snapshot.metadata_changed_ns
+    )
 
 
 def _create_unified_diff(
@@ -1126,8 +1491,8 @@ def _create_unified_diff(
 
     from_file = "/dev/null" if operation == "create" else f"a/{relative_path}"
     lines = difflib.unified_diff(
-        old_content.splitlines(keepends=True),
-        new_content.splitlines(keepends=True),
+        _split_lf_lines(old_content),
+        _split_lf_lines(new_content),
         fromfile=from_file,
         tofile=f"b/{relative_path}",
         lineterm="\n",
@@ -1138,6 +1503,16 @@ def _create_unified_diff(
         if not line.endswith("\n"):
             complete_lines.append("\n\\ No newline at end of file\n")
     return "".join(complete_lines)
+
+
+def _split_lf_lines(content: str) -> list[str]:
+    """Split display lines at LF while preserving other characters verbatim."""
+
+    parts = content.split("\n")
+    lines = [f"{part}\n" for part in parts[:-1]]
+    if parts[-1]:
+        lines.append(parts[-1])
+    return lines
 
 
 def _create_file_exclusively(patch: _PreparedPatch) -> None:
@@ -1177,9 +1552,10 @@ def _replace_file_atomically(
     workspace: Workspace,
     patch: _PreparedPatch,
 ) -> None:
-    """Write a same-directory temporary file and atomically replace the target."""
+    """Replace an unchanged approved target through a held no-follow descriptor."""
 
     temporary_path: Path | None = None
+    target_descriptor: int | None = None
     try:
         with tempfile.NamedTemporaryFile(
             mode="wb",
@@ -1195,20 +1571,23 @@ def _replace_file_atomically(
         if patch.existing_mode is not None:
             os.chmod(temporary_path, patch.existing_mode)
 
-        current = _prepare_patch(
-            workspace,
-            {
-                "path": patch.relative_path,
-                "expected_content": patch.expected_content,
-                "replacement_content": patch.replacement_content,
-                "create_if_missing": False,
-            },
-            preview_limit_bytes=MAX_PATCH_PREVIEW_BYTES,
-            validation_name="apply_file_patch",
-        )
-        if current.operation != "update":
+        snapshot = patch.approved_snapshot
+        if snapshot is None:
             raise ValueError("apply_file_patch target changed before replacement.")
+        target_descriptor = _open_verified_replacement_target(
+            workspace,
+            patch,
+            snapshot,
+        )
+        _verify_open_replacement_target(target_descriptor, snapshot)
 
+        _before_atomic_replace_final_check(patch)
+
+        _verify_open_replacement_target(target_descriptor, snapshot)
+        _verify_replacement_path(workspace, patch, target_descriptor, snapshot)
+
+        # A non-cooperating process can still race after this final pathname
+        # identity check and before the operating system performs os.replace.
         os.replace(temporary_path, patch.target)
         temporary_path = None
     except ValueError:
@@ -1216,11 +1595,117 @@ def _replace_file_atomically(
     except OSError:
         raise ValueError("Unable to replace patch target.") from None
     finally:
+        if target_descriptor is not None:
+            os.close(target_descriptor)
         if temporary_path is not None:
             try:
                 temporary_path.unlink()
             except OSError:
                 pass
+
+
+def _open_verified_replacement_target(
+    workspace: Workspace,
+    patch: _PreparedPatch,
+    snapshot: _FileSnapshot,
+) -> int:
+    """Open the approved target without following its final symlink."""
+
+    try:
+        target, _, target_status = _resolve_write_target(
+            workspace,
+            patch.relative_path,
+        )
+        if target != patch.target or target_status is None:
+            raise ValueError
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(target, flags)
+    except (OSError, ValueError):
+        raise ValueError(
+            "apply_file_patch target changed before replacement."
+        ) from None
+
+    try:
+        opened_status = os.fstat(descriptor)
+        if not _status_matches_snapshot(target_status, snapshot) or not (
+            _same_file_metadata(target_status, opened_status)
+        ):
+            raise ValueError
+    except (OSError, ValueError):
+        os.close(descriptor)
+        raise ValueError(
+            "apply_file_patch target changed before replacement."
+        ) from None
+    return descriptor
+
+
+def _verify_open_replacement_target(
+    descriptor: int,
+    snapshot: _FileSnapshot,
+) -> None:
+    """Recheck exact bytes, digest, size, identity, mode, and timestamps."""
+
+    try:
+        before_status = os.fstat(descriptor)
+        if not _status_matches_snapshot(before_status, snapshot):
+            raise ValueError
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        chunks: list[bytes] = []
+        remaining = MAX_PATCH_CONTENT_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        content = b"".join(chunks)
+        after_status = os.fstat(descriptor)
+        if (
+            content != snapshot.content
+            or len(content) != snapshot.size
+            or hashlib.sha256(content).hexdigest() != snapshot.sha256
+            or not _same_file_metadata(before_status, after_status)
+            or not _status_matches_snapshot(after_status, snapshot)
+        ):
+            raise ValueError
+    except (OSError, ValueError):
+        raise ValueError(
+            "apply_file_patch target changed before replacement."
+        ) from None
+
+
+def _verify_replacement_path(
+    workspace: Workspace,
+    patch: _PreparedPatch,
+    descriptor: int,
+    snapshot: _FileSnapshot,
+) -> None:
+    """Verify the final pathname still names the held approved descriptor."""
+
+    try:
+        target, _, path_status = _resolve_write_target(
+            workspace,
+            patch.relative_path,
+        )
+        descriptor_status = os.fstat(descriptor)
+        if (
+            target != patch.target
+            or path_status is None
+            or not _status_matches_snapshot(path_status, snapshot)
+            or not _status_matches_snapshot(descriptor_status, snapshot)
+            or not _same_file_metadata(path_status, descriptor_status)
+        ):
+            raise ValueError
+    except (OSError, ValueError):
+        raise ValueError(
+            "apply_file_patch target changed before replacement."
+        ) from None
+
+
+def _before_atomic_replace_final_check(_patch: _PreparedPatch) -> None:
+    """Provide one private deterministic test seam before final verification."""
 
 
 def _prepare_transaction_changes(
