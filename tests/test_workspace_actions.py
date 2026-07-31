@@ -1173,6 +1173,38 @@ def test_content_size_and_changed_line_limits(tmp_path: Path) -> None:
             preview_file_patch(workspace, arguments)
 
 
+@pytest.mark.parametrize(
+    ("original", "replacement"),
+    [("value\r\n", "value\n"), ("value\n", "value\r\n")],
+)
+def test_patch_and_rewrite_count_line_ending_only_changes(
+    tmp_path: Path,
+    original: str,
+    replacement: str,
+) -> None:
+    """Use line-terminator-aware accounting in patch and rewrite previews."""
+
+    root, workspace = create_workspace(tmp_path)
+    target = root / "module.py"
+    target.write_bytes(original.encode("utf-8"))
+
+    patch_preview = preview_file_patch(
+        workspace,
+        patch_arguments(expected=original, replacement=replacement),
+    )
+    rewrite_preview = preview_file_rewrite(
+        workspace,
+        file_rewrite_arguments(
+            file_content=original,
+            replacement=replacement,
+        ),
+    )
+
+    assert patch_preview["changed_lines"] == 2
+    assert rewrite_preview["changed_lines"] == 2
+    assert target.read_bytes() == original.encode("utf-8")
+
+
 def test_complete_preview_size_limit_rejects_instead_of_truncating(
     tmp_path: Path,
     monkeypatch,
@@ -2025,6 +2057,57 @@ def test_line_range_replacement_enforces_real_file_and_500_changed_line_limits(
         )
 
     assert target.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.parametrize(
+    ("old_ending", "new_ending"),
+    [("\r\n", "\n"), ("\n", "\r\n")],
+)
+def test_line_range_replacement_counts_and_limits_line_ending_only_changes(
+    tmp_path: Path,
+    old_ending: str,
+    new_ending: str,
+) -> None:
+    """Report bounded terminator changes and reject 501-line conversions."""
+
+    root, workspace = create_workspace(tmp_path)
+    target = root / "module.py"
+    bounded_original = "".join(f"line {index}{old_ending}" for index in range(3))
+    bounded_replacement = "".join(f"line {index}{new_ending}" for index in range(3))
+    target.write_bytes(bounded_original.encode("utf-8"))
+
+    preview = preview_line_range_replacement(
+        workspace,
+        line_range_replacement_arguments(
+            start_line=1,
+            end_line=3,
+            replacement=bounded_replacement,
+            file_content=bounded_original,
+        ),
+    )
+
+    assert preview["changed_lines"] == 6
+    assert target.read_bytes() == bounded_original.encode("utf-8")
+
+    broad_original = "".join(f"line {index}{old_ending}" for index in range(501))
+    broad_replacement = "".join(f"line {index}{new_ending}" for index in range(501))
+    target.write_bytes(broad_original.encode("utf-8"))
+
+    with pytest.raises(
+        ValueError,
+        match=r"^line-range replacement exceeds the 500-changed-line limit\.$",
+    ):
+        preview_line_range_replacement(
+            workspace,
+            line_range_replacement_arguments(
+                start_line=1,
+                end_line=501,
+                replacement=broad_replacement,
+                file_content=broad_original,
+            ),
+        )
+
+    assert target.read_bytes() == broad_original.encode("utf-8")
 
 
 @pytest.mark.parametrize("decision", [None, ToolApprovalDecision.DENY])

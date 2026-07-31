@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 
 from agent_workbench.errors import WorkspaceTransactionError
+from agent_workbench.line_changes import count_changed_lines
 from agent_workbench.tool_registry import ToolRegistry
 from agent_workbench.tools import JSONObject, ToolDefinition
 from agent_workbench.workspace import Workspace
@@ -567,7 +568,7 @@ def _prepare_patch(
         operation = "update"
         existing_mode = stat.S_IMODE(target_status.st_mode)
 
-    changed_lines = _count_changed_lines(old_content, replacement_content)
+    changed_lines = count_changed_lines(old_content, replacement_content)
     if changed_lines > MAX_CHANGED_LINES:
         raise ValueError(f"patch exceeds the {MAX_CHANGED_LINES}-changed-line limit.")
 
@@ -653,7 +654,7 @@ def _prepare_text_replacement(
         )
     except ValueError as exc:
         raise _as_text_replacement_error(exc) from None
-    changed_lines = _count_changed_lines(old_content, replacement_content)
+    changed_lines = count_changed_lines(old_content, replacement_content)
     if changed_lines > MAX_CHANGED_LINES:
         raise ValueError(
             f"text replacement exceeds the {MAX_CHANGED_LINES}-changed-line limit."
@@ -742,7 +743,7 @@ def _prepare_line_range_replacement(
     except ValueError as exc:
         raise _as_line_range_replacement_error(exc) from None
 
-    changed_lines = _count_changed_lines(old_content, replacement_file_content)
+    changed_lines = count_changed_lines(old_content, replacement_file_content)
     if changed_lines > MAX_CHANGED_LINES:
         raise ValueError(
             "line-range replacement exceeds the "
@@ -812,7 +813,7 @@ def _prepare_file_rewrite(
     except UnicodeDecodeError:
         raise ValueError("apply_file_rewrite requires valid UTF-8.") from None
 
-    changed_lines = _count_changed_lines(old_content, replacement_content)
+    changed_lines = count_changed_lines(old_content, replacement_content)
     if changed_lines > MAX_CHANGED_LINES:
         raise ValueError(
             f"file rewrite exceeds the {MAX_CHANGED_LINES}-changed-line limit."
@@ -1348,24 +1349,6 @@ def _read_existing_file(
             f"workspace file exceeds the {MAX_PATCH_CONTENT_BYTES}-byte limit."
         )
     return content
-
-
-def _count_changed_lines(old_content: str, new_content: str) -> int:
-    """Count removed and added lines using deterministic sequence matching."""
-
-    old_lines = old_content.splitlines()
-    new_lines = new_content.splitlines()
-    changed_lines = 0
-    for tag, old_start, old_end, new_start, new_end in difflib.SequenceMatcher(
-        None,
-        old_lines,
-        new_lines,
-        autojunk=False,
-    ).get_opcodes():
-        if tag != "equal":
-            changed_lines += old_end - old_start
-            changed_lines += new_end - new_start
-    return changed_lines
 
 
 def _create_unified_diff(

@@ -15,6 +15,7 @@ import threading
 from typing import cast
 
 from agent_workbench.errors import CompletionError, ConfigurationError
+from agent_workbench.line_changes import count_changed_lines
 from agent_workbench.recovery import (
     IsolatedCommitRecoveryEvidence,
     IsolatedCommitRecoveryPhase,
@@ -917,7 +918,7 @@ def _read_staged_change(
     current_content = content_output.stdout
     current_text = _decode_file_content(current_content)
     old_text = _decode_file_content(approved.old_content)
-    changed_lines = _count_changed_lines(old_text, current_text)
+    changed_lines = count_changed_lines(old_text, current_text)
     operation = approved.operation
     return _CommitChange(
         path=approved.path,
@@ -1094,7 +1095,7 @@ def _read_committed_change(
         current_content=current_content,
         old_mode=approved.old_mode,
         current_mode=mode,
-        changed_lines=_count_changed_lines(old_text, current_text),
+        changed_lines=count_changed_lines(old_text, current_text),
         diff=_create_unified_diff(
             approved.path,
             old_text,
@@ -1392,7 +1393,7 @@ def _prepare_added_change(relative_path: str, target: Path) -> _CommitChange:
 
     current_content, current_mode = _read_regular_file(target)
     current_text = _decode_file_content(current_content)
-    changed_lines = _count_changed_lines("", current_text)
+    changed_lines = count_changed_lines("", current_text)
     _validate_file_limits(
         old_content=b"",
         current_content=current_content,
@@ -1452,7 +1453,7 @@ def _prepare_modified_change(
         or _decode_line(head_output.stdout, "tracked object") != object_id
     ):
         raise ConfigurationError("tracked commit content is ambiguous.")
-    changed_lines = _count_changed_lines(old_text, current_text)
+    changed_lines = count_changed_lines(old_text, current_text)
     _validate_file_limits(
         old_content=old_content,
         current_content=current_content,
@@ -1611,24 +1612,6 @@ def _validate_complete_limits(changes: tuple[_CommitChange, ...]) -> None:
             "isolated commit exceeds the "
             f"{MAX_COMMIT_CHANGED_LINES}-changed-line limit."
         )
-
-
-def _count_changed_lines(old_content: str, new_content: str) -> int:
-    """Count removed and added lines deterministically."""
-
-    old_lines = old_content.splitlines()
-    new_lines = new_content.splitlines()
-    changed_lines = 0
-    for tag, old_start, old_end, new_start, new_end in difflib.SequenceMatcher(
-        None,
-        old_lines,
-        new_lines,
-        autojunk=False,
-    ).get_opcodes():
-        if tag != "equal":
-            changed_lines += old_end - old_start
-            changed_lines += new_end - new_start
-    return changed_lines
 
 
 def _create_unified_diff(
