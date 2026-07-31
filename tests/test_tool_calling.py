@@ -92,6 +92,27 @@ def create_read_file_definition() -> ToolDefinition:
     )
 
 
+def create_search_text_definition() -> ToolDefinition:
+    """Create a read-only text search definition for loop tests."""
+
+    return ToolDefinition(
+        name="search_text",
+        description="Search workspace text.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                }
+            },
+            "required": [
+                "query",
+            ],
+            "additionalProperties": False,
+        },
+    )
+
+
 def create_tool_response(
     *invocations: ToolInvocation,
     text: str = "",
@@ -661,7 +682,7 @@ def test_repaired_repeated_inspections_stop_at_tool_round_limit() -> None:
     assert "duplicate_count=1" in str(raised_error.value)
     assert "inspection_streak_count=2" in str(raised_error.value)
     assert "response_repair_attempt_count=1" in str(raised_error.value)
-    assert "alternative_inspection_tools_available=true" in str(raised_error.value)
+    assert "alternative_inspection_tools_available=false" in str(raised_error.value)
 
 
 def test_repeated_inspection_keeps_every_inspection_definition() -> None:
@@ -734,11 +755,13 @@ def test_infinitely_repeated_inspection_stops_with_lifecycle_diagnostics() -> No
     executions: list[dict[str, object]] = []
     observed_rounds: list[ToolInteractionRound] = []
     read_file = create_read_file_definition()
+    search_text = create_search_text_definition()
     registry = ToolRegistry()
     registry.register(
         read_file,
         lambda arguments: executions.append(arguments) or {"content": "value"},
     )
+    registry.register(search_text, lambda arguments: {"matches": []})
 
     def repeated_response(identifier: str) -> ChatResponse:
         return create_tool_response(
@@ -772,7 +795,7 @@ def test_infinitely_repeated_inspection_stops_with_lifecycle_diagnostics() -> No
     ) as raised_error:
         run_tool_calling_loop(
             provider,
-            ChatRequest(messages=[], tools=(read_file,)),
+            ChatRequest(messages=[], tools=(read_file, search_text)),
             registry,
             max_tool_rounds=3,
             tool_round_observer=observed_rounds.append,
@@ -786,8 +809,101 @@ def test_infinitely_repeated_inspection_stops_with_lifecycle_diagnostics() -> No
         "error",
         "error",
     ]
-    assert all(request.tools == (read_file,) for request in provider.requests)
+    assert all(
+        request.tools == (read_file, search_text) for request in provider.requests
+    )
     assert "secret-repeat.py" not in str(raised_error.value)
+
+
+def test_diagnostic_excludes_inspections_disallowed_for_the_send() -> None:
+    """Do not report an advertised but disallowed inspection as available."""
+
+    read_file = create_read_file_definition()
+    search_text = create_search_text_definition()
+    registry = ToolRegistry()
+    registry.register(read_file, lambda arguments: {"content": "value"})
+
+    def repeated_response(identifier: str) -> ChatResponse:
+        return create_tool_response(
+            ToolInvocation(
+                id=identifier,
+                tool_name="read_file",
+                arguments={"path": "private-module.py"},
+            )
+        )
+
+    provider = FakeProvider(
+        [
+            repeated_response("first"),
+            repeated_response("second"),
+        ]
+    )
+
+    with pytest.raises(CompletionError) as raised_error:
+        run_tool_calling_loop(
+            provider,
+            ChatRequest(messages=[], tools=(read_file, search_text)),
+            registry,
+            max_tool_rounds=1,
+            allowed_tool_names=frozenset({"read_file"}),
+        )
+
+    diagnostic = str(raised_error.value)
+    assert "alternative_inspection_tools_available=false" in diagnostic
+    assert "private-module.py" not in diagnostic
+
+
+def test_diagnostic_excludes_all_requested_inspection_tool_names() -> None:
+    """Treat every inspection name in a multi-invocation response as requested."""
+
+    executions: list[str] = []
+    read_file = create_read_file_definition()
+    search_text = create_search_text_definition()
+    registry = ToolRegistry()
+    registry.register(
+        read_file,
+        lambda arguments: executions.append("read_file") or {"content": "value"},
+    )
+    registry.register(
+        search_text,
+        lambda arguments: executions.append("search_text") or {"matches": []},
+    )
+
+    def inspection_batch(prefix: str) -> ChatResponse:
+        return create_tool_response(
+            ToolInvocation(
+                id=f"{prefix}-read",
+                tool_name="read_file",
+                arguments={"path": "private-module.py"},
+            ),
+            ToolInvocation(
+                id=f"{prefix}-search",
+                tool_name="search_text",
+                arguments={"query": "private-pattern"},
+            ),
+        )
+
+    provider = FakeProvider(
+        [
+            inspection_batch("first"),
+            inspection_batch("second"),
+        ]
+    )
+
+    with pytest.raises(CompletionError) as raised_error:
+        run_tool_calling_loop(
+            provider,
+            ChatRequest(messages=[], tools=(read_file, search_text)),
+            registry,
+            max_tool_rounds=1,
+        )
+
+    diagnostic = str(raised_error.value)
+    assert executions == ["read_file", "search_text"]
+    assert "duplicate_count=2" in diagnostic
+    assert "alternative_inspection_tools_available=false" in diagnostic
+    assert "private-module.py" not in diagnostic
+    assert "private-pattern" not in diagnostic
 
 
 def test_allows_inspection_with_different_arguments_in_consecutive_rounds() -> None:

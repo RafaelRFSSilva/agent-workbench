@@ -148,6 +148,7 @@ def _inspection_failure_diagnostics(
     response: ChatResponse,
     request: ChatRequest,
     *,
+    allowed_tool_names: frozenset[str] | None,
     executed_rounds: int,
     max_tool_rounds: int,
     duplicate_count: int,
@@ -160,9 +161,19 @@ def _inspection_failure_diagnostics(
         for invocation in response.tool_invocations
         if invocation.tool_name in _REPEATED_INSPECTION_TOOL_NAMES
     )
-    alternatives_available = any(
-        definition.name in _REPEATED_INSPECTION_TOOL_NAMES
+    requested_inspection_names = frozenset(
+        invocation.tool_name
+        for invocation in response.tool_invocations
+        if invocation.tool_name in _REPEATED_INSPECTION_TOOL_NAMES
+    )
+    permitted_inspection_names = frozenset(
+        definition.name
         for definition in request.tools
+        if definition.name in _REPEATED_INSPECTION_TOOL_NAMES
+        and (allowed_tool_names is None or definition.name in allowed_tool_names)
+    )
+    alternatives_available = bool(
+        permitted_inspection_names - requested_inspection_names
     )
 
     return (
@@ -306,6 +317,7 @@ def run_tool_calling_loop(
                     + _inspection_failure_diagnostics(
                         response,
                         current_request,
+                        allowed_tool_names=allowed_tool_names,
                         executed_rounds=executed_rounds,
                         max_tool_rounds=max_tool_rounds,
                         duplicate_count=len(
@@ -358,6 +370,7 @@ def run_tool_calling_loop(
                     + _inspection_failure_diagnostics(
                         response,
                         current_request,
+                        allowed_tool_names=allowed_tool_names,
                         executed_rounds=executed_rounds,
                         max_tool_rounds=max_tool_rounds,
                         duplicate_count=(
