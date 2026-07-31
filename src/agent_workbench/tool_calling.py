@@ -19,9 +19,9 @@ from agent_workbench.tools import (
 type ToolRoundObserver = Callable[[ToolInteractionRound], None]
 
 MAX_TOOL_INVOCATIONS_PER_RESPONSE = 8
+RESERVED_SYNTHESIS_ACTION_TOOL_ROUNDS = 1
 _MAX_TOOL_BATCH_RECOVERIES = 1
 _MAX_WITHHELD_INSPECTION_RECOVERIES = 1
-_MAX_CONSECUTIVE_INSPECTION_ROUNDS = 16
 _REPEATED_INSPECTION_TOOL_NAMES = frozenset(
     {
         "inspect_git_diff",
@@ -39,11 +39,11 @@ _TOOL_BATCH_RECOVERY_INSTRUCTION = (
     "for the returned results before requesting more. If no tool call is "
     "needed, respond normally."
 )
-_INSPECTION_STREAK_RECOVERY_INSTRUCTION = (
-    "The previous completed rounds used only successful read-only inspection "
-    "tools without transitioning to another operation. Use the inspection "
-    "information already returned to perform the next necessary non-inspection "
-    "operation, or respond normally if no tool call is needed."
+_INSPECTION_BUDGET_RECOVERY_INSTRUCTION = (
+    "The productive read-only inspection budget is exhausted. Use the repository "
+    "evidence already gathered to produce the next available controlled action, "
+    "or finish without making changes. Do not request another read-only inspection "
+    "tool."
 )
 _WITHHELD_INSPECTION_RECOVERY_INSTRUCTION = (
     "The previous response requested a read-only inspection tool that was not "
@@ -151,8 +151,11 @@ def _inspection_failure_diagnostics(
     allowed_tool_names: frozenset[str] | None,
     executed_rounds: int,
     max_tool_rounds: int,
+    productive_inspection_count: int,
     duplicate_count: int,
     inspection_streak_count: int,
+    inspection_budget: int,
+    reserved_synthesis_action_rounds: int,
 ) -> str:
     """Return sanitized lifecycle fields for one repeated-inspection failure."""
 
@@ -179,8 +182,12 @@ def _inspection_failure_diagnostics(
     return (
         f"requested_inspection={invocation.tool_name}; "
         f"tool_round_count={executed_rounds}/{max_tool_rounds}; "
+        f"productive_inspection_count={productive_inspection_count}; "
         f"duplicate_count={duplicate_count}; "
         f"inspection_streak_count={inspection_streak_count}; "
+        f"inspection_budget={inspection_budget}; "
+        "reserved_synthesis_action_rounds="
+        f"{reserved_synthesis_action_rounds}; "
         "response_repair_attempt_count="
         f"{response.response_repair_attempt_count}; "
         "alternative_inspection_tools_available="
@@ -214,6 +221,31 @@ def _count_trailing_successful_inspection_rounds(
         count += 1
 
     return count
+
+
+def _productive_inspection_budget(
+    request: ChatRequest,
+    max_tool_rounds: int,
+    allowed_tool_names: frozenset[str] | None,
+) -> tuple[int, int]:
+    """Reserve an action round only when one is available to the provider."""
+
+    inspection_available = any(
+        definition.name in _REPEATED_INSPECTION_TOOL_NAMES
+        and (allowed_tool_names is None or definition.name in allowed_tool_names)
+        for definition in request.tools
+    )
+    action_available = any(
+        definition.name not in _REPEATED_INSPECTION_TOOL_NAMES
+        and (allowed_tool_names is None or definition.name in allowed_tool_names)
+        for definition in request.tools
+    )
+    reserved_rounds = (
+        min(RESERVED_SYNTHESIS_ACTION_TOOL_ROUNDS, max_tool_rounds)
+        if inspection_available and action_available
+        else 0
+    )
+    return max_tool_rounds - reserved_rounds, reserved_rounds
 
 
 def _without_inspection_tools(
@@ -287,10 +319,18 @@ def run_tool_calling_loop(
     consecutive_inspection_rounds = _count_trailing_successful_inspection_rounds(
         completed_rounds
     )
-    withheld_inspection_streak_count = 0
-    inspection_tools_withheld = (
-        consecutive_inspection_rounds >= _MAX_CONSECUTIVE_INSPECTION_ROUNDS
+    productive_inspection_count = consecutive_inspection_rounds
+    inspection_budget, reserved_synthesis_action_rounds = _productive_inspection_budget(
+        request,
+        max_tool_rounds,
+        allowed_tool_names,
     )
+    withheld_inspection_streak_count = 0
+    inspection_budget_exhausted = (
+        reserved_synthesis_action_rounds > 0
+        and productive_inspection_count >= inspection_budget
+    )
+    inspection_tools_withheld = inspection_budget_exhausted
 
     if inspection_tools_withheld:
         withheld_inspection_streak_count = consecutive_inspection_rounds
@@ -298,10 +338,9 @@ def run_tool_calling_loop(
         current_request = _add_temporary_recovery_instruction(
             request,
             completed_rounds,
-            _INSPECTION_STREAK_RECOVERY_INSTRUCTION,
+            _INSPECTION_BUDGET_RECOVERY_INSTRUCTION,
             withhold_inspection_tools=True,
         )
-        consecutive_inspection_rounds = 0
 
     while True:
         response = provider.complete(current_request)
@@ -320,10 +359,15 @@ def run_tool_calling_loop(
                         allowed_tool_names=allowed_tool_names,
                         executed_rounds=executed_rounds,
                         max_tool_rounds=max_tool_rounds,
+                        productive_inspection_count=productive_inspection_count,
                         duplicate_count=len(
                             _duplicate_inspection_ids(response, completed_rounds)
                         ),
                         inspection_streak_count=withheld_inspection_streak_count,
+                        inspection_budget=inspection_budget,
+                        reserved_synthesis_action_rounds=(
+                            reserved_synthesis_action_rounds
+                        ),
                     )
                 )
 
@@ -373,19 +417,25 @@ def run_tool_calling_loop(
                         allowed_tool_names=allowed_tool_names,
                         executed_rounds=executed_rounds,
                         max_tool_rounds=max_tool_rounds,
+                        productive_inspection_count=productive_inspection_count,
                         duplicate_count=(
                             duplicate_inspection_rejections
                             + len(matching_inspection_ids)
                         ),
                         inspection_streak_count=consecutive_inspection_rounds,
+                        inspection_budget=inspection_budget,
+                        reserved_synthesis_action_rounds=(
+                            reserved_synthesis_action_rounds
+                        ),
                     )
                 )
             raise CompletionError(
                 "The maximum number of tool execution rounds was exceeded."
             )
 
-        inspection_tools_withheld = False
-        withheld_inspection_recoveries = 0
+        if not inspection_budget_exhausted:
+            inspection_tools_withheld = False
+            withheld_inspection_recoveries = 0
 
         approval_required = tuple(
             invocation
@@ -429,9 +479,18 @@ def run_tool_calling_loop(
                 if tool_round_observer is not None:
                     tool_round_observer(completed_round)
 
-                current_request = replace(
-                    request,
-                    tool_interactions=completed_rounds,
+                current_request = (
+                    _add_temporary_recovery_instruction(
+                        request,
+                        completed_rounds,
+                        _INSPECTION_BUDGET_RECOVERY_INSTRUCTION,
+                        withhold_inspection_tools=True,
+                    )
+                    if inspection_budget_exhausted
+                    else replace(
+                        request,
+                        tool_interactions=completed_rounds,
+                    )
                 )
                 consecutive_inspection_rounds = 0
                 executed_rounds += 1
@@ -491,20 +550,33 @@ def run_tool_calling_loop(
 
         if _is_successful_inspection_round(completed_round):
             consecutive_inspection_rounds += 1
+            productive_inspection_count = consecutive_inspection_rounds
         else:
             consecutive_inspection_rounds = 0
+            if not inspection_budget_exhausted:
+                productive_inspection_count = 0
 
-        if consecutive_inspection_rounds >= _MAX_CONSECUTIVE_INSPECTION_ROUNDS:
+        if (
+            reserved_synthesis_action_rounds > 0
+            and productive_inspection_count >= inspection_budget
+        ):
+            inspection_budget_exhausted = True
+            inspection_tools_withheld = True
             withheld_inspection_streak_count = consecutive_inspection_rounds
             current_request = _add_temporary_recovery_instruction(
                 request,
                 completed_rounds,
-                _INSPECTION_STREAK_RECOVERY_INSTRUCTION,
+                _INSPECTION_BUDGET_RECOVERY_INSTRUCTION,
                 withhold_inspection_tools=True,
             )
-            inspection_tools_withheld = True
             withheld_inspection_recoveries = 0
-            consecutive_inspection_rounds = 0
+        elif inspection_budget_exhausted:
+            current_request = _add_temporary_recovery_instruction(
+                request,
+                completed_rounds,
+                _INSPECTION_BUDGET_RECOVERY_INSTRUCTION,
+                withhold_inspection_tools=True,
+            )
         else:
             current_request = replace(
                 request,
