@@ -249,22 +249,144 @@ def test_line_range_approval_preserves_safe_text_and_normalizes_crlf(
         approval_request(
             "apply_line_range_replacement",
             {
-                "path": "src/café.py",
+                "path": "src/café-Ελλάδα-文件-😀.py",
                 "operation": "update",
                 "old_size_bytes": 4,
                 "new_size_bytes": 4,
                 "changed_lines": 2,
                 "start_line": 1,
                 "end_line": 1,
-                "diff": "--- a/café.py\r\n+++ b/café.py\r\n+name\t=\t'Zoë'\r\n",
+                "diff": (
+                    "--- a/café.py\r\n"
+                    "+++ b/café.py\r\n"
+                    "+name\t=\t'Zoë Ελλάδα 文件 😀'\r\n"
+                ),
             },
         )
     )
 
     output = capsys.readouterr().out
-    assert "Path: src/café.py" in output
-    assert "--- a/café.py\n+++ b/café.py\n+name\t=\t'Zoë'\n" in output
+    assert "Path: src/café-Ελλάδα-文件-😀.py" in output
+    assert "--- a/café.py\n+++ b/café.py\n+name\t=\t'Zoë Ελλάδα 文件 😀'\n" in output
     assert "\r" not in output
+
+
+def test_line_range_approval_escapes_unicode_formatting_controls(
+    monkeypatch,
+    capsys,
+) -> None:
+    """Render bidi, zero-width, BOM, and Unicode separators visibly."""
+
+    monkeypatch.setattr("builtins.input", lambda _prompt: "no")
+    controls = (
+        "\u202e",
+        "\u202c",
+        "\u2066",
+        "\u2067",
+        "\u2068",
+        "\u2069",
+        "\u200b",
+        "\u200c",
+        "\u200d",
+        "\ufeff",
+        "\u2028",
+        "\u2029",
+    )
+    unsafe_text = "".join(controls)
+
+    decision = _prompt_for_tool_approval(
+        approval_request(
+            "apply_line_range_replacement",
+            {
+                "path": f"src/{unsafe_text}module.py",
+                "operation": "update",
+                "old_size_bytes": 1,
+                "new_size_bytes": 1,
+                "changed_lines": 2,
+                "start_line": 1,
+                "end_line": 1,
+                "diff": f"--- a/module.py\n+++ b/module.py\n+{unsafe_text}\n",
+            },
+        )
+    )
+
+    output = capsys.readouterr().out
+    assert decision is ToolApprovalDecision.DENY
+    assert "Terminal control characters are shown as escaped text" in output
+    for control in controls:
+        assert f"\\u{ord(control):04x}" in output
+        assert control not in output
+
+
+def test_approved_line_range_preserves_unicode_control_bytes(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    """Escape Unicode preview controls without changing replacement bytes."""
+
+    original = "old\n"
+    replacement = (
+        "café Ελλάδα 文件 😀\t"
+        "\u202ehidden\u202c"
+        "\u2066a\u2067b\u2068c\u2069"
+        "\u200b\u200c\u200d\ufeff"
+        "\u2028\u2029\n"
+    )
+    tested_controls = (
+        "\u202e",
+        "\u202c",
+        "\u2066",
+        "\u2067",
+        "\u2068",
+        "\u2069",
+        "\u200b",
+        "\u200c",
+        "\u200d",
+        "\ufeff",
+        "\u2028",
+        "\u2029",
+    )
+    target = tmp_path / "module.py"
+    target.write_text(original, encoding="utf-8")
+    provider = FakeProvider(
+        [
+            ChatResponse(
+                tool_invocations=(
+                    ToolInvocation(
+                        id="unicode-preview-controls",
+                        tool_name="apply_line_range_replacement",
+                        arguments={
+                            "path": "module.py",
+                            "start_line": 1,
+                            "end_line": 1,
+                            "replacement_content": replacement,
+                            "expected_file_sha256": hashlib.sha256(
+                                original.encode("utf-8")
+                            ).hexdigest(),
+                        },
+                    ),
+                )
+            ),
+            ChatResponse(text="Done."),
+        ]
+    )
+    session = AgentSession(
+        id=SessionId("unicode-preview-controls"),
+        provider=provider,
+        tool_registry=action_registry(Workspace(tmp_path)),
+    )
+    inputs = iter(["Change it.", "yes", "/exit"])
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
+
+    run_cli(session, enable_actions=True)
+
+    output = capsys.readouterr().out
+    assert target.read_bytes() == replacement.encode("utf-8")
+    assert "café Ελλάδα 文件 😀\t" in output
+    for control in tested_controls:
+        assert f"\\u{ord(control):04x}" in output
+        assert control not in output
 
 
 def test_approved_line_range_writes_exact_controls_but_renders_them_safely(

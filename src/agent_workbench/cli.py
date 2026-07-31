@@ -2,6 +2,7 @@
 
 import json
 import sys
+import unicodedata
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -779,6 +780,11 @@ def _render_terminal_safe_text(
             was_escaped = True
         elif 0x80 <= codepoint <= 0x9F:
             rendered.append(f"\\u{codepoint:04x}")
+            was_escaped = True
+        elif unicodedata.category(character) in {"Cf", "Zl", "Zp"}:
+            rendered.append(
+                f"\\u{codepoint:04x}" if codepoint <= 0xFFFF else f"\\U{codepoint:08x}"
+            )
             was_escaped = True
         else:
             rendered.append(character)
