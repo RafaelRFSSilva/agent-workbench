@@ -2202,6 +2202,140 @@ def test_line_range_replacement_approved_action_rechecks_stale_file(
     assert target.read_text(encoding="utf-8") == "concurrent\n"
 
 
+@pytest.mark.parametrize(
+    "change_kind",
+    ["content", "identical-inode", "chmod", "symlink", "deletion"],
+)
+def test_line_range_approved_snapshot_rejects_identity_and_metadata_changes(
+    tmp_path: Path,
+    change_kind: str,
+) -> None:
+    """Bind approval to exact bytes, inode, mode, timestamps, and file type."""
+
+    root, workspace = create_workspace(tmp_path)
+    target = root / "module.py"
+    target.write_bytes(b"old\n")
+    target.chmod(0o640)
+    original_inode = target.stat().st_ino
+    outside = tmp_path / "outside.py"
+    outside.write_bytes(b"outside\n")
+    registry = ToolRegistry()
+    register_workspace_action_tools(registry, workspace)
+
+    def change_approved_target() -> None:
+        if change_kind == "content":
+            target.write_bytes(b"concurrent\n")
+        elif change_kind == "identical-inode":
+            substitute = root / "substitute.py"
+            substitute.write_bytes(b"old\n")
+            substitute.chmod(0o640)
+            os.replace(substitute, target)
+            assert target.stat().st_ino != original_inode
+        elif change_kind == "chmod":
+            target.chmod(0o600)
+        elif change_kind == "symlink":
+            target.unlink()
+            target.symlink_to(outside)
+        else:
+            target.unlink()
+
+    invoke_line_range_replacement(
+        registry,
+        line_range_replacement_arguments(file_content="old\n"),
+        decision=ToolApprovalDecision.APPROVE,
+        before_approval=change_approved_target,
+    )
+
+    if change_kind == "content":
+        assert target.read_bytes() == b"concurrent\n"
+    elif change_kind == "identical-inode":
+        assert target.read_bytes() == b"old\n"
+        assert target.stat().st_ino != original_inode
+    elif change_kind == "chmod":
+        assert target.read_bytes() == b"old\n"
+        assert stat.S_IMODE(target.stat().st_mode) == 0o600
+    elif change_kind == "symlink":
+        assert target.is_symlink()
+        assert outside.read_bytes() == b"outside\n"
+    else:
+        assert not target.exists()
+    assert list(root.glob(".agent-workbench-patch-*")) == []
+
+
+@pytest.mark.parametrize("change_kind", ["content", "identical-inode"])
+def test_line_range_final_handoff_rejects_descriptor_and_path_changes(
+    tmp_path: Path,
+    monkeypatch,
+    change_kind: str,
+) -> None:
+    """Reject deterministic changes after the initial final-handoff read."""
+
+    root, workspace = create_workspace(tmp_path)
+    target = root / "module.py"
+    target.write_bytes(b"old\n")
+    target.chmod(0o640)
+    original_inode = target.stat().st_ino
+
+    def change_during_handoff(_patch) -> None:
+        if change_kind == "content":
+            target.write_bytes(b"concurrent\n")
+        else:
+            substitute = root / "substitute.py"
+            substitute.write_bytes(b"old\n")
+            substitute.chmod(0o640)
+            os.replace(substitute, target)
+            assert target.stat().st_ino != original_inode
+
+    monkeypatch.setattr(
+        "agent_workbench.workspace_actions._before_atomic_replace_final_check",
+        change_during_handoff,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"^apply_file_patch target changed before replacement\.$",
+    ):
+        apply_line_range_replacement(
+            workspace,
+            line_range_replacement_arguments(file_content="old\n"),
+        )
+
+    if change_kind == "content":
+        assert target.read_bytes() == b"concurrent\n"
+    else:
+        assert target.read_bytes() == b"old\n"
+        assert target.stat().st_ino != original_inode
+    assert list(root.glob(".agent-workbench-patch-*")) == []
+
+
+def test_line_range_final_handoff_unchanged_target_succeeds(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Keep the target descriptor open through a successful final check."""
+
+    root, workspace = create_workspace(tmp_path)
+    target = root / "module.py"
+    target.write_bytes(b"old\n")
+    target.chmod(0o751)
+    checks = []
+    monkeypatch.setattr(
+        "agent_workbench.workspace_actions._before_atomic_replace_final_check",
+        lambda patch: checks.append(patch.relative_path),
+    )
+
+    result = apply_line_range_replacement(
+        workspace,
+        line_range_replacement_arguments(file_content="old\n"),
+    )
+
+    assert result["path"] == "module.py"
+    assert checks == ["module.py"]
+    assert target.read_bytes() == b"value = 2\n"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o751
+    assert list(root.glob(".agent-workbench-patch-*")) == []
+
+
 def test_transaction_registration_uses_exact_closed_nested_schema(
     tmp_path: Path,
 ) -> None:
