@@ -410,6 +410,12 @@ def _display_coding_progress(event: CodingProgressEvent) -> None:
         )
     elif event.kind is CodingProgressKind.WORKSPACE_CHANGED:
         message = f"Changed {event.path or '[unavailable]'}"
+    elif event.kind is CodingProgressKind.ACTION_ARGUMENTS_REJECTED:
+        target = f" for {event.path}" if event.path is not None else ""
+        message = (
+            f"Controlled action arguments rejected{target}: "
+            f"{event.reason or 'unavailable'}"
+        )
     elif event.kind is CodingProgressKind.ACTION_FAILED:
         target = f" for {event.path}" if event.path is not None else ""
         if event.later_action_rejected:

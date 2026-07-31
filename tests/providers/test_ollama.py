@@ -20,7 +20,10 @@ from agent_workbench.providers.ollama import OllamaProvider
 from agent_workbench.generation import GenerationConfig
 from agent_workbench.structured_outputs import JSONResponseFormat
 from agent_workbench.tools import ToolDefinition, ToolInvocation, ToolResult
-from agent_workbench.workspace_actions import APPLY_WORKSPACE_CHANGES_DEFINITION
+from agent_workbench.workspace_actions import (
+    APPLY_FILE_PATCH_DEFINITION,
+    APPLY_WORKSPACE_CHANGES_DEFINITION,
+)
 
 
 def test_provider_returns_model_response(monkeypatch) -> None:
@@ -601,6 +604,46 @@ def test_atomic_workspace_schema_is_delivered_to_ollama_unchanged(
         "replacement_content",
     ]
     assert changes["items"]["additionalProperties"] is False
+
+
+def test_patch_schema_is_delivered_to_ollama_unchanged(monkeypatch) -> None:
+    """Advertise the exact closed patch shape enforced by the generic runtime."""
+
+    captured_arguments = {}
+
+    def fake_chat(**kwargs):
+        captured_arguments.update(kwargs)
+        return SimpleNamespace(
+            message=SimpleNamespace(
+                content="",
+                tool_calls=None,
+            )
+        )
+
+    monkeypatch.setattr(
+        "agent_workbench.providers.ollama.chat",
+        fake_chat,
+    )
+
+    assert (
+        OllamaProvider(model_name="test-model").complete(
+            ChatRequest(
+                messages=[{"role": "user", "content": "Update one file."}],
+                tools=(APPLY_FILE_PATCH_DEFINITION,),
+            )
+        )
+        == ChatResponse()
+    )
+
+    function = captured_arguments["tools"][0]["function"]
+    assert function["name"] == "apply_file_patch"
+    assert function["parameters"] == APPLY_FILE_PATCH_DEFINITION.input_schema
+    assert function["parameters"]["required"] == [
+        "path",
+        "expected_content",
+        "replacement_content",
+    ]
+    assert function["parameters"]["additionalProperties"] is False
 
 
 def test_tool_calls_are_translated_to_tool_invocations(

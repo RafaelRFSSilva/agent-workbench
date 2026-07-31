@@ -20,6 +20,7 @@ type ToolRoundObserver = Callable[[ToolInteractionRound], None]
 
 MAX_TOOL_INVOCATIONS_PER_RESPONSE = 8
 RESERVED_SYNTHESIS_ACTION_TOOL_ROUNDS = 1
+MAX_TOOL_ARGUMENT_VALIDATION_RECOVERIES = 1
 _MAX_TOOL_BATCH_RECOVERIES = 1
 _MAX_WITHHELD_INSPECTION_RECOVERIES = 1
 _REPEATED_INSPECTION_TOOL_NAMES = frozenset(
@@ -55,6 +56,11 @@ _DUPLICATE_INSPECTION_ERROR = (
     "Duplicate inspection rejected: the same read-only invocation already "
     "completed successfully. Use the existing result, choose a different "
     "inspection, or produce the next controlled edit."
+)
+_VALIDATION_BATCH_RETRY_ERROR = (
+    "Tool call was not executed because another invocation in the same response "
+    "failed argument validation. Issue corrected tool calls matching the "
+    "advertised schemas."
 )
 
 
@@ -315,6 +321,7 @@ def run_tool_calling_loop(
     executed_rounds = 0
     tool_batch_recoveries = 0
     duplicate_inspection_rejections = 0
+    argument_validation_recoveries = 0
     withheld_inspection_recoveries = 0
     consecutive_inspection_rounds = _count_trailing_successful_inspection_rounds(
         completed_rounds
@@ -397,6 +404,79 @@ def run_tool_calling_loop(
 
         if not response.tool_invocations:
             return response
+
+        validation_errors = tuple(
+            (
+                registry.argument_validation_error(invocation)
+                if registry.requires_approval(invocation)
+                else None
+            )
+            for invocation in response.tool_invocations
+        )
+        if any(error is not None for error in validation_errors):
+            failure_count = argument_validation_recoveries + 1
+            invalid_invocation = next(
+                invocation
+                for invocation, error in zip(
+                    response.tool_invocations,
+                    validation_errors,
+                    strict=True,
+                )
+                if error is not None
+            )
+            results = tuple(
+                ToolResult(
+                    invocation_id=invocation.id,
+                    status="error",
+                    error=error or _VALIDATION_BATCH_RETRY_ERROR,
+                )
+                for invocation, error in zip(
+                    response.tool_invocations,
+                    validation_errors,
+                    strict=True,
+                )
+            )
+            completed_round = ToolInteractionRound(
+                response=response,
+                results=results,
+            )
+            completed_rounds = (*completed_rounds, completed_round)
+
+            if tool_round_observer is not None:
+                tool_round_observer(completed_round)
+
+            if (
+                argument_validation_recoveries
+                >= MAX_TOOL_ARGUMENT_VALIDATION_RECOVERIES
+            ):
+                raise CompletionError(
+                    "Tool argument validation recovery limit reached; "
+                    f"tool={invalid_invocation.tool_name}; "
+                    f"argument_validation_failures={failure_count}; "
+                    f"tool_round_count={executed_rounds}/{max_tool_rounds}; "
+                    "correction_opportunity_provided="
+                    f"{str(argument_validation_recoveries > 0).lower()}"
+                )
+
+            argument_validation_recoveries += 1
+            consecutive_inspection_rounds = 0
+            if not inspection_budget_exhausted:
+                productive_inspection_count = 0
+
+            current_request = (
+                _add_temporary_recovery_instruction(
+                    request,
+                    completed_rounds,
+                    _INSPECTION_BUDGET_RECOVERY_INSTRUCTION,
+                    withhold_inspection_tools=True,
+                )
+                if inspection_budget_exhausted
+                else replace(
+                    request,
+                    tool_interactions=completed_rounds,
+                )
+            )
+            continue
 
         duplicate_inspection_ids = _duplicate_inspection_ids(
             response,
