@@ -307,7 +307,7 @@ def test_registration_preserves_existing_tools_and_exact_definition(
     assert APPLY_FILE_PATCH_DEFINITION.name == "apply_file_patch"
     assert APPLY_FILE_PATCH_DEFINITION.description == (
         "Apply one approved optimistic UTF-8 file patch inside the authorized "
-        "workspace."
+        "workspace when complete exact current content is known or creating a file."
     )
     assert APPLY_FILE_PATCH_DEFINITION.input_schema == {
         "type": "object",
@@ -382,8 +382,8 @@ def test_registration_preserves_existing_tools_and_exact_definition(
     )
     assert APPLY_TEXT_REPLACEMENT_DEFINITION.name == "apply_text_replacement"
     assert APPLY_TEXT_REPLACEMENT_DEFINITION.description == (
-        "Replace a bounded exact literal text fragment in one existing UTF-8 "
-        "file using the SHA-256 digest from read_file."
+        "Replace a reasonably small exact current literal fragment in one "
+        "existing UTF-8 file using the exact SHA-256 from read_file."
     )
     assert APPLY_TEXT_REPLACEMENT_DEFINITION.input_schema == {
         "type": "object",
@@ -417,6 +417,48 @@ def test_registration_preserves_existing_tools_and_exact_definition(
             arguments=text_replacement_arguments(),
         )
     )
+
+
+def test_line_range_model_contract_documents_range_and_required_sha(
+    tmp_path: Path,
+) -> None:
+    """Expose one closed model-facing schema with explicit line semantics."""
+
+    root, workspace = create_workspace(tmp_path)
+    target = root / "module.py"
+    target.write_text("old\n", encoding="utf-8")
+    registry = ToolRegistry()
+    register_workspace_action_tools(registry, workspace)
+    schema = APPLY_LINE_RANGE_REPLACEMENT_DEFINITION.input_schema
+
+    assert "one-based inclusive" in (
+        APPLY_LINE_RANGE_REPLACEMENT_DEFINITION.description
+    )
+    assert "SHA-256" in APPLY_LINE_RANGE_REPLACEMENT_DEFINITION.description
+    assert schema["required"] == [
+        "path",
+        "start_line",
+        "end_line",
+        "replacement_content",
+        "expected_file_sha256",
+    ]
+    assert schema["additionalProperties"] is False
+
+    invalid = ToolInvocation(
+        id="unsupported-line-range",
+        tool_name="apply_line_range_replacement",
+        arguments={
+            **line_range_replacement_arguments(file_content="old\n"),
+            "expected_content": "old\n",
+        },
+    )
+    validation_error = registry.argument_validation_error(invalid)
+    assert validation_error is not None
+    assert "1 unsupported field" in validation_error
+    assert "additional fields are not allowed" in validation_error
+    with pytest.raises(CompletionError, match="argument validation failed"):
+        registry.create_approval_request(invalid)
+    assert target.read_text(encoding="utf-8") == "old\n"
 
 
 @pytest.mark.parametrize(

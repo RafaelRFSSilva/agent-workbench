@@ -50,7 +50,7 @@ APPLY_FILE_PATCH_DEFINITION = ToolDefinition(
     name="apply_file_patch",
     description=(
         "Apply one approved optimistic UTF-8 file patch inside the authorized "
-        "workspace."
+        "workspace when complete exact current content is known or creating a file."
     ),
     input_schema={
         "type": "object",
@@ -68,7 +68,8 @@ APPLY_FILE_PATCH_DEFINITION = ToolDefinition(
 APPLY_FILE_REWRITE_DEFINITION = ToolDefinition(
     name="apply_file_rewrite",
     description=(
-        "Rewrite one existing UTF-8 file using the SHA-256 digest from read_file."
+        "Rewrite one complete existing UTF-8 file using the SHA-256 from a "
+        "complete read_file; do not use it to bypass an exact-content mismatch."
     ),
     input_schema={
         "type": "object",
@@ -92,8 +93,8 @@ APPLY_FILE_REWRITE_DEFINITION = ToolDefinition(
 APPLY_TEXT_REPLACEMENT_DEFINITION = ToolDefinition(
     name="apply_text_replacement",
     description=(
-        "Replace a bounded exact literal text fragment in one existing UTF-8 "
-        "file using the SHA-256 digest from read_file."
+        "Replace a reasonably small exact current literal fragment in one "
+        "existing UTF-8 file using the exact SHA-256 from read_file."
     ),
     input_schema={
         "type": "object",
@@ -125,8 +126,9 @@ APPLY_TEXT_REPLACEMENT_DEFINITION = ToolDefinition(
 APPLY_LINE_RANGE_REPLACEMENT_DEFINITION = ToolDefinition(
     name="apply_line_range_replacement",
     description=(
-        "Replace one exact one-based inclusive line range in an existing UTF-8 "
-        "file using its current SHA-256 digest."
+        "After read_file inspection, replace one exact one-based inclusive line "
+        "range in an existing UTF-8 file, particularly a large file, using the "
+        "exact current file SHA-256."
     ),
     input_schema={
         "type": "object",

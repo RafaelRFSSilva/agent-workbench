@@ -406,6 +406,92 @@ def test_line_range_action_is_compatible_with_final_workspace_verification(
     assert run_git(repository, "status", "--short").stdout == " M module.py\n"
 
 
+def test_large_file_line_range_regression_changes_only_inspected_middle_range(
+    tmp_path: Path,
+) -> None:
+    """Avoid fragile exact-fragment retries while preserving surrounding bytes."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    prefix = "".join(f"# prefix {index:04d}\n" for index in range(1, 601))
+    selected = "    return left - right\n"
+    suffix = "\n\n" + "".join(f"# suffix {index:04d}\n" for index in range(1, 601))
+    original = (
+        prefix + "\n\ndef add(left: int, right: int) -> int:\n" + selected + suffix
+    )
+    target = repository / "module.py"
+    target.write_bytes(original.encode("utf-8"))
+    run_git(repository, "add", "module.py")
+    run_git(repository, "commit", "-m", "add large source fixture")
+    expected_sha256 = hashlib.sha256(original.encode("utf-8")).hexdigest()
+    approvals = []
+    provider = ScriptedProvider(
+        [
+            tool_response(
+                "inspect-middle",
+                "read_file",
+                {"path": "module.py", "line_start": 600, "line_end": 607},
+            ),
+            ChatResponse(text="Inspected the target range."),
+            line_range_response(
+                "edit-middle",
+                expected_content=original,
+                start_line=604,
+                end_line=604,
+                replacement_content="    return left + right\n",
+            ),
+            ChatResponse(text="Changed only the inspected range."),
+        ]
+    )
+
+    def approve_and_capture(request) -> ToolApprovalDecision:
+        if request.invocation.tool_name == "apply_line_range_replacement":
+            approvals.append(request.preview)
+        return ToolApprovalDecision.APPROVE
+
+    result = run_autonomous_coding_task(
+        create_session(repository, provider),
+        "Correct the add implementation in the large source file.",
+        tool_approval_handler=approve_and_capture,
+    )
+
+    updated = target.read_bytes()
+    prefix_bytes = (prefix + "\n\ndef add(left: int, right: int) -> int:\n").encode(
+        "utf-8"
+    )
+    suffix_bytes = suffix.encode("utf-8")
+    assert updated[: len(prefix_bytes)] == prefix_bytes
+    assert updated[-len(suffix_bytes) :] == suffix_bytes
+    assert updated == (prefix_bytes + b"    return left + right\n" + suffix_bytes)
+    assert expected_sha256 != hashlib.sha256(updated).hexdigest()
+    assert approvals == [
+        {
+            "path": "module.py",
+            "operation": "update",
+            "old_size_bytes": len(original.encode("utf-8")),
+            "new_size_bytes": len(updated),
+            "changed_lines": 2,
+            "start_line": 604,
+            "end_line": 604,
+            "diff": (
+                "--- a/module.py\n"
+                "+++ b/module.py\n"
+                "@@ -601,7 +601,7 @@\n"
+                " \n"
+                " \n"
+                " def add(left: int, right: int) -> int:\n"
+                "-    return left - right\n"
+                "+    return left + right\n"
+                " \n"
+                " \n"
+                " # suffix 0001\n"
+            ),
+        }
+    ]
+    assert result.final_phase is CodingPhase.DONE
+    assert result.approved_workspace_paths == ("module.py",)
+    assert run_git(repository, "status", "--short").stdout == " M module.py\n"
+
+
 def test_invalid_patch_arguments_are_corrected_before_one_approved_edit(
     tmp_path: Path,
     monkeypatch,
@@ -533,8 +619,13 @@ def test_invalid_patch_arguments_are_corrected_before_one_approved_edit(
     assert (repository / "module.py").read_text(encoding="utf-8") == corrected
 
 
-def test_repeated_invalid_patch_arguments_terminate_with_safe_diagnostics(
+@pytest.mark.parametrize(
+    "tool_name",
+    ["apply_file_patch", "apply_line_range_replacement"],
+)
+def test_repeated_invalid_controlled_action_arguments_remain_bounded(
     tmp_path: Path,
+    tool_name: str,
 ) -> None:
     """Preserve the workspace after the fixed controlled-action recovery bound."""
 
@@ -543,19 +634,31 @@ def test_repeated_invalid_patch_arguments_terminate_with_safe_diagnostics(
     unsupported_name = (
         f"{repository}/private.env\nPRIVATE_TOKEN=secret-value\rreturn\ttab\x1b[31mred"
     )
+    valid_arguments: dict[str, object]
+    if tool_name == "apply_file_patch":
+        valid_arguments = {
+            "path": "module.py",
+            "expected_content": original,
+            "replacement_content": original.replace(
+                "left - right",
+                "left + right",
+            ),
+        }
+    else:
+        valid_arguments = {
+            "path": "module.py",
+            "start_line": 2,
+            "end_line": 2,
+            "replacement_content": "    return left + right\n",
+            "expected_file_sha256": hashlib.sha256(
+                original.encode("utf-8")
+            ).hexdigest(),
+        }
     invalid_responses = [
         tool_response(
             f"invalid-{index}",
-            "apply_file_patch",
-            {
-                "path": "module.py",
-                "expected_content": original,
-                "replacement_content": original.replace(
-                    "left - right",
-                    "left + right",
-                ),
-                unsupported_name: index,
-            },
+            tool_name,
+            {**valid_arguments, unsupported_name: index},
         )
         for index in range(MAX_CONTROLLED_ACTION_ARGUMENT_VALIDATION_FAILURES)
     ]
@@ -586,7 +689,7 @@ def test_repeated_invalid_patch_arguments_terminate_with_safe_diagnostics(
     message = str(raised.value)
     assert "controlled action argument recovery limit reached" in message
     assert "phase=EDIT" in message
-    assert "tool=apply_file_patch" in message
+    assert f"tool={tool_name}" in message
     assert "argument_validation_failures=2" in message
     assert "tool_round_count=" in message
     assert "correction_opportunity_provided=true" in message
@@ -3023,6 +3126,17 @@ def test_phase_prompts_include_explicit_evidence_and_attempt_counters(
         assert "Completion continuations: 0" in prompt
         assert "Only the controller can advance phases or declare DONE." in prompt
     assert "Executed tools: read_file" in edit_prompt
+    assert "Controlled edit selection:" in edit_prompt
+    assert "apply_text_replacement" in edit_prompt
+    assert "exact current fragment is known and reasonably small" in edit_prompt
+    assert "apply_line_range_replacement" in edit_prompt
+    assert "one-based and inclusive" in edit_prompt
+    assert "exact current file SHA-256" in edit_prompt
+    assert "Never guess a hash or uninspected line numbers" in edit_prompt
+    assert "Never use a whole-file rewrite to avoid an exact-content mismatch" in (
+        edit_prompt
+    )
+    assert "Never weaken tests or validation" in edit_prompt
     assert DEFAULT_DISCOVER_MAX_TOOL_ROUNDS == 4
     assert DEFAULT_REPAIR_COMPLETION_CONTINUATIONS == 2
 

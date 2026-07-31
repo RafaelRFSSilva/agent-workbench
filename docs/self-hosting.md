@@ -22,13 +22,14 @@ repository-lifecycle changes.
    worktree path, and one new local isolated branch.
 4. Launch the complete isolated autonomous workflow.
 5. Let the bounded read-only DISCOVER phase inspect repository and named files.
-6. Prefer `apply_text_replacement` for each small exact edit to an existing
-   file, using a short literal copied exactly from the latest file. Use
-   `apply_file_rewrite` only after calling `read_file` for the complete file;
-   use that complete latest read's SHA-256 and send the complete resulting
-   file. Never construct a whole-file rewrite from a partial line-range read.
-   Use one `apply_workspace_changes` transaction when several file changes
-   must succeed together or when creation is required.
+6. Use `apply_text_replacement` when the exact current fragment is known and
+   reasonably small. After inspecting the current file, use
+   `apply_line_range_replacement` for a known one-based inclusive range,
+   particularly in a large file, with the exact current `read_file` SHA-256.
+   Never guess a hash or uninspected line numbers. Use `apply_file_rewrite`
+   only for a true whole-file change after a complete read, never to avoid an
+   exact-content mismatch. Use one `apply_workspace_changes` transaction when
+   several file changes must succeed together or when creation is required.
 7. Review every complete action preview and diff.
 8. Approve each controller-invoked Ruff format target separately, then approve
    project-wide Ruff check and pytest. Formatter targets are sorted existing
@@ -118,13 +119,14 @@ Use the existing test conventions:
 1. Inspect the implementation and its tests during DISCOVER.
 2. Add or update focused tests together with the smallest implementation
    change when the objective requires them.
-3. Prefer apply_text_replacement for small exact edits to existing files,
-   using a short literal copied exactly from the latest file. Use
-   apply_file_rewrite only after read_file returns the complete file. Use the
-   SHA from that complete latest read, and send the complete resulting file as
-   replacement_content. Never base a whole-file rewrite on a partial line-range
-   read. Use one apply_workspace_changes transaction when several changes must
-   succeed together.
+3. Use apply_text_replacement when the exact current fragment is known and
+   reasonably small. After inspecting the current file, use
+   apply_line_range_replacement for a known one-based inclusive range,
+   particularly in a large file, with the exact current read_file SHA-256.
+   Never guess a hash or uninspected line numbers. Use apply_file_rewrite only
+   for a true whole-file change after a complete read, never to avoid an
+   exact-content mismatch. Use one apply_workspace_changes transaction when
+   several changes must succeed together.
 4. Wait for operator approval before every write action.
 5. Implement only the smallest correct change.
 6. Do not restart broad discovery during EDIT or REPAIR.
@@ -162,6 +164,9 @@ private paths, or `.env` values in the task prompt or commit message.
 - For `apply_text_replacement`, the path is allowed, the expected literal
   fragment is sufficiently specific, the expected occurrence count is correct,
   and the complete diff contains only the intended edit.
+- For `apply_line_range_replacement`, the path, one-based inclusive range, and
+  exact current SHA-256 match the latest inspection, and the complete diff
+  changes only that range.
 - For `apply_workspace_changes`, the complete path list exactly matches the
   allowed files.
 - Every complete diff implements the requested behavior.

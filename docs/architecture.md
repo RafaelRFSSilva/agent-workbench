@@ -852,8 +852,9 @@ calculator, while `--workspace PATH` authorizes the read-only `list_files`,
 `read_file`, `search_text`, `search_symbols`, `inspect_git_status`, and
 `inspect_git_diff` tools for one root. `--enable-actions` requires that
 workspace and appends `apply_file_patch`, `apply_file_rewrite`,
-`apply_text_replacement`, `apply_workspace_changes`, `run_ruff_format`,
-`run_ruff_check`, and `run_pytest`. The calculator, when
+`apply_text_replacement`, `apply_line_range_replacement`,
+`apply_workspace_changes`, `run_ruff_format`, `run_ruff_check`, and
+`run_pytest`. The calculator, when
 enabled, remains first. Without a tool option or workspace, no registry is
 created.
 `--show-tool-traces` adds an optional callback for completed provider-independent
@@ -957,6 +958,18 @@ limits, and reuse the same complete diff, post-approval revalidation,
 permission preservation, and atomic replacement boundary as
 `apply_file_patch`. It does not support regular expressions, creation,
 deletion, rename, or ambiguous occurrence counts.
+
+`apply_line_range_replacement` performs an exact optimistic splice in an
+existing UTF-8 file after inspection. Its closed provider-independent schema
+requires only `path`, one-based inclusive `start_line` and `end_line`, exact
+`replacement_content`, and the current complete-file SHA-256. Planning hashes
+and decodes the bounded regular file, rejects an invalid or out-of-range
+selection, preserves every byte outside the selected complete lines, enforces
+the existing resulting-file, changed-line, and complete-preview limits, and
+shows the complete unified diff. Execution repeats the hash validation and
+reuses exact-content stale-state checking, permission preservation, and atomic
+replacement. There is no fuzzy match, range correction, creation, or fallback
+to a full-file rewrite.
 
 `apply_workspace_changes` adds an immutable multi-file plan without weakening
 that per-file boundary. Its provider-independent schema is one closed object

@@ -574,9 +574,9 @@ access the network, or use MCP.
 
 Controlled actions are disabled by default. `--enable-actions` requires an
 explicit `--workspace PATH` and adds `apply_file_patch`,
-`apply_file_rewrite`, `apply_text_replacement`, `apply_workspace_changes`,
-`run_ruff_format`, `run_ruff_check`, and `run_pytest` after the read-only
-tools:
+`apply_file_rewrite`, `apply_text_replacement`,
+`apply_line_range_replacement`, `apply_workspace_changes`, `run_ruff_format`,
+`run_ruff_check`, and `run_pytest` after the read-only tools:
 
 ```bash
 uv run agent-workbench \
@@ -645,6 +645,27 @@ replacement internally, shows the complete unified diff, revalidates after
 approval, and uses the same atomic replacement and permission-preservation
 boundary as `apply_file_patch`.
 
+`apply_line_range_replacement` replaces a known complete line range after the
+current file has been inspected, particularly when the file is large:
+
+```json
+{
+  "path": "relative/path.py",
+  "start_line": 120,
+  "end_line": 124,
+  "replacement_content": "exact replacement for the selected lines",
+  "expected_file_sha256": "sha256 from the latest read_file result"
+}
+```
+
+Line numbers are one-based and inclusive. All five fields are required, the
+SHA-256 must exactly match the current complete file, and additional fields are
+rejected. The action performs no fuzzy matching, range correction, or fallback
+rewrite. It preserves content outside the selected range byte-for-byte,
+constructs and displays the complete diff, and revalidates the file before the
+same atomic replacement used by the other single-file actions. Never guess a
+hash or line number: inspect the current file first.
+
 `apply_workspace_changes` applies one approved transaction using this exact
 closed shape:
 
@@ -697,22 +718,26 @@ approval.
 With `--workspace` and `--enable-actions`, tool order is `list_files`,
 `read_file`, `search_text`, `search_symbols`, `inspect_git_status`,
 `inspect_git_diff`, `apply_file_patch`, `apply_file_rewrite`,
-`apply_text_replacement`, `apply_workspace_changes`, `run_ruff_format`,
-`run_ruff_check`, then `run_pytest`. With
+`apply_text_replacement`, `apply_line_range_replacement`,
+`apply_workspace_changes`, `run_ruff_format`, `run_ruff_check`, then
+`run_pytest`. With
 `--enable-tools`, `calculator` comes first and the remaining order is
 unchanged.
 
 Example request:
 
 ```text
-Inspect the relevant files. Prefer apply_text_replacement for small exact
-edits to existing files, using a short literal copied from the latest read.
-Use apply_file_rewrite with the latest read_file SHA for a whole-file
-replacement. For changes that must succeed together, request one
+Inspect the relevant files. Use apply_text_replacement when the exact current
+fragment is known and reasonably small. After inspection, use
+apply_line_range_replacement for a known one-based inclusive range,
+particularly in a large file, with the exact current read_file SHA-256. Never
+guess a hash or uninspected line numbers. Use apply_file_rewrite only for a
+true whole-file replacement after a complete read, never to avoid an
+exact-content mismatch. For changes that must succeed together, request one
 apply_workspace_changes transaction with complete expected and replacement
 content for every file. Request approval before every write or validation
 action, run Ruff and pytest, inspect the final Git status and diff, and
-summarize the result. Do not commit or push.
+summarize the result. Never weaken tests or validation. Do not commit or push.
 ```
 
 See [Architecture](docs/architecture.md) for the shared tool models and
