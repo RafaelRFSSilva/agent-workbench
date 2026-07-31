@@ -29,7 +29,9 @@ from agent_workbench.agents import get_agent_profile
 from agent_workbench.generation import GenerationConfig
 from agent_workbench.config import (
     PROJECT_CONFIG_RELATIVE_PATH,
+    ProjectCodingConfiguration,
     load_project_configuration,
+    render_project_configuration,
 )
 from agent_workbench.git_tools import register_git_tools
 from agent_workbench.structured_outputs import JSONResponseFormat
@@ -1612,6 +1614,179 @@ def test_init_creates_deterministic_loadable_project_configuration(
     assert not (configuration_path.parent / "instructions.md").exists()
     assert capsys.readouterr().out == ("Created .agent-workbench/config.toml\n")
     create_session_mock.assert_not_called()
+
+
+def test_init_dry_run_prints_exact_canonical_configuration_without_files(
+    monkeypatch,
+    tmp_path,
+    capsys,
+) -> None:
+    """Print only canonical TOML without calling the filesystem initializer."""
+
+    create_configuration_mock = Mock()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        "agent_workbench.cli.create_project_configuration",
+        create_configuration_mock,
+    )
+
+    main(
+        [
+            "init",
+            "--dry-run",
+            "--provider",
+            "ollama",
+            "--model",
+            "qwen3-coder:30b",
+        ]
+    )
+
+    expected = render_project_configuration(
+        ProjectCodingConfiguration(
+            provider="ollama",
+            model="qwen3-coder:30b",
+            agent="developer",
+            enable_tools=True,
+            enable_actions=True,
+            max_tool_rounds=8,
+            temperature=0.2,
+            top_p=0.9,
+            max_output_tokens=4096,
+            isolated=False,
+        )
+    )
+    captured = capsys.readouterr()
+    assert captured.out.encode() == expected.encode()
+    assert captured.err == ""
+    assert "Created .agent-workbench/config.toml" not in captured.out
+    assert not (tmp_path / ".agent-workbench").exists()
+    create_configuration_mock.assert_not_called()
+
+
+def test_init_dry_run_output_exactly_matches_normal_initialization(
+    monkeypatch,
+    tmp_path,
+    capsys,
+) -> None:
+    """Keep preview bytes identical to the file written by normal init."""
+
+    preview_root = tmp_path / "preview"
+    normal_root = tmp_path / "normal"
+    preview_root.mkdir()
+    normal_root.mkdir()
+    options = [
+        "--provider",
+        "ollama",
+        "--model",
+        "qwen3-coder:30b",
+        "--no-enable-tools",
+        "--isolated",
+    ]
+
+    monkeypatch.chdir(preview_root)
+    main(["init", "--dry-run", *options])
+    preview_output = capsys.readouterr().out.encode()
+
+    monkeypatch.chdir(normal_root)
+    main(["init", *options])
+    capsys.readouterr()
+
+    assert preview_output == (normal_root / PROJECT_CONFIG_RELATIVE_PATH).read_bytes()
+    assert not (preview_root / ".agent-workbench").exists()
+
+
+def test_init_dry_run_does_not_inspect_existing_invalid_configuration(
+    monkeypatch,
+    tmp_path,
+    capsys,
+) -> None:
+    """Ignore and preserve existing configuration without opening it."""
+
+    configuration_path = tmp_path / PROJECT_CONFIG_RELATIVE_PATH
+    configuration_path.parent.mkdir()
+    original = b"invalid = [toml\n"
+    configuration_path.write_bytes(original)
+    original_open = Path.open
+
+    def guarded_open(path, *args, **kwargs):
+        if path == configuration_path:
+            raise AssertionError("dry-run inspected the existing configuration")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(Path, "open", guarded_open)
+
+    main(["init", "--dry-run"])
+
+    captured = capsys.readouterr()
+    assert captured.out == render_project_configuration(
+        ProjectCodingConfiguration(
+            provider="ollama",
+            model="gpt-oss:20b",
+            agent="developer",
+            enable_tools=True,
+            enable_actions=True,
+            max_tool_rounds=8,
+            temperature=0.2,
+            top_p=0.9,
+            max_output_tokens=4096,
+            isolated=False,
+        )
+    )
+    assert captured.err == ""
+    with original_open(configuration_path, "rb") as configuration_file:
+        assert configuration_file.read() == original
+    assert list(configuration_path.parent.iterdir()) == [configuration_path]
+
+
+def test_invalid_init_dry_run_options_create_no_files(
+    monkeypatch,
+    tmp_path,
+    capsys,
+) -> None:
+    """Report parser validation errors without initialization side effects."""
+
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(SystemExit) as raised:
+        main(["init", "--dry-run", "--max-tool-rounds", "0"])
+
+    assert raised.value.code == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "max tool rounds must be a positive integer" in captured.err
+    assert "Traceback" not in captured.err
+    assert not (tmp_path / ".agent-workbench").exists()
+
+
+def test_init_dry_run_rendering_error_is_concise_and_creates_no_files(
+    monkeypatch,
+    tmp_path,
+    capsys,
+) -> None:
+    """Normalize canonical-renderer validation errors without write attempts."""
+
+    create_configuration_mock = Mock()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        "agent_workbench.cli.render_project_configuration",
+        Mock(side_effect=ConfigurationError("simulated rendering failure")),
+    )
+    monkeypatch.setattr(
+        "agent_workbench.cli.create_project_configuration",
+        create_configuration_mock,
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        main(["init", "--dry-run"])
+
+    assert raised.value.code == 1
+    captured = capsys.readouterr()
+    assert captured.out == "Configuration error: simulated rendering failure\n"
+    assert captured.err == ""
+    assert "Traceback" not in captured.out
+    assert not (tmp_path / ".agent-workbench").exists()
+    create_configuration_mock.assert_not_called()
 
 
 def test_init_creates_configuration_in_the_current_nested_directory(

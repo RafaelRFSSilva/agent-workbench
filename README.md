@@ -173,6 +173,16 @@ to its project configuration:
 Create the configuration, then add `instructions.md` separately as needed;
 `agent-workbench init` does not create the instructions file.
 
+Preview the generated configuration without creating or inspecting project
+configuration files:
+
+```bash
+agent-workbench init \
+  --dry-run \
+  --provider ollama \
+  --model gpt-oss:20b
+```
+
 ```bash
 agent-workbench init --provider ollama --model gpt-oss:20b
 agent-workbench code "Fix the failing tests."
