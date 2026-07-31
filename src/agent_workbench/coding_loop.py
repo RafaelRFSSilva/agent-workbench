@@ -183,6 +183,7 @@ class CodingProgressEvent:
     changed_path_count: int | None = None
     skipped: bool = False
     workspace_preserved: bool = False
+    later_action_rejected: bool = False
 
 
 type CodingProgressObserver = Callable[[CodingProgressEvent], None]
@@ -929,6 +930,13 @@ def _emit_action_progress(
                 kind=CodingProgressKind.ACTION_FAILED,
                 path=evidence.path,
                 reason=evidence.error_message,
+                later_action_rejected=(
+                    evidence.error_message.startswith("Approval preview failed for ")
+                    and _rounds_contain_successful_change(
+                        state.rounds[:-1],
+                        state.approved_action_ids,
+                    )
+                ),
                 **event_fields,
             ),
         )

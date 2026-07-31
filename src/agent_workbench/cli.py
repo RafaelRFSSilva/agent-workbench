@@ -412,7 +412,15 @@ def _display_coding_progress(event: CodingProgressEvent) -> None:
         message = f"Changed {event.path or '[unavailable]'}"
     elif event.kind is CodingProgressKind.ACTION_FAILED:
         target = f" for {event.path}" if event.path is not None else ""
-        message = f"Controlled action failed{target}: {event.reason or 'unavailable'}"
+        if event.later_action_rejected:
+            message = (
+                f"Later controlled action rejected{target}: "
+                f"{event.reason or 'unavailable'}"
+            )
+        else:
+            message = (
+                f"Controlled action failed{target}: {event.reason or 'unavailable'}"
+            )
     elif event.kind is CodingProgressKind.VALIDATION_RESULT:
         message = _format_validation_progress(event)
     elif event.kind is CodingProgressKind.REPAIR_STARTED:
