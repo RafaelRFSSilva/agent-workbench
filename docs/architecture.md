@@ -936,6 +936,13 @@ metadata. Execution validates again after approval; existing files use a
 same-directory temporary file and atomic replacement with portable permission
 preservation, while new files use exclusive creation.
 
+Repeated descriptor and pathname revalidation substantially reduces stale-state
+risk, and same-directory `os.replace` remains atomic. It does not eliminate
+every external filesystem race: a non-cooperating external process may still
+race in the extremely small interval between the final pathname identity check
+and the operating-system `os.replace` call. Agent Workbench does not use
+workspace lock files or a portable filesystem compare-and-swap.
+
 `apply_file_rewrite` provides a whole-file optimistic update without requiring
 caller-supplied expected content. It accepts only an existing contained UTF-8
 regular file, the 64-character lowercase SHA-256 from the latest `read_file`,
