@@ -115,6 +115,25 @@ def create_search_text_definition() -> ToolDefinition:
     )
 
 
+def create_apply_file_patch_definition() -> ToolDefinition:
+    """Create a controlled workspace action definition for recovery tests."""
+
+    return ToolDefinition(
+        name="apply_file_patch",
+        description="Apply one file patch.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "expected_content": {"type": "string"},
+                "replacement_content": {"type": "string"},
+            },
+            "required": ["path", "expected_content", "replacement_content"],
+            "additionalProperties": False,
+        },
+    )
+
+
 def create_tool_response(
     *invocations: ToolInvocation,
     text: str = "",
@@ -1856,6 +1875,224 @@ def test_repeated_invalid_arguments_stop_through_explicit_bounded_policy() -> No
     assert len(provider.requests) == MAX_TOOL_ARGUMENT_VALIDATION_RECOVERIES + 1
     assert executions == []
     assert approvals == []
+
+
+def test_controlled_action_validation_recovery_resets_after_applied_success() -> None:
+    """Allow a fresh correction opportunity after one applied controlled action."""
+
+    patch = create_apply_file_patch_definition()
+    registry = ToolRegistry()
+    approvals = []
+    executions = []
+    registry.register(
+        patch,
+        lambda arguments: executions.append(arguments) or {"changed_lines": 1},
+        requires_approval=True,
+        approval_preview=lambda arguments: arguments,
+    )
+    provider = FakeProvider(
+        [
+            create_tool_response(
+                ToolInvocation(
+                    id="invalid-1",
+                    tool_name="apply_file_patch",
+                    arguments={},
+                )
+            ),
+            create_tool_response(
+                ToolInvocation(
+                    id="corrected-1",
+                    tool_name="apply_file_patch",
+                    arguments={
+                        "path": "a.py",
+                        "expected_content": "old\n",
+                        "replacement_content": "new\n",
+                    },
+                )
+            ),
+            create_tool_response(
+                ToolInvocation(
+                    id="invalid-2",
+                    tool_name="apply_file_patch",
+                    arguments={},
+                )
+            ),
+            create_tool_response(
+                ToolInvocation(
+                    id="corrected-2",
+                    tool_name="apply_file_patch",
+                    arguments={
+                        "path": "b.py",
+                        "expected_content": "before\n",
+                        "replacement_content": "after\n",
+                    },
+                )
+            ),
+            ChatResponse(text="Completed after two corrected actions."),
+        ]
+    )
+
+    result = run_tool_calling_loop(
+        provider,
+        ChatRequest(messages=[], tools=(patch,)),
+        registry,
+        max_tool_rounds=4,
+        tool_approval_handler=(
+            lambda request: approvals.append(request) or ToolApprovalDecision.APPROVE
+        ),
+    )
+
+    assert result.text == "Completed after two corrected actions."
+    assert [request.invocation.id for request in approvals] == [
+        "corrected-1",
+        "corrected-2",
+    ]
+    assert [execution["path"] for execution in executions] == ["a.py", "b.py"]
+    first_invalid_error = provider.requests[1].tool_interactions[0].results[0].error
+    second_invalid_error = provider.requests[3].tool_interactions[2].results[0].error
+    assert "argument validation failed" in (first_invalid_error or "")
+    assert "argument validation failed" in (second_invalid_error or "")
+
+
+def test_unapplied_controlled_action_does_not_reset_validation_recovery() -> None:
+    """Keep recovery cumulative across malformed calls when no change was applied."""
+
+    patch = create_apply_file_patch_definition()
+    registry = ToolRegistry()
+    approvals = []
+    executions = []
+    registry.register(
+        patch,
+        lambda arguments: executions.append(arguments) or {"changed_lines": 0},
+        requires_approval=True,
+        approval_preview=lambda arguments: arguments,
+    )
+    provider = FakeProvider(
+        [
+            create_tool_response(
+                ToolInvocation(
+                    id="invalid-1",
+                    tool_name="apply_file_patch",
+                    arguments={},
+                )
+            ),
+            create_tool_response(
+                ToolInvocation(
+                    id="corrected-noop",
+                    tool_name="apply_file_patch",
+                    arguments={
+                        "path": "a.py",
+                        "expected_content": "old\n",
+                        "replacement_content": "old\n",
+                    },
+                )
+            ),
+            create_tool_response(
+                ToolInvocation(
+                    id="invalid-2",
+                    tool_name="apply_file_patch",
+                    arguments={},
+                )
+            ),
+        ]
+    )
+
+    with pytest.raises(CompletionError) as raised:
+        run_tool_calling_loop(
+            provider,
+            ChatRequest(messages=[], tools=(patch,)),
+            registry,
+            max_tool_rounds=3,
+            tool_approval_handler=(
+                lambda request: (
+                    approvals.append(request) or ToolApprovalDecision.APPROVE
+                )
+            ),
+        )
+
+    message = str(raised.value)
+    assert "Tool argument validation recovery limit reached" in message
+    assert "tool=apply_file_patch" in message
+    assert "argument_validation_failures=2" in message
+    assert "correction_opportunity_provided=true" in message
+    assert [request.invocation.id for request in approvals] == ["corrected-noop"]
+    assert [execution["path"] for execution in executions] == ["a.py"]
+
+
+def test_preview_failure_does_not_reset_validation_recovery_counter() -> None:
+    """Keep malformed-call recovery bounded across non-mutating preview failures."""
+
+    patch = create_apply_file_patch_definition()
+    registry = ToolRegistry()
+    approvals = []
+    executions = []
+
+    def fail_preview(arguments: dict[str, object]) -> dict[str, object]:
+        if arguments["path"] == "preview-fail.py":
+            raise CompletionError("invalid target")
+        return arguments
+
+    registry.register(
+        patch,
+        lambda arguments: executions.append(arguments) or {"changed_lines": 1},
+        requires_approval=True,
+        approval_preview=fail_preview,
+    )
+    provider = FakeProvider(
+        [
+            create_tool_response(
+                ToolInvocation(
+                    id="invalid-1",
+                    tool_name="apply_file_patch",
+                    arguments={},
+                )
+            ),
+            create_tool_response(
+                ToolInvocation(
+                    id="preview-fail",
+                    tool_name="apply_file_patch",
+                    arguments={
+                        "path": "preview-fail.py",
+                        "expected_content": "old\n",
+                        "replacement_content": "new\n",
+                    },
+                )
+            ),
+            create_tool_response(
+                ToolInvocation(
+                    id="invalid-2",
+                    tool_name="apply_file_patch",
+                    arguments={},
+                )
+            ),
+        ]
+    )
+
+    with pytest.raises(CompletionError) as raised:
+        run_tool_calling_loop(
+            provider,
+            ChatRequest(messages=[], tools=(patch,)),
+            registry,
+            max_tool_rounds=3,
+            tool_approval_handler=(
+                lambda request: (
+                    approvals.append(request) or ToolApprovalDecision.APPROVE
+                )
+            ),
+            recover_approval_preview_errors=True,
+        )
+
+    message = str(raised.value)
+    assert "Tool argument validation recovery limit reached" in message
+    assert "tool=apply_file_patch" in message
+    assert "argument_validation_failures=2" in message
+    assert "correction_opportunity_provided=true" in message
+    assert executions == []
+    assert approvals == []
+    preview_failure_error = provider.requests[2].tool_interactions[1].results[0].error
+    assert preview_failure_error == (
+        "Approval preview failed for apply_file_patch: invalid target"
+    )
 
 
 def test_allows_more_than_sixteen_productive_inspection_rounds() -> None:

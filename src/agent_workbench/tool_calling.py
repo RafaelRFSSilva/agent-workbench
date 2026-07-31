@@ -62,6 +62,15 @@ _VALIDATION_BATCH_RETRY_ERROR = (
     "failed argument validation. Issue corrected tool calls matching the "
     "advertised schemas."
 )
+_CONTROLLED_WORKSPACE_ACTION_TOOL_NAMES = frozenset(
+    {
+        "apply_file_patch",
+        "apply_file_rewrite",
+        "apply_text_replacement",
+        "apply_line_range_replacement",
+        "apply_workspace_changes",
+    }
+)
 
 
 def _requires_tool_batch_recovery(response: ChatResponse) -> bool:
@@ -95,6 +104,48 @@ def _inspection_signature(invocation: ToolInvocation) -> tuple[str, str]:
             sort_keys=True,
         ),
     )
+
+
+def _successful_controlled_workspace_change_occurred(
+    invocations: tuple[ToolInvocation, ...],
+    results: tuple[ToolResult, ...],
+) -> bool:
+    """Return whether one invocation/result pair proves an applied change."""
+
+    for invocation, result in zip(invocations, results, strict=True):
+        if invocation.tool_name not in _CONTROLLED_WORKSPACE_ACTION_TOOL_NAMES:
+            continue
+        if result.status != "success":
+            continue
+        arguments = invocation.arguments
+        output = result.output
+        if not isinstance(arguments, dict) or not isinstance(output, dict):
+            continue
+
+        if invocation.tool_name == "apply_workspace_changes":
+            changes = arguments.get("changes")
+            if isinstance(changes, list) and any(
+                isinstance(change, dict) and change.get("create_if_missing") is True
+                for change in changes
+            ):
+                return True
+            changed_lines = output.get("total_changed_lines")
+        else:
+            if (
+                invocation.tool_name == "apply_file_patch"
+                and arguments.get("create_if_missing") is True
+            ):
+                return True
+            changed_lines = output.get("changed_lines")
+
+        if (
+            isinstance(changed_lines, int)
+            and not isinstance(changed_lines, bool)
+            and changed_lines > 0
+        ):
+            return True
+
+    return False
 
 
 def _completed_inspection_signatures(
@@ -627,6 +678,12 @@ def run_tool_calling_loop(
 
         if tool_round_observer is not None:
             tool_round_observer(completed_round)
+
+        if _successful_controlled_workspace_change_occurred(
+            response.tool_invocations,
+            results,
+        ):
+            argument_validation_recoveries = 0
 
         if _is_successful_inspection_round(completed_round):
             consecutive_inspection_rounds += 1

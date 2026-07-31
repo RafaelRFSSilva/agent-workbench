@@ -1011,6 +1011,19 @@ def _capture_argument_validation_failures(
     ):
         if (
             invocation.tool_name in _WORKSPACE_CHANGE_TOOL_NAMES
+            and invocation.id in state.approved_action_ids
+            and result.status == "success"
+            and _workspace_change_result_applied(
+                invocation.tool_name,
+                invocation.arguments,
+                result.output,
+            )
+        ):
+            state.controlled_action_argument_validation_failures = 0
+            state.last_argument_validation_tool_name = None
+            continue
+        if (
+            invocation.tool_name in _WORKSPACE_CHANGE_TOOL_NAMES
             and result.status == "error"
             and _is_argument_validation_error(invocation.tool_name, result.error)
         ):
