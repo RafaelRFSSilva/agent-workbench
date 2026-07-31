@@ -1,5 +1,6 @@
 """Tests for controlled-action approval in the CLI presentation layer."""
 
+import hashlib
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -193,6 +194,127 @@ def test_line_range_approval_renders_selected_range_and_complete_diff(
     assert "Selected line range: 20–21" in output
     assert "Complete diff:" in output
     assert "+new" in output
+
+
+def test_line_range_approval_escapes_terminal_controls(monkeypatch, capsys) -> None:
+    """Render terminal controls visibly without emitting executable sequences."""
+
+    monkeypatch.setattr("builtins.input", lambda _prompt: "no")
+    unsafe_path = "src/\x1b]0;path\x07module\n.py"
+    unsafe_diff = (
+        "--- a/module.py\n"
+        "+++ b/module.py\n"
+        "+CSI \x1b[31mred\x1b[0m\n"
+        "+OSC \x1b]0;title\x07\n"
+        "+return\rtext\n"
+        "+back\bspace\x7f\u009b31m\n"
+    )
+
+    decision = _prompt_for_tool_approval(
+        approval_request(
+            "apply_line_range_replacement",
+            {
+                "path": unsafe_path,
+                "operation": "update",
+                "old_size_bytes": 1,
+                "new_size_bytes": 1,
+                "changed_lines": 2,
+                "start_line": 1,
+                "end_line": 1,
+                "diff": unsafe_diff,
+            },
+        )
+    )
+
+    output = capsys.readouterr().out
+    assert decision is ToolApprovalDecision.DENY
+    assert "Terminal control characters are shown as escaped text" in output
+    assert "\\x1b[31mred\\x1b[0m" in output
+    assert "\\x1b]0;title\\x07" in output
+    assert "return\\x0dtext" in output
+    assert "back\\x08space\\x7f\\u009b31m" in output
+    assert "src/\\x1b]0;path\\x07module\\x0a.py" in output
+    for raw_control in ("\x1b", "\x07", "\r", "\b", "\x7f", "\u009b"):
+        assert raw_control not in output
+
+
+def test_line_range_approval_preserves_safe_text_and_normalizes_crlf(
+    monkeypatch,
+    capsys,
+) -> None:
+    """Keep benign Unicode, tabs, and lines readable while neutralizing CRLF."""
+
+    monkeypatch.setattr("builtins.input", lambda _prompt: "no")
+    _prompt_for_tool_approval(
+        approval_request(
+            "apply_line_range_replacement",
+            {
+                "path": "src/café.py",
+                "operation": "update",
+                "old_size_bytes": 4,
+                "new_size_bytes": 4,
+                "changed_lines": 2,
+                "start_line": 1,
+                "end_line": 1,
+                "diff": "--- a/café.py\r\n+++ b/café.py\r\n+name\t=\t'Zoë'\r\n",
+            },
+        )
+    )
+
+    output = capsys.readouterr().out
+    assert "Path: src/café.py" in output
+    assert "--- a/café.py\n+++ b/café.py\n+name\t=\t'Zoë'\n" in output
+    assert "\r" not in output
+
+
+def test_approved_line_range_writes_exact_controls_but_renders_them_safely(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    """Escape approval output without altering the approved replacement bytes."""
+
+    original = "old\n"
+    replacement = "safe\tZoë\n\x1b[31mred\x1b[0m\rback\b\x7f\u009b\n"
+    target = tmp_path / "module.py"
+    target.write_text(original, encoding="utf-8")
+    provider = FakeProvider(
+        [
+            ChatResponse(
+                tool_invocations=(
+                    ToolInvocation(
+                        id="line-range",
+                        tool_name="apply_line_range_replacement",
+                        arguments={
+                            "path": "module.py",
+                            "start_line": 1,
+                            "end_line": 1,
+                            "replacement_content": replacement,
+                            "expected_file_sha256": hashlib.sha256(
+                                original.encode("utf-8")
+                            ).hexdigest(),
+                        },
+                    ),
+                )
+            ),
+            ChatResponse(text="Done."),
+        ]
+    )
+    session = AgentSession(
+        id=SessionId("terminal-safe-preview"),
+        provider=provider,
+        tool_registry=action_registry(Workspace(tmp_path)),
+    )
+    inputs = iter(["Change it.", "yes", "/exit"])
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
+
+    run_cli(session, enable_actions=True)
+
+    output = capsys.readouterr().out
+    assert target.read_bytes() == replacement.encode("utf-8")
+    assert "\\x1b[31mred\\x1b[0m\\x0dback\\x08\\x7f\\u009b" in output
+    for raw_control in ("\x1b", "\r", "\b", "\x7f", "\u009b"):
+        assert raw_control not in output
 
 
 def test_cli_approval_input_eof_denies(monkeypatch) -> None:

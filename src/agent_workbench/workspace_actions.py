@@ -1379,8 +1379,8 @@ def _create_unified_diff(
 
     from_file = "/dev/null" if operation == "create" else f"a/{relative_path}"
     lines = difflib.unified_diff(
-        old_content.splitlines(keepends=True),
-        new_content.splitlines(keepends=True),
+        _split_lf_lines(old_content),
+        _split_lf_lines(new_content),
         fromfile=from_file,
         tofile=f"b/{relative_path}",
         lineterm="\n",
@@ -1391,6 +1391,16 @@ def _create_unified_diff(
         if not line.endswith("\n"):
             complete_lines.append("\n\\ No newline at end of file\n")
     return "".join(complete_lines)
+
+
+def _split_lf_lines(content: str) -> list[str]:
+    """Split display lines at LF while preserving other characters verbatim."""
+
+    parts = content.split("\n")
+    lines = [f"{part}\n" for part in parts[:-1]]
+    if parts[-1]:
+        lines.append(parts[-1])
+    return lines
 
 
 def _create_file_exclusively(patch: _PreparedPatch) -> None:
