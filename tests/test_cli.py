@@ -2362,6 +2362,53 @@ def test_progress_renderer_covers_repair_skip_plural_and_terminal_failure(
     )
 
 
+def test_cli_progress_omits_unsupported_control_character_field_names(
+    capsys,
+) -> None:
+    """Render registry guidance without terminal-control or private key names."""
+
+    calculator = create_calculator_definition()
+    registry = ToolRegistry()
+    registry.register(
+        calculator,
+        lambda arguments: arguments,
+        requires_approval=True,
+    )
+    unsupported_name = (
+        "/home/operator/private.env\nPRIVATE_TOKEN=secret-value\rreturn\ttab\x1b[31mred"
+    )
+    error = registry.argument_validation_error(
+        ToolInvocation(
+            id="invalid-calculator",
+            tool_name="calculator",
+            arguments={
+                "expression": "2 + 2",
+                unsupported_name: "untrusted value",
+            },
+        )
+    )
+    assert error is not None
+
+    _display_coding_progress(
+        CodingProgressEvent(
+            phase=CodingPhase.EDIT,
+            kind=CodingProgressKind.ACTION_ARGUMENTS_REJECTED,
+            reason=error,
+        )
+    )
+
+    output = capsys.readouterr().out
+    assert (
+        "arguments contain 1 unsupported field; additional fields are not allowed"
+        in output
+    )
+    assert unsupported_name not in output
+    assert "/home/operator" not in output
+    assert "PRIVATE_TOKEN" not in output
+    assert "secret-value" not in output
+    assert "\x1b[31m" not in output
+
+
 def test_complete_assistant_summary_is_explicitly_opt_in(
     monkeypatch,
     tmp_path,

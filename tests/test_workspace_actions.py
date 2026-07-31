@@ -345,7 +345,10 @@ def test_registration_preserves_existing_tools_and_exact_definition(
                 "replacement_content": "updated\n",
                 "patch": "legacy text",
             },
-            "unsupported fields: patch",
+            (
+                "arguments contain 1 unsupported field; "
+                "additional fields are not allowed"
+            ),
         ),
     ],
 )
@@ -373,6 +376,126 @@ def test_advertised_patch_schema_rejects_runtime_invalid_shapes_before_preview(
         "Required structured shape: {path: string, expected_content: string, "
         "replacement_content: string, create_if_missing?: boolean}"
     ) in error
+    assert "legacy text" not in error
+
+
+@pytest.mark.parametrize(
+    ("unsupported_names", "expected_issue", "forbidden_fragments"),
+    [
+        (
+            ("/home/operator/private/.env",),
+            (
+                "arguments contain 1 unsupported field; "
+                "additional fields are not allowed"
+            ),
+            ("/home/operator", "private", ".env"),
+        ),
+        (
+            ("PRIVATE_TOKEN = 'secret-value'\nprint(PRIVATE_TOKEN)",),
+            (
+                "arguments contain 1 unsupported field; "
+                "additional fields are not allowed"
+            ),
+            ("PRIVATE_TOKEN", "secret-value", "print"),
+        ),
+        (
+            (
+                (
+                    "CONTROL_LINE_MARKER\nCONTROL_BREAK_MARKER"
+                    "\rCONTROL_RETURN_MARKER\tCONTROL_TAB_MARKER"
+                    "\x1b[31mCONTROL_RED_MARKER"
+                ),
+            ),
+            (
+                "arguments contain 1 unsupported field; "
+                "additional fields are not allowed"
+            ),
+            (
+                "CONTROL_LINE_MARKER",
+                "CONTROL_BREAK_MARKER",
+                "CONTROL_RETURN_MARKER",
+                "CONTROL_TAB_MARKER",
+                "\x1b[31m",
+                "CONTROL_RED_MARKER",
+            ),
+        ),
+        (
+            ("first-private-field", "second-secret-field", "third-source-field"),
+            (
+                "arguments contain 3 unsupported fields; "
+                "additional fields are not allowed"
+            ),
+            ("first-private", "second-secret", "third-source"),
+        ),
+        (
+            ("very-private-" + ("x" * 2_000),),
+            (
+                "arguments contain 1 unsupported field; "
+                "additional fields are not allowed"
+            ),
+            ("very-private", "x" * 40),
+        ),
+    ],
+)
+def test_unsupported_argument_names_are_replaced_by_a_bounded_structural_count(
+    tmp_path: Path,
+    unsupported_names: tuple[str, ...],
+    expected_issue: str,
+    forbidden_fragments: tuple[str, ...],
+) -> None:
+    """Never expose model-controlled object keys in schema diagnostics."""
+
+    _, workspace = create_workspace(tmp_path)
+    registry = ToolRegistry()
+    register_workspace_action_tools(registry, workspace)
+    arguments = patch_arguments()
+    arguments.update(dict.fromkeys(unsupported_names, "untrusted value"))
+
+    error = registry.argument_validation_error(
+        ToolInvocation(
+            id="invalid-patch",
+            tool_name="apply_file_patch",
+            arguments=arguments,
+        )
+    )
+
+    assert error is not None
+    assert expected_issue in error
+    assert len(error) <= 800
+    assert "Tool 'apply_file_patch' argument validation failed" in error
+    assert "Required structured shape" in error
+    assert "Issue a corrected apply_file_patch tool call" in error
+    for fragment in forbidden_fragments:
+        assert fragment not in error
+
+
+def test_nested_unsupported_argument_name_uses_only_the_trusted_schema_path(
+    tmp_path: Path,
+) -> None:
+    """Identify a nested location without exposing its model-controlled child key."""
+
+    _, workspace = create_workspace(tmp_path)
+    registry = ToolRegistry()
+    register_workspace_action_tools(registry, workspace)
+    private_name = "NESTED_PRIVATE_TOKEN\n\x1b[31msecret"
+    change = patch_arguments()
+    change[private_name] = "untrusted value"
+
+    error = registry.argument_validation_error(
+        ToolInvocation(
+            id="invalid-transaction",
+            tool_name="apply_workspace_changes",
+            arguments=transaction_arguments(change),
+        )
+    )
+
+    assert error is not None
+    assert (
+        "changes[0] contains 1 unsupported field; additional fields are not allowed"
+    ) in error
+    assert private_name not in error
+    assert "NESTED_PRIVATE_TOKEN" not in error
+    assert "\x1b[31m" not in error
 
 
 def test_advertised_patch_schema_accepts_the_runtime_patch_shape(

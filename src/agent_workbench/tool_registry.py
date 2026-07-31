@@ -229,9 +229,14 @@ def _schema_validation_issue(
             return f"missing required fields: {', '.join(missing)}"
 
         if schema.get("additionalProperties") is False:
-            unsupported = sorted(set(value) - set(property_schemas))
-            if unsupported:
-                return f"unsupported fields: {', '.join(unsupported)}"
+            unsupported_count = sum(name not in property_schemas for name in value)
+            if unsupported_count:
+                location = f"{path} contains" if path else "arguments contain"
+                field_label = "field" if unsupported_count == 1 else "fields"
+                return (
+                    f"{location} {unsupported_count} unsupported {field_label}; "
+                    "additional fields are not allowed"
+                )
 
         for name, property_schema in property_schemas.items():
             if name not in value or not isinstance(property_schema, dict):

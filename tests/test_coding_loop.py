@@ -351,16 +351,24 @@ def test_invalid_patch_arguments_are_corrected_before_one_approved_edit(
     repository = create_coding_repository(tmp_path / "project")
     original = (repository / "module.py").read_text(encoding="utf-8")
     corrected = original.replace("left - right", "left + right")
+    unsupported_names = (
+        str(repository / "private.env"),
+        "PRIVATE_TOKEN = 'secret-value'\nprint(PRIVATE_TOKEN)",
+        "line\nbreak\rreturn\ttab\x1b[31mred",
+    )
+    invalid_arguments = {
+        "path": "module.py",
+        "expected_content": original,
+        "replacement_content": corrected,
+    }
+    invalid_arguments.update(dict.fromkeys(unsupported_names, "untrusted value"))
     provider = ScriptedProvider(
         [
             ChatResponse(text="Discovery complete."),
             tool_response(
                 "invalid-edit",
                 "apply_file_patch",
-                {
-                    "path": "module.py",
-                    "patch": "legacy unstructured patch text",
-                },
+                invalid_arguments,
             ),
             tool_response(
                 "corrected-edit",
@@ -375,16 +383,27 @@ def test_invalid_patch_arguments_are_corrected_before_one_approved_edit(
         ]
     )
     replacements = []
+    previews = []
     original_replace = workspace_actions._replace_file_atomically
+    original_preview = workspace_actions.preview_file_patch
 
     def record_replace(workspace, patch):
         replacements.append(patch.relative_path)
         original_replace(workspace, patch)
 
+    def record_preview(workspace, arguments):
+        previews.append(arguments)
+        return original_preview(workspace, arguments)
+
     monkeypatch.setattr(
         workspace_actions,
         "_replace_file_atomically",
         record_replace,
+    )
+    monkeypatch.setattr(
+        workspace_actions,
+        "preview_file_patch",
+        record_preview,
     )
     approvals = []
 
@@ -406,17 +425,31 @@ def test_invalid_patch_arguments_are_corrected_before_one_approved_edit(
     assert invalid_result.status == "error"
     assert invalid_result.error is not None
     assert "Tool 'apply_file_patch' argument validation failed" in invalid_result.error
-    assert "missing required fields: expected_content, replacement_content" in (
-        invalid_result.error
+    assert (
+        "arguments contain 3 unsupported fields; additional fields are not allowed"
+        in invalid_result.error
     )
     assert "Required structured shape" in invalid_result.error
     assert "Issue a corrected apply_file_patch tool call" in invalid_result.error
-    assert "legacy unstructured patch text" not in invalid_result.error
+    assert len(invalid_result.error) <= 800
+    for unsupported_name in unsupported_names:
+        assert unsupported_name not in invalid_result.error
+    assert str(repository) not in invalid_result.error
+    assert "PRIVATE_TOKEN" not in invalid_result.error
+    assert "secret-value" not in invalid_result.error
+    assert "\x1b[31m" not in invalid_result.error
     assert [
         request.invocation.id
         for request in approvals
         if request.invocation.tool_name == "apply_file_patch"
     ] == ["corrected-edit"]
+    assert previews == [
+        {
+            "path": "module.py",
+            "expected_content": original,
+            "replacement_content": corrected,
+        }
+    ]
     assert replacements == ["module.py"]
     rejected = [
         event
@@ -425,6 +458,13 @@ def test_invalid_patch_arguments_are_corrected_before_one_approved_edit(
     ]
     assert len(rejected) == 1
     assert rejected[0].path == "module.py"
+    assert rejected[0].reason is not None
+    assert "arguments contain 3 unsupported fields" in rejected[0].reason
+    for unsupported_name in unsupported_names:
+        assert unsupported_name not in rejected[0].reason
+    assert str(repository) not in rejected[0].reason
+    assert "PRIVATE_TOKEN" not in rejected[0].reason
+    assert "\x1b[31m" not in rejected[0].reason
     assert result.final_phase is CodingPhase.DONE
     assert (repository / "module.py").read_text(encoding="utf-8") == corrected
 
@@ -436,13 +476,21 @@ def test_repeated_invalid_patch_arguments_terminate_with_safe_diagnostics(
 
     repository = create_coding_repository(tmp_path / "project")
     original = (repository / "module.py").read_text(encoding="utf-8")
+    unsupported_name = (
+        f"{repository}/private.env\nPRIVATE_TOKEN=secret-value\rreturn\ttab\x1b[31mred"
+    )
     invalid_responses = [
         tool_response(
             f"invalid-{index}",
             "apply_file_patch",
             {
                 "path": "module.py",
-                "replacement_content": index,
+                "expected_content": original,
+                "replacement_content": original.replace(
+                    "left - right",
+                    "left + right",
+                ),
+                unsupported_name: index,
             },
         )
         for index in range(MAX_CONTROLLED_ACTION_ARGUMENT_VALIDATION_FAILURES)
@@ -479,6 +527,10 @@ def test_repeated_invalid_patch_arguments_terminate_with_safe_diagnostics(
     assert "tool_round_count=" in message
     assert "correction_opportunity_provided=true" in message
     assert str(repository) not in message
+    assert unsupported_name not in message
+    assert "PRIVATE_TOKEN" not in message
+    assert "secret-value" not in message
+    assert "\x1b[31m" not in message
     assert approvals == []
     assert (repository / "module.py").read_text(encoding="utf-8") == original
     assert run_git(repository, "status", "--short").stdout == ""
@@ -491,6 +543,14 @@ def test_repeated_invalid_patch_arguments_terminate_with_safe_diagnostics(
     )
     assert progress[-1].kind is CodingProgressKind.TERMINAL_FAILURE
     assert progress[-1].workspace_preserved is True
+    for event in progress:
+        if event.reason is None:
+            continue
+        assert unsupported_name not in event.reason
+        assert str(repository) not in event.reason
+        assert "PRIVATE_TOKEN" not in event.reason
+        assert "secret-value" not in event.reason
+        assert "\x1b[31m" not in event.reason
 
 
 def test_edit_uses_derived_inspection_budget_before_approved_change(
