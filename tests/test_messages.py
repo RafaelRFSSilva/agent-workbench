@@ -191,6 +191,18 @@ def test_chat_response_has_no_tool_invocations_by_default() -> None:
 
     assert response.text == "Provider response."
     assert response.tool_invocations == ()
+    assert response.response_repair_attempt_count == 0
+
+
+@pytest.mark.parametrize("value", [True, -1, 1.5, "1"])
+def test_chat_response_rejects_invalid_response_repair_count(value: object) -> None:
+    """Require non-negative integer provider response-repair accounting."""
+
+    with pytest.raises(
+        ConfigurationError,
+        match="response repair attempt count must be a non-negative integer",
+    ):
+        ChatResponse(response_repair_attempt_count=value)  # type: ignore[arg-type]
 
 
 def test_chat_response_preserves_text_exactly() -> None:

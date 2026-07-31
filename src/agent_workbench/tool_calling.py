@@ -271,10 +271,14 @@ def run_tool_calling_loop(
             )
             continue
 
-        if _repeats_previous_inspection_batch(response, completed_rounds):
+        if (
+            response.response_repair_attempt_count == 0
+            and _repeats_previous_inspection_batch(response, completed_rounds)
+        ):
             if repeated_tool_batch_recoveries >= _MAX_REPEATED_TOOL_BATCH_RECOVERIES:
                 raise CompletionError(
-                    "The provider repeatedly requested the same read-only inspection tool-call batch."
+                    "The provider repeatedly requested the same read-only inspection "
+                    "tool-call batch."
                 )
 
             repeated_tool_batch_recoveries += 1

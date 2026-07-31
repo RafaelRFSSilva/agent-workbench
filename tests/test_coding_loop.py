@@ -154,6 +154,8 @@ def tool_response(
     invocation_id: str,
     tool_name: str,
     arguments: dict[str, object],
+    *,
+    response_repair_attempt_count: int = 0,
 ) -> ChatResponse:
     """Create one deterministic single-tool provider response."""
 
@@ -164,7 +166,8 @@ def tool_response(
                 tool_name=tool_name,
                 arguments=arguments,
             ),
-        )
+        ),
+        response_repair_attempt_count=response_repair_attempt_count,
     )
 
 
@@ -336,6 +339,71 @@ def test_controller_runs_discover_edit_validate_verify_and_done(
     assert not edit_tools.intersection(
         {"run_ruff_format", "run_ruff_check", "run_pytest"}
     )
+
+
+def test_edit_executes_repeated_safe_read_then_applies_approved_change(
+    tmp_path: Path,
+) -> None:
+    """Resume EDIT after a response-recovery read repeats the latest inspection."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    original = "def add(left: int, right: int) -> int:\n    return left - right\n"
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            tool_response("initial-read", "read_file", {"path": "module.py"}),
+            tool_response(
+                "recovery-read",
+                "read_file",
+                {"path": "module.py"},
+                response_repair_attempt_count=1,
+            ),
+            replacement_response(
+                "edit",
+                expected_content=original,
+                expected_text="return left - right",
+                replacement_text="return left + right",
+            ),
+            ChatResponse(text="Edit complete."),
+        ]
+    )
+    approval_names: list[str] = []
+
+    def record_approval(request) -> ToolApprovalDecision:
+        approval_names.append(request.invocation.tool_name)
+        return ToolApprovalDecision.APPROVE
+
+    result = run_autonomous_coding_task(
+        create_session(repository, provider),
+        "Correct the add implementation.",
+        tool_approval_handler=record_approval,
+    )
+
+    assert result.final_phase is CodingPhase.DONE
+    assert result.repair_attempt_count == 0
+    assert result.tool_round_count == 8
+    assert result.executed_tool_names[:3] == (
+        "read_file",
+        "read_file",
+        "apply_text_replacement",
+    )
+    assert approval_names == [
+        "apply_text_replacement",
+        "run_ruff_format",
+        "run_ruff_check",
+        "run_pytest",
+    ]
+    assert "read_file" in {tool.name for tool in provider.requests[3].tools}
+    assert len(provider.requests[3].tool_interactions) == 2
+    assert (
+        provider.requests[3].tool_interactions[1].response.response_repair_attempt_count
+        == 1
+    )
+    assert all(
+        round_.results[0].status == "success"
+        for round_ in provider.requests[3].tool_interactions
+    )
+    assert run_git(repository, "status", "--short").stdout == " M module.py\n"
 
 
 def test_formats_only_successful_approved_python_path_and_preserves_baseline_dirty(
