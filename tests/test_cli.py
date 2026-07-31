@@ -133,6 +133,20 @@ def run_cli(
     )
 
 
+def run_main_and_capture_exit_code(argv: list[str]) -> int:
+    """Emulate console-script exit semantics for deterministic assertions."""
+
+    try:
+        main(argv)
+    except SystemExit as exc:
+        if exc.code is None:
+            return 0
+        if isinstance(exc.code, int):
+            return exc.code
+        return 1
+    return 0
+
+
 def create_calculator_definition() -> ToolDefinition:
     """Create a calculator definition for CLI tool-calling tests."""
 
@@ -2641,6 +2655,55 @@ def test_complete_assistant_summary_is_explicitly_opt_in(
     )
 
 
+def test_successful_coding_workflow_exits_with_zero(
+    monkeypatch,
+    tmp_path,
+    capsys,
+) -> None:
+    """Keep successful autonomous coding exit status unchanged at zero."""
+
+    configuration = RuntimeConfiguration(
+        provider_name="ollama",
+        model_name="test-model",
+        workspace_root=tmp_path,
+        enable_actions=True,
+    )
+
+    def run_task(_session, _prompt, **kwargs):
+        kwargs["progress_event_observer"](
+            CodingProgressEvent(
+                phase=CodingPhase.DONE,
+                kind=CodingProgressKind.DONE,
+            )
+        )
+        return Mock(assistant_summary="Done")
+
+    monkeypatch.setattr("agent_workbench.cli.load_environment", Mock())
+    monkeypatch.setattr(
+        "agent_workbench.cli.resolve_runtime_configuration",
+        Mock(return_value=configuration),
+    )
+    monkeypatch.setattr(
+        "agent_workbench.cli.create_agent_session",
+        Mock(return_value=Mock()),
+    )
+    monkeypatch.setattr("agent_workbench.cli.run_autonomous_coding_task", run_task)
+
+    exit_code = run_main_and_capture_exit_code(
+        [
+            "code",
+            "--workspace",
+            str(tmp_path),
+            "--enable-actions",
+            "--task",
+            "Fix the defect.",
+        ]
+    )
+
+    assert exit_code == 0
+    assert capsys.readouterr().out == "[DONE] Task completed successfully\n"
+
+
 def test_terminal_failure_progress_is_not_duplicated_by_cli_error(
     monkeypatch,
     tmp_path,
@@ -2679,7 +2742,7 @@ def test_terminal_failure_progress_is_not_duplicated_by_cli_error(
     )
     monkeypatch.setattr("agent_workbench.cli.run_autonomous_coding_task", fail_task)
 
-    main(
+    exit_code = run_main_and_capture_exit_code(
         [
             "code",
             "--workspace",
@@ -2690,11 +2753,36 @@ def test_terminal_failure_progress_is_not_duplicated_by_cli_error(
         ]
     )
 
+    assert exit_code == 1
     assert capsys.readouterr().out == (
         "[FAILED] VALIDATE: unexpected changed paths after run_ruff_format: "
         "unrelated.py; validation repair attempts 1/2; "
         "workspace preserved for manual recovery\n"
     )
+
+
+def test_setup_command_exit_behavior_is_unchanged(
+    monkeypatch,
+) -> None:
+    """Keep unrelated non-coding setup flow returning a successful exit code."""
+
+    configuration = RuntimeConfiguration(
+        provider_name="ollama",
+        model_name="test-model",
+    )
+    monkeypatch.setattr(
+        "agent_workbench.cli.run_interactive_setup",
+        Mock(return_value=configuration),
+    )
+    monkeypatch.setattr(
+        "agent_workbench.cli.create_agent_session",
+        Mock(return_value=Mock(tool_registry=None)),
+    )
+    monkeypatch.setattr("agent_workbench.cli.run_cli", Mock())
+
+    exit_code = run_main_and_capture_exit_code(["--setup"])
+
+    assert exit_code == 0
 
 
 def test_isolated_autonomous_output_preserves_progress_order_without_hashes(
@@ -3022,7 +3110,7 @@ def test_scripted_cli_unexpected_formatter_path_fails_without_done(
         Mock(return_value=ToolApprovalDecision.APPROVE),
     )
 
-    main(
+    exit_code = run_main_and_capture_exit_code(
         [
             "code",
             "--workspace",
@@ -3033,6 +3121,7 @@ def test_scripted_cli_unexpected_formatter_path_fails_without_done(
         ]
     )
 
+    assert exit_code == 1
     lines = capsys.readouterr().out.splitlines()
     assert lines[-1] == (
         "[FAILED] VALIDATE: unexpected changed paths after run_ruff_format: "
