@@ -25,6 +25,7 @@ from agent_workbench.worktree_commits import (
     IsolatedCommitResult,
     create_isolated_commit,
     plan_isolated_commit,
+    require_local_author_identity,
 )
 from agent_workbench.worktrees import (
     WorktreeApprovalHandler,
@@ -205,6 +206,7 @@ def _validate_workflow_inputs(
         )
 
     _validate_commit_message_input(commit_message)
+    require_local_author_identity(configuration.workspace_root)
 
     try:
         return TaskSpec(

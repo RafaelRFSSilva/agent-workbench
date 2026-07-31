@@ -810,3 +810,259 @@ def test_isolated_session_failure_preserves_created_worktree(
     assert run_git(target, "status", "--short").stdout == ""
     assert run_git(source, "branch", "--list", "agent/session-failure").stdout.strip()
     assert run_git(source, "status", "--short").stdout == ""
+
+
+def create_repository_without_local_identity(root: Path) -> Path:
+    """Create a repository with no local user.name or user.email configured."""
+
+    root.mkdir()
+    run_git(root, "init", "-b", "main")
+    run_git(
+        root,
+        "-c",
+        "user.name=Temp Identity",
+        "-c",
+        "user.email=temp@example.invalid",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "initial",
+    )
+    return root
+
+
+def test_preflight_fails_before_worktree_when_both_identity_fields_missing(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Fail before worktree creation when both local user.name and user.email are absent."""
+
+    source = create_repository_without_local_identity(tmp_path / "source")
+    target = tmp_path / "isolated"
+
+    provider_called = []
+    monkeypatch.setattr(
+        "agent_workbench.isolated_coding.create_isolated_agent_session",
+        lambda *_a, **_kw: provider_called.append(True),
+    )
+
+    with pytest.raises(ConfigurationError, match="user.name") as raised:
+        run_isolated_autonomous_workflow(
+            SessionId("preflight-both-missing"),
+            configuration(source),
+            "agent/preflight",
+            target,
+            "Fix it.",
+            "fix: preflight",
+            worktree_approval_handler=approve,
+            tool_approval_handler=approve,
+            commit_approval_handler=approve,
+        )
+
+    assert "user.email" in str(raised.value)
+    assert not provider_called
+    assert_no_worktree_mutation(source, target, "agent/preflight")
+
+
+def test_preflight_fails_before_worktree_when_local_name_missing(
+    tmp_path: Path,
+) -> None:
+    """Report missing user.name alone before any worktree or branch is created."""
+
+    source = create_repository_without_local_identity(tmp_path / "source")
+    run_git(source, "config", "user.email", "only-email@example.invalid")
+    target = tmp_path / "isolated"
+
+    with pytest.raises(ConfigurationError, match="user.name") as raised:
+        run_isolated_autonomous_workflow(
+            SessionId("preflight-name-missing"),
+            configuration(source),
+            "agent/preflight-name",
+            target,
+            "Fix it.",
+            "fix: preflight",
+            worktree_approval_handler=approve,
+            tool_approval_handler=approve,
+            commit_approval_handler=approve,
+        )
+
+    assert "user.email" not in str(raised.value)
+    assert_no_worktree_mutation(source, target, "agent/preflight-name")
+
+
+def test_preflight_fails_before_worktree_when_local_email_missing(
+    tmp_path: Path,
+) -> None:
+    """Report missing user.email alone before any worktree or branch is created."""
+
+    source = create_repository_without_local_identity(tmp_path / "source")
+    run_git(source, "config", "user.name", "Only Name")
+    target = tmp_path / "isolated"
+
+    with pytest.raises(ConfigurationError, match="user.email") as raised:
+        run_isolated_autonomous_workflow(
+            SessionId("preflight-email-missing"),
+            configuration(source),
+            "agent/preflight-email",
+            target,
+            "Fix it.",
+            "fix: preflight",
+            worktree_approval_handler=approve,
+            tool_approval_handler=approve,
+            commit_approval_handler=approve,
+        )
+
+    assert "user.name" not in str(raised.value)
+    assert_no_worktree_mutation(source, target, "agent/preflight-email")
+
+
+def test_preflight_rejects_global_only_identity(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Global identity alone must not satisfy the repository-local requirement.
+
+    A temporary global gitconfig is created with placeholder identity values
+    and exposed via GIT_CONFIG_GLOBAL so git would normally see it. The
+    preflight must still fail because _run_git always overrides
+    GIT_CONFIG_GLOBAL with os.devnull, excluding global config entirely.
+    """
+
+    source = create_repository_without_local_identity(tmp_path / "source")
+    target = tmp_path / "isolated"
+
+    global_config = tmp_path / "global_gitconfig"
+    global_config.write_text(
+        "[user]\n    name = Global Only User\n    email = global@example.invalid\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
+
+    with pytest.raises(ConfigurationError, match="repository-local") as raised:
+        run_isolated_autonomous_workflow(
+            SessionId("preflight-global-only"),
+            configuration(source),
+            "agent/preflight-global",
+            target,
+            "Fix it.",
+            "fix: preflight",
+            worktree_approval_handler=approve,
+            tool_approval_handler=approve,
+            commit_approval_handler=approve,
+        )
+
+    assert "user.name" in str(raised.value) or "user.email" in str(raised.value)
+    assert_no_worktree_mutation(source, target, "agent/preflight-global")
+
+
+def test_preflight_message_contains_actionable_git_config_guidance(
+    tmp_path: Path,
+) -> None:
+    """Include shell-quoted git config --local commands for each missing field."""
+
+    source_with_spaces = tmp_path / "my source repo"
+    source = create_repository_without_local_identity(source_with_spaces)
+    target = tmp_path / "isolated"
+
+    with pytest.raises(ConfigurationError) as raised:
+        run_isolated_autonomous_workflow(
+            SessionId("preflight-guidance"),
+            configuration(source),
+            "agent/preflight-guidance",
+            target,
+            "Fix it.",
+            "fix: preflight",
+            worktree_approval_handler=approve,
+            tool_approval_handler=approve,
+            commit_approval_handler=approve,
+        )
+
+    message = str(raised.value)
+    assert "config --local" in message
+    assert 'user.name "Your Name"' in message
+    assert 'user.email "you@example.com"' in message
+    assert "my source repo" in message
+    # Path containing spaces must be shell-quoted as a single argument.
+    import shlex
+
+    assert shlex.quote(str(source)) in message
+
+
+def test_preflight_propagates_git_operational_error(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """A non-not-found Git failure propagates and is not rewritten as missing or blank.
+
+    Patches _run_git so that the user.name query returns exit code 128
+    (a fatal Git error), simulating a corrupt config or permission failure.
+    Verifies the error propagates unchanged without aggregating any field.
+    """
+
+    source = create_repository_without_local_identity(tmp_path / "source")
+
+    import agent_workbench.worktree_commits as wc
+
+    original_run_git = wc._run_git
+
+    def patched_run_git(repository, arguments, **kwargs):
+        if "user.name" in arguments:
+            return wc._GitOutput(
+                returncode=128, stdout=b"", stderr=b"fatal: bad config"
+            )
+        return original_run_git(repository, arguments, **kwargs)
+
+    monkeypatch.setattr(wc, "_run_git", patched_run_git)
+
+    with pytest.raises(ConfigurationError) as raised:
+        wc.require_local_author_identity(source)
+
+    assert "missing or blank" not in str(raised.value)
+    assert "unexpected error" in str(raised.value)
+
+
+def test_preflight_succeeds_when_both_local_fields_are_configured(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Allow the workflow to proceed when local user.name and user.email are set."""
+
+    source = create_repository(tmp_path / "source")
+    target = tmp_path / "isolated"
+    captured = {}
+
+    def create_isolated(_session_id, _runtime, worktree, *, max_tool_rounds):
+        captured["worktree"] = worktree
+        return SimpleNamespace(worktree=worktree, session=object())
+
+    def run_coding(_session, _prompt, **_kwargs):
+        worktree = captured["worktree"]
+        (worktree.worktree_path / "module.py").write_text(
+            "def add(left: int, right: int) -> int:\n    return left + right\n",
+            encoding="utf-8",
+        )
+        return coding_result()
+
+    monkeypatch.setattr(
+        "agent_workbench.isolated_coding.create_isolated_agent_session",
+        create_isolated,
+    )
+    monkeypatch.setattr(
+        "agent_workbench.isolated_coding.run_autonomous_coding_task",
+        run_coding,
+    )
+
+    result = run_isolated_autonomous_workflow(
+        SessionId("preflight-success"),
+        configuration(source),
+        "agent/preflight-success",
+        target,
+        "Fix it.",
+        "fix: preflight success",
+        worktree_approval_handler=approve,
+        tool_approval_handler=approve,
+        commit_approval_handler=approve,
+    )
+
+    assert isinstance(result, IsolatedAutonomousWorkflowResult)
+    assert result.commit_result.branch_name == "agent/preflight-success"
