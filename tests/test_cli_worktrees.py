@@ -396,25 +396,28 @@ def test_main_reports_isolated_workflow_failure_without_fallback(
     )
     monkeypatch.setattr("agent_workbench.cli.create_agent_session", create_session)
 
-    main(
-        [
-            "--workspace",
-            "/source",
-            "--enable-actions",
-            "--task",
-            "Correct the implementation.",
-            "--worktree-path",
-            "/isolated",
-            "--worktree-branch",
-            "agent/task",
-            "--commit-message",
-            "fix: exact",
-        ]
-    )
+    with pytest.raises(SystemExit) as raised:
+        main(
+            [
+                "--workspace",
+                "/source",
+                "--enable-actions",
+                "--task",
+                "Correct the implementation.",
+                "--worktree-path",
+                "/isolated",
+                "--worktree-branch",
+                "agent/task",
+                "--commit-message",
+                "fix: exact",
+            ]
+        )
 
+    assert raised.value.code == 1
     create_session.assert_not_called()
     output = capsys.readouterr().out
     assert "[FAILED] Isolated autonomous workflow failed:" in output
+    assert "workspace preserved for manual recovery" in output
     assert "preserved for manual recovery" in output
     assert "Traceback" not in output
     assert "[ISOLATED]" not in output

@@ -303,7 +303,7 @@ def _run_autonomous_task(
                 "[FAILED] Autonomous coding could not start: "
                 f"{exc}; workspace preserved for manual recovery"
             )
-        return
+        raise SystemExit(1) from None
 
     if show_assistant_summary:
         print(f"\nAssistant summary:\n{result.assistant_summary}")
@@ -366,7 +366,7 @@ def _run_isolated_autonomous_task(
                 "[FAILED] Isolated autonomous workflow failed: "
                 f"{exc}; workspace preserved for manual recovery"
             )
-        return
+        raise SystemExit(1) from None
 
     _display_isolated_autonomous_result(
         result,
