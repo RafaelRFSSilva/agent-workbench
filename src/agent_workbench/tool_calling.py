@@ -230,14 +230,19 @@ def _productive_inspection_budget(
 ) -> tuple[int, int]:
     """Reserve an action round only when one is available to the provider."""
 
+    inspection_available = any(
+        definition.name in _REPEATED_INSPECTION_TOOL_NAMES
+        and (allowed_tool_names is None or definition.name in allowed_tool_names)
+        for definition in request.tools
+    )
     action_available = any(
         definition.name not in _REPEATED_INSPECTION_TOOL_NAMES
         and (allowed_tool_names is None or definition.name in allowed_tool_names)
         for definition in request.tools
     )
     reserved_rounds = (
-        min(RESERVED_SYNTHESIS_ACTION_TOOL_ROUNDS, max_tool_rounds - 1)
-        if action_available
+        min(RESERVED_SYNTHESIS_ACTION_TOOL_ROUNDS, max_tool_rounds)
+        if inspection_available and action_available
         else 0
     )
     return max_tool_rounds - reserved_rounds, reserved_rounds

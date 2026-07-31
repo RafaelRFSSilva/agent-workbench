@@ -1782,6 +1782,218 @@ def test_allows_more_than_sixteen_productive_inspection_rounds() -> None:
     )
 
 
+def test_minimal_action_budget_executes_one_explicitly_approved_action() -> None:
+    """Reserve the only tool round for one immutable approved action."""
+
+    read_file = create_read_file_definition()
+    calculator = create_calculator_definition()
+    executions: list[dict[str, object]] = []
+    approvals = []
+    registry = ToolRegistry()
+    registry.register(read_file, lambda arguments: {"content": "value"})
+    registry.register(
+        calculator,
+        lambda arguments: executions.append(arguments) or {"value": 4},
+        requires_approval=True,
+        approval_preview=lambda arguments: {
+            "expression": arguments["expression"],
+        },
+    )
+    action_response = create_tool_response(
+        ToolInvocation(
+            id="calculate",
+            tool_name="calculator",
+            arguments={"expression": "2 + 2"},
+        )
+    )
+    final_response = ChatResponse(text="Completed.")
+    provider = FakeProvider([action_response, final_response])
+    request = ChatRequest(messages=[], tools=(read_file, calculator))
+
+    def approve_action(approval) -> ToolApprovalDecision:
+        approvals.append(approval)
+        preview = approval.preview
+        assert isinstance(preview, dict)
+        preview["expression"] = "changed"
+        assert approval.preview == {"expression": "2 + 2"}
+        return ToolApprovalDecision.APPROVE
+
+    result = run_tool_calling_loop(
+        provider,
+        request,
+        registry,
+        max_tool_rounds=1,
+        tool_approval_handler=approve_action,
+    )
+
+    assert result is final_response
+    assert executions == [{"expression": "2 + 2"}]
+    assert len(approvals) == 1
+    assert provider.requests[0].tools == (calculator,)
+    assert provider.requests[0].system_prompt is not None
+    assert "productive read-only inspection budget is exhausted" in (
+        provider.requests[0].system_prompt
+    )
+    assert provider.requests[1].tools == (calculator,)
+
+
+def test_minimal_action_budget_allows_text_completion() -> None:
+    """Allow a normal completion while reserving the only action round."""
+
+    read_file = create_read_file_definition()
+    calculator = create_calculator_definition()
+    final_response = ChatResponse(text="No change is needed.")
+    provider = FakeProvider([final_response])
+    registry = ToolRegistry()
+    registry.register(read_file, lambda arguments: {"content": "value"})
+    registry.register(
+        calculator,
+        lambda arguments: {"value": 4},
+        requires_approval=True,
+        approval_preview=lambda arguments: {
+            "expression": arguments["expression"],
+        },
+    )
+
+    result = run_tool_calling_loop(
+        provider,
+        ChatRequest(messages=[], tools=(read_file, calculator)),
+        registry,
+        max_tool_rounds=1,
+        tool_approval_handler=lambda approval: ToolApprovalDecision.APPROVE,
+    )
+
+    assert result is final_response
+    assert provider.requests[0].tools == (calculator,)
+    assert provider.requests[0].system_prompt is not None
+    assert "finish without making changes" in provider.requests[0].system_prompt
+
+
+def test_minimal_action_budget_rejects_inspection_with_safe_diagnostics() -> None:
+    """Never let inspection consume the only controlled-action round."""
+
+    read_file = create_read_file_definition()
+    calculator = create_calculator_definition()
+    inspection_executions: list[dict[str, object]] = []
+    action_executions: list[dict[str, object]] = []
+    approvals = []
+    registry = ToolRegistry()
+    registry.register(
+        read_file,
+        lambda arguments: (
+            inspection_executions.append(arguments) or {"content": "private-source"}
+        ),
+    )
+    registry.register(
+        calculator,
+        lambda arguments: action_executions.append(arguments) or {"value": 4},
+        requires_approval=True,
+        approval_preview=lambda arguments: {
+            "expression": arguments["expression"],
+        },
+    )
+    provider = FakeProvider(
+        [
+            create_tool_response(
+                ToolInvocation(
+                    id="ignored-first",
+                    tool_name="read_file",
+                    arguments={"path": "private-first.py"},
+                )
+            ),
+            create_tool_response(
+                ToolInvocation(
+                    id="ignored-second",
+                    tool_name="read_file",
+                    arguments={"path": "private-second.py"},
+                )
+            ),
+        ]
+    )
+
+    with pytest.raises(
+        CompletionError,
+        match=(
+            r"repeatedly requested a read-only inspection tool.*"
+            r"requested_inspection=read_file.*"
+            r"tool_round_count=0/1.*"
+            r"productive_inspection_count=0.*"
+            r"duplicate_count=0.*"
+            r"inspection_streak_count=0.*"
+            r"inspection_budget=0.*"
+            r"reserved_synthesis_action_rounds=1.*"
+            r"response_repair_attempt_count=0.*"
+            r"alternative_inspection_tools_available=false"
+        ),
+    ) as raised_error:
+        run_tool_calling_loop(
+            provider,
+            ChatRequest(messages=[], tools=(read_file, calculator)),
+            registry,
+            max_tool_rounds=1,
+            tool_approval_handler=lambda approval: (
+                approvals.append(approval) or ToolApprovalDecision.APPROVE
+            ),
+        )
+
+    diagnostic = str(raised_error.value)
+    assert inspection_executions == []
+    assert action_executions == []
+    assert approvals == []
+    assert all(request.tools == (calculator,) for request in provider.requests)
+    assert "private-first.py" not in diagnostic
+    assert "private-second.py" not in diagnostic
+    assert "private-source" not in diagnostic
+    assert all(
+        request.system_prompt is not None
+        and "private-first.py" not in request.system_prompt
+        and "private-second.py" not in request.system_prompt
+        for request in provider.requests
+    )
+
+
+def test_minimal_read_only_budget_allows_one_inspection() -> None:
+    """Keep the complete configured tool budget when no action is available."""
+
+    read_file = create_read_file_definition()
+    inspection_executions: list[dict[str, object]] = []
+    registry = ToolRegistry()
+    registry.register(
+        read_file,
+        lambda arguments: (
+            inspection_executions.append(arguments) or {"content": "value"}
+        ),
+    )
+    inspection_response = create_tool_response(
+        ToolInvocation(
+            id="read",
+            tool_name="read_file",
+            arguments={"path": "module.py"},
+        )
+    )
+    final_response = ChatResponse(text="Inspection complete.")
+    provider = FakeProvider([inspection_response, final_response])
+    request = ChatRequest(messages=[], tools=(read_file,))
+
+    result = run_tool_calling_loop(
+        provider,
+        request,
+        registry,
+        max_tool_rounds=1,
+    )
+
+    assert result is final_response
+    assert inspection_executions == [{"path": "module.py"}]
+    assert all(
+        provider_request.tools is request.tools
+        for provider_request in provider.requests
+    )
+    assert all(
+        provider_request.system_prompt is request.system_prompt
+        for provider_request in provider.requests
+    )
+
+
 @pytest.mark.parametrize(
     ("max_tool_rounds", "inspection_count"),
     [(20, 19), (40, 39)],
