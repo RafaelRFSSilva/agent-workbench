@@ -2645,6 +2645,94 @@ def test_scripted_cli_progress_orders_failure_repair_success_verify_and_done(
     assert "Provider long completion" not in output
 
 
+def test_scripted_cli_separates_successful_patch_from_later_stale_repeat(
+    monkeypatch,
+    tmp_path,
+    capsys,
+) -> None:
+    """Report a preserved successful change before a later rejected action."""
+
+    repository = create_cli_coding_repository(tmp_path / "project")
+    original = (repository / "module.py").read_text(encoding="utf-8")
+    corrected = original.replace("left - right", "left + right")
+    arguments = {
+        "path": "module.py",
+        "expected_content": original,
+        "replacement_content": corrected,
+    }
+    repeated_patch = create_tool_response(
+        ToolInvocation(
+            id="ollama-tool-call-1",
+            tool_name="apply_file_patch",
+            arguments=arguments,
+        )
+    )
+    provider = FakeProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            repeated_patch,
+            repeated_patch,
+            ChatResponse(text="Edit complete."),
+        ]
+    )
+    session = create_cli_coding_session(repository, provider)
+    configuration = RuntimeConfiguration(
+        provider_name="ollama",
+        model_name="scripted",
+        workspace_root=repository,
+        enable_actions=True,
+    )
+    approval = Mock(return_value=ToolApprovalDecision.APPROVE)
+    monkeypatch.setattr("agent_workbench.cli.load_environment", Mock())
+    monkeypatch.setattr(
+        "agent_workbench.cli.resolve_runtime_configuration",
+        Mock(return_value=configuration),
+    )
+    monkeypatch.setattr(
+        "agent_workbench.cli.create_agent_session",
+        Mock(return_value=session),
+    )
+    monkeypatch.setattr("agent_workbench.cli._prompt_for_tool_approval", approval)
+
+    main(
+        [
+            "code",
+            "--workspace",
+            str(repository),
+            "--enable-actions",
+            "--task",
+            "Fix the failing tests.",
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert output.splitlines() == [
+        "[DISCOVER] Inspecting workspace",
+        "[DISCOVER] Inspection complete",
+        "[EDIT] Applying controlled workspace changes",
+        "[EDIT] Changed module.py",
+        (
+            "[EDIT] Later controlled action rejected for module.py: "
+            "Approval preview failed for apply_file_patch: "
+            "apply_file_patch expected content does not match."
+        ),
+        "[VALIDATE] Running controller-owned validation",
+        "[VALIDATE] Ruff format passed",
+        "[VALIDATE] Ruff check passed",
+        "[VALIDATE] Pytest passed: 1 passed",
+        "[VERIFY] Inspecting final workspace changes",
+        "[VERIFY] 1 changed file",
+        "[DONE] Task completed successfully",
+    ]
+    patch_approval_calls = [
+        approval_call
+        for approval_call in approval.call_args_list
+        if approval_call.args[0].invocation.tool_name == "apply_file_patch"
+    ]
+    assert len(patch_approval_calls) == 1
+    assert (repository / "module.py").read_text(encoding="utf-8") == corrected
+
+
 def test_scripted_cli_unexpected_formatter_path_fails_without_done(
     monkeypatch,
     tmp_path,

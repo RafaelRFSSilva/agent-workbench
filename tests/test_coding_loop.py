@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_workbench import validation_tools
+from agent_workbench import validation_tools, workspace_actions
 from agent_workbench.coding_loop import (
     DEFAULT_DISCOVER_MAX_TOOL_ROUNDS,
     DEFAULT_EDIT_COMPLETION_CONTINUATIONS,
@@ -531,6 +531,7 @@ def test_failed_controlled_action_emits_bounded_typed_progress(
         "Approval preview failed for apply_text_replacement: "
         "apply_text_replacement expected_file_sha256 does not match the current file."
     )
+    assert failure.later_action_rejected is False
     terminal = progress[-1]
     assert terminal.kind is CodingProgressKind.TERMINAL_FAILURE
     assert terminal.workspace_preserved is True
@@ -543,6 +544,93 @@ def test_failed_controlled_action_emits_bounded_typed_progress(
         )
         == 1
     )
+
+
+def test_stale_repeated_patch_after_success_is_rejected_as_a_later_action(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Apply once and distinguish a later stale repeat without reverting it."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    original = "def add(left: int, right: int) -> int:\n    return left - right\n"
+    corrected = "def add(left: int, right: int) -> int:\n    return left + right\n"
+    arguments = {
+        "path": "module.py",
+        "expected_content": original,
+        "replacement_content": corrected,
+    }
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            tool_response("ollama-tool-call-1", "apply_file_patch", arguments),
+            tool_response("ollama-tool-call-1", "apply_file_patch", arguments),
+            ChatResponse(text="Edit complete."),
+        ]
+    )
+    replacements: list[str] = []
+    original_replace = workspace_actions._replace_file_atomically
+
+    def record_replace(workspace, patch):
+        replacements.append(patch.relative_path)
+        original_replace(workspace, patch)
+
+    monkeypatch.setattr(
+        workspace_actions,
+        "_replace_file_atomically",
+        record_replace,
+    )
+    approvals = []
+
+    def approve_once(request):
+        approvals.append(request)
+        return ToolApprovalDecision.APPROVE
+
+    progress: list[CodingProgressEvent] = []
+    result = run_autonomous_coding_task(
+        create_session(repository, provider),
+        "Correct the add implementation.",
+        tool_approval_handler=approve_once,
+        progress_event_observer=progress.append,
+    )
+
+    assert replacements == ["module.py"]
+    assert (
+        sum(request.invocation.tool_name == "apply_file_patch" for request in approvals)
+        == 1
+    )
+    assert (repository / "module.py").read_text(encoding="utf-8") == corrected
+    changed = [
+        event
+        for event in progress
+        if event.kind is CodingProgressKind.WORKSPACE_CHANGED
+    ]
+    failures = [
+        event for event in progress if event.kind is CodingProgressKind.ACTION_FAILED
+    ]
+    assert [event.path for event in changed] == ["module.py"]
+    assert len(failures) == 1
+    assert failures[0].path == "module.py"
+    assert failures[0].later_action_rejected is True
+    assert failures[0].reason == (
+        "Approval preview failed for apply_file_patch: "
+        "apply_file_patch expected content does not match."
+    )
+    patch_results = [
+        result
+        for tool_name, result in zip(
+            result.executed_tool_names,
+            result.tool_results,
+            strict=True,
+        )
+        if tool_name == "apply_file_patch"
+    ]
+    assert [patch_result.status for patch_result in patch_results] == [
+        "success",
+        "error",
+    ]
+    assert result.validation_succeeded is True
+    assert result.final_phase is CodingPhase.DONE
 
 
 def test_validation_failure_emits_repair_attempt_and_safe_pytest_summary(
