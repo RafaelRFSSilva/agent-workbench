@@ -1,17 +1,77 @@
 # Self-Hosting Agent Workbench Development
 
-This playbook uses the local `gpt-oss:20b` model for one bounded autonomous
-coding task inside a separately approved Git worktree. The model may inspect
+This playbook documents the current supervised local-model workflow validated
+with Ollama `gpt-oss:20b` on a bounded Python smoke task. The model may inspect
 and request controlled edits. The application controller, rather than the
 model, formats only approved changed Python paths, runs project-wide Ruff check
 and pytest, and inspects Git status and diff in fixed phases. Worktree creation,
-controlled actions, executable validation, and the final local commit remain
-explicitly approved. The workflow preserves the worktree and local branch
-after success. Pushes and Pull Requests remain manual.
+controlled actions, executable validation, and isolated commit creation remain
+explicitly approved. Pushes and Pull Requests remain manual.
 
 The primary repository must be completely clean before launch. Do not use this
 workflow as a substitute for external review of security-sensitive or
 repository-lifecycle changes.
+
+## Validated supervised self-hosting workflow
+
+Observed end-to-end behavior for a bounded Python implementation task:
+
+1. Approved creation of one isolated worktree and branch.
+2. Controlled repository inspection during DISCOVER.
+3. Approved edit attempt with expected-content guards.
+4. Safe rejection when an expected fragment did not match.
+5. Approved recovery edit using a whole-file rewrite.
+6. Approved follow-up edit to restore the required final newline.
+7. Controller-owned Ruff formatting on changed Python paths.
+8. Controller-owned Ruff linting and pytest execution.
+9. Successful target-project test run.
+10. Final verification of status and exact changed-path set.
+11. Explicit approval of one isolated local commit.
+12. One created isolated commit with exactly one modified source file.
+13. Clean isolated worktree after commit.
+14. Unchanged primary workspace.
+15. Process exit status `0`.
+
+This evidence validates supervised isolated operation for small bounded tasks.
+It does not claim fully autonomous or production-ready operation for broad,
+multi-file, or high-risk changes.
+
+## Prerequisites
+
+- A clean source repository before launch.
+- Python and project dependencies already installed.
+- A supported provider and model available.
+- Explicit approval for worktree creation and all mutating actions.
+- Sufficient `--max-tool-rounds` and model-output budget for the selected task.
+- Repository-local Git identity (`user.name` and `user.email`) when isolated
+  commit creation is requested.
+
+Global Git identity is not sufficient for this workflow policy. The source
+repository must contain its own local `user.name` and `user.email`.
+
+## Repository-local identity preflight
+
+Identity preflight runs before any isolated worktree creation and before
+provider execution. If required repository-local Git fields are missing, the
+workflow exits with status `1` and names the missing fields.
+
+When preflight fails, the workflow does not:
+
+- create a branch;
+- create a worktree;
+- start discovery;
+- call the provider;
+- request approval;
+- edit files;
+- run Ruff or pytest;
+- create a commit.
+
+Configure identity in the source repository:
+
+```bash
+git -C "/path/to/project" config --local user.name "Your Name"
+git -C "/path/to/project" config --local user.email "you@example.com"
+```
 
 ## Supported workflow
 
@@ -67,21 +127,32 @@ match a credential, `.env`, or private-path boundary. Generic objectives,
 summaries, discovery, and action failures retain a separate, more conservative
 sensitive-line boundary.
 
-## Recommended launch command
+## Canonical isolated command
 
 From the clean primary Agent Workbench repository:
 
 ```bash
-uv run agent-workbench code \
+set +e
+
+PYTHONDONTWRITEBYTECODE=1 uv run agent-workbench code \
+  --workspace "/path/to/project" \
+  --worktree-path "/path/to/project-task-worktree" \
+  --worktree-branch "agent/task-name" \
   --provider ollama \
-  --model gpt-oss:20b \
+  --model "gpt-oss:20b" \
   --agent developer \
-  --workspace . \
+  --enable-tools \
   --enable-actions \
-  --task "<BOUNDED_TASK>" \
-  --worktree-path ../agent-workbench-task \
-  --worktree-branch agent/task-name \
-  --commit-message "<COMMIT_MESSAGE>"
+  --max-tool-rounds 8 \
+  --max-output-tokens 8192 \
+  --commit-message "feat: bounded change" \
+  --task "Implement one bounded, reviewable task."
+
+WORKFLOW_EXIT_CODE=$?
+
+set -e
+
+printf 'WORKFLOW_EXIT_CODE=%s\n' "$WORKFLOW_EXIT_CODE"
 ```
 
 The worktree target must be absent, its parent must already exist, and the
@@ -94,6 +165,78 @@ Normal output is concise controller-owned progress. Exact complete diffs remain
 visible for workspace and commit approval. Add `--show-tool-traces` only for
 debugging tool calls, or `--show-assistant-summary` when the model's complete
 final prose is needed.
+
+## Expected successful lifecycle
+
+Expected progression for a successful isolated run:
+
+1. worktree approval
+2. `DISCOVER`
+3. `EDIT`
+4. `VALIDATE`
+5. `VERIFY`
+6. `DONE`
+7. isolated commit approval
+8. `ISOLATED` commit confirmation
+9. exit status `0`
+
+Worktree creation, file mutations, executable validation, and isolated commit
+creation remain explicitly approval-controlled.
+
+## Failure semantics
+
+| Outcome | Exit status | Expected state |
+| --- | --- | --- |
+| Complete success | `0` | Isolated commit created and isolated worktree clean |
+| Terminal failure after work begins | `1` | Isolated branch/worktree and recoverable changes preserved for manual inspection |
+| Invalid preflight | `1` | No branch, worktree, provider request, edit, validation, or commit |
+
+When a failure preserves isolated state, inspect it deliberately and clean it
+up manually. Destructive automatic cleanup is intentionally avoided.
+
+## Patch recovery behavior
+
+A controlled patch can be rejected when expected content no longer matches the
+current file state. Rejection is explicit and safe; the failed patch is not
+silently applied. The model may then propose another controlled action (for
+example, a whole-file rewrite) that still requires explicit approval.
+
+## Evidence checklist after an isolated run
+
+Use generic variables and inspect the preserved evidence directly:
+
+```bash
+WORKSPACE="/path/to/project"
+ISOLATED_WORKTREE="/path/to/project-task-worktree"
+ISOLATED_BRANCH="agent/task-name"
+COMMIT_REF="<isolated-commit-ref>"
+
+# Source repository status.
+git -C "$WORKSPACE" status -sb
+
+# Registered worktrees.
+git -C "$WORKSPACE" worktree list --porcelain
+
+# Isolated branch and worktree status.
+git -C "$WORKSPACE" branch --list "$ISOLATED_BRANCH"
+git -C "$ISOLATED_WORKTREE" status -sb
+
+# Recent commits in the isolated worktree.
+git -C "$ISOLATED_WORKTREE" log --oneline -n 5
+
+# Changed paths in the isolated commit.
+git -C "$WORKSPACE" show --name-only --pretty="" "$COMMIT_REF"
+
+# Whitespace validity for commit diff.
+git -C "$WORKSPACE" show --check "$COMMIT_REF"
+
+# Accidental Python bytecode cache directories.
+find "$WORKSPACE" -type d -name "__pycache__" -print
+find "$ISOLATED_WORKTREE" -type d -name "__pycache__" -print
+
+# Workflow status captured immediately after Agent Workbench finished.
+printf 'Recorded workflow exit code: %s\n' "$WORKFLOW_EXIT_CODE"
+```
 
 ## Reusable local-agent prompt template
 
@@ -196,7 +339,7 @@ private paths, or `.env` values in the task prompt or commit message.
 Commit approval does not make staging and commit globally transactional. If
 execution reports partial state, stop and inspect manually.
 
-## What to send to ChatGPT for review
+## Evidence bundle for external review
 
 Provide this compact evidence bundle without secrets:
 
@@ -210,7 +353,7 @@ Provide this compact evidence bundle without secrets:
 - Transaction preview path/count summary.
 - Final `git diff --stat` and complete diff review findings.
 - Approved exact commit message and new isolated HEAD.
-- Local-agent final response.
+- Local-agent final response summary.
 - Every denied or failed action and the preserved recovery state.
 
 Do not include `.env`, credentials, external secret files, canonical temporary
@@ -264,8 +407,16 @@ complete compact, sorted-key UTF-8 JSON result is limited to 100 KiB. Binary,
 unsupported, unreadable, oversized, sensitive, ignored, and limit-exceeding
 files are omitted with metadata whose detailed form has a 16 KiB budget and
 collapses to deterministic reason counts when needed. Omission metadata alone
-cannot satisfy VERIFY and requires manual review. No post-hardening real-model
-benchmark has passed yet.
+cannot satisfy VERIFY and requires manual review.
+
+## Current limitations
+
+- Workflows remain approval-supervised for all mutating actions.
+- Isolated commits are local only and are not pushed or merged automatically.
+- Failure-preserved worktrees require deliberate manual inspection and cleanup.
+- Output quality depends on the selected provider/model and task complexity.
+- The validated `gpt-oss:20b` smoke task was intentionally small.
+- Broader multi-file tasks still require additional end-to-end validation.
 
 ## Tasks suitable for `gpt-oss:20b`
 
@@ -293,25 +444,3 @@ Keep each task small enough to inspect in one complete transaction preview.
 - Crash recovery.
 - Merge or conflict automation.
 - Any security-boundary change.
-
-## Historical pre-controller `COMMIT-842` validation evidence
-
-Before the deterministic controller was implemented, the isolated commit
-milestone was validated with a fresh temporary repository and the real local
-`gpt-oss:20b` model. This is historical manual evidence, not a benchmark of the
-current phase controller. Worktree creation pinned a clean primary HEAD. The
-model read the two implementation files and their test, changed exactly
-`demo/labels.py` and `demo/math_ops.py` in one approved transaction, ran Ruff
-format, Ruff check, and pytest successfully, and inspected status and diff.
-
-The primary branch, HEAD, status, and tracked bytes remained unchanged. An
-immutable preview for `fix: correct demo behavior` contained exactly both
-complete diffs. One separate commit approval staged only those paths and
-created one commit; its parent, exact message, path set, content, and diff were
-verified. The isolated index and worktree became clean. Clean removal was
-approved separately, while `agent/commit-842` and its commit remained.
-
-No merge, push, fetch, pull, amend, reset, restore, clean, stash, force removal,
-or branch deletion occurred. Separate smokes verified denial, stale plans,
-partial staging, staged-diff mismatch, failed commit preservation, ambiguous
-advanced HEAD preservation, and rejection of unsupported changes.
