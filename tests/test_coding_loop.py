@@ -341,6 +341,133 @@ def test_controller_runs_discover_edit_validate_verify_and_done(
     )
 
 
+def test_edit_uses_derived_inspection_budget_before_approved_change(
+    tmp_path: Path,
+) -> None:
+    """Reach DONE after exhausting productive inspection in EDIT."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    original = "def add(left: int, right: int) -> int:\n    return left - right\n"
+    inspections = [
+        tool_response(
+            f"search-{index}",
+            "search_text",
+            {"query": f"distinct-query-{index}"},
+        )
+        for index in range(19)
+    ]
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            *inspections,
+            replacement_response(
+                "edit",
+                expected_content=original,
+                expected_text="return left - right",
+                replacement_text="return left + right",
+            ),
+            ChatResponse(text="Edit complete."),
+        ]
+    )
+    approval_names: list[str] = []
+
+    def record_approval(request) -> ToolApprovalDecision:
+        approval_names.append(request.invocation.tool_name)
+        return ToolApprovalDecision.APPROVE
+
+    result = run_autonomous_coding_task(
+        create_session(repository, provider, max_tool_rounds=20),
+        "Correct the add implementation.",
+        tool_approval_handler=record_approval,
+    )
+
+    assert result.final_phase is CodingPhase.DONE
+    assert result.workspace_change_applied is True
+    assert result.executed_tool_names[:20] == (
+        *("search_text" for _ in range(19)),
+        "apply_text_replacement",
+    )
+    assert approval_names == [
+        "apply_text_replacement",
+        "run_ruff_format",
+        "run_ruff_check",
+        "run_pytest",
+    ]
+    assert all(
+        "search_text" in {tool.name for tool in request.tools}
+        for request in provider.requests[1:20]
+    )
+    assert "search_text" not in {tool.name for tool in provider.requests[20].tools}
+    assert "apply_text_replacement" in {
+        tool.name for tool in provider.requests[20].tools
+    }
+    assert provider.requests[20].system_prompt is not None
+    assert "productive read-only inspection budget is exhausted" in (
+        provider.requests[20].system_prompt
+    )
+    assert (repository / "module.py").read_text(encoding="utf-8") == original.replace(
+        "return left - right",
+        "return left + right",
+    )
+
+
+def test_edit_rejects_inspection_after_budget_guidance_without_changes(
+    tmp_path: Path,
+) -> None:
+    """Preserve the workspace when bounded synthesis still requests inspection."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    inspections = [
+        tool_response(
+            f"search-{index}",
+            "search_text",
+            {"query": f"distinct-query-{index}"},
+        )
+        for index in range(19)
+    ]
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            *inspections,
+            tool_response("ignored-first", "read_file", {"path": "module.py"}),
+            tool_response("ignored-second", "read_file", {"path": "test_module.py"}),
+        ]
+    )
+    approval_names: list[str] = []
+
+    def record_approval(request) -> ToolApprovalDecision:
+        approval_names.append(request.invocation.tool_name)
+        return ToolApprovalDecision.APPROVE
+
+    with pytest.raises(
+        CompletionError,
+        match=(
+            r"phase EDIT: model-facing phase failed: The provider repeatedly "
+            r"requested a read-only inspection tool.*"
+            r"requested_inspection=read_file.*"
+            r"tool_round_count=19/20.*"
+            r"productive_inspection_count=19.*"
+            r"duplicate_count=0.*"
+            r"inspection_streak_count=19.*"
+            r"inspection_budget=19.*"
+            r"reserved_synthesis_action_rounds=1.*"
+            r"response_repair_attempt_count=0"
+        ),
+    ):
+        run_autonomous_coding_task(
+            create_session(repository, provider, max_tool_rounds=20),
+            "Correct the add implementation.",
+            tool_approval_handler=record_approval,
+        )
+
+    assert approval_names == []
+    assert "read_file" not in {tool.name for tool in provider.requests[20].tools}
+    assert "apply_text_replacement" in {
+        tool.name for tool in provider.requests[20].tools
+    }
+    assert run_git(repository, "status", "--short").stdout == ""
+
+
 def test_edit_executes_repeated_safe_read_then_applies_approved_change(
     tmp_path: Path,
 ) -> None:

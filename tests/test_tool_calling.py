@@ -15,6 +15,7 @@ from agent_workbench.messages import (
 from agent_workbench.structured_outputs import JSONResponseFormat
 from agent_workbench.tool_calling import (
     MAX_TOOL_INVOCATIONS_PER_RESPONSE,
+    RESERVED_SYNTHESIS_ACTION_TOOL_ROUNDS,
     run_tool_calling_loop,
 )
 from agent_workbench.tool_registry import ToolRegistry
@@ -624,7 +625,7 @@ def test_executes_one_repeated_inspection_before_duplicate_recovery() -> None:
         repeated_response,
         calculator_response,
     )
-    assert provider.requests[2].tools is request.tools
+    assert provider.requests[2].tools == (calculator,)
     assert provider.requests[2].tool_interactions == tuple(observed_rounds[:2])
 
 
@@ -740,7 +741,7 @@ def test_repeated_inspection_keeps_every_inspection_definition() -> None:
         provider,
         request,
         registry,
-        max_tool_rounds=2,
+        max_tool_rounds=3,
     )
 
     assert result.text == "Use the existing inspection result."
@@ -1744,8 +1745,8 @@ def test_recovers_approval_preview_failure_as_tool_error_when_enabled() -> None:
     assert provider.requests[1].tool_interactions == (expected_round,)
 
 
-def test_keeps_inspection_tools_available_before_sixteen_round_limit() -> None:
-    """Keep the full tool set through fifteen successful inspection rounds."""
+def test_allows_more_than_sixteen_productive_inspection_rounds() -> None:
+    """Keep distinct successful inspections available within the derived budget."""
 
     read_file = create_read_file_definition()
     calculator = create_calculator_definition()
@@ -1760,7 +1761,7 @@ def test_keeps_inspection_tools_available_before_sixteen_round_limit() -> None:
                 arguments={"path": f"module-{index}.py"},
             )
         )
-        for index in range(15)
+        for index in range(17)
     ]
     final_response = ChatResponse(text="Enough context collected.")
     provider = FakeProvider([*inspection_responses, final_response])
@@ -1770,21 +1771,30 @@ def test_keeps_inspection_tools_available_before_sixteen_round_limit() -> None:
         provider,
         request,
         registry,
-        max_tool_rounds=15,
+        max_tool_rounds=20,
     )
 
     assert result is final_response
+    assert RESERVED_SYNTHESIS_ACTION_TOOL_ROUNDS == 1
     assert all(
         provider_request.tools is request.tools
         for provider_request in provider.requests
     )
 
 
-def test_withholds_inspection_tools_after_sixteen_inspection_only_rounds() -> None:
-    """Require progress after a bounded successful inspection-only streak."""
+@pytest.mark.parametrize(
+    ("max_tool_rounds", "inspection_count"),
+    [(20, 19), (40, 39)],
+)
+def test_withholds_inspection_tools_after_derived_productive_budget(
+    max_tool_rounds: int,
+    inspection_count: int,
+) -> None:
+    """Reserve one configured tool round for synthesis or a controlled action."""
 
     read_executions: list[dict[str, object]] = []
     calculator_executions: list[dict[str, object]] = []
+    approvals = []
     read_file = create_read_file_definition()
     calculator = create_calculator_definition()
     registry = ToolRegistry()
@@ -1795,6 +1805,8 @@ def test_withholds_inspection_tools_after_sixteen_inspection_only_rounds() -> No
     registry.register(
         calculator,
         lambda arguments: calculator_executions.append(arguments) or {"value": 4},
+        requires_approval=True,
+        approval_preview=lambda arguments: {"expression": arguments["expression"]},
     )
     inspection_responses = [
         create_tool_response(
@@ -1804,7 +1816,7 @@ def test_withholds_inspection_tools_after_sixteen_inspection_only_rounds() -> No
                 arguments={"path": f"module-{index}.py"},
             )
         )
-        for index in range(16)
+        for index in range(inspection_count)
     ]
     calculator_response = create_tool_response(
         ToolInvocation(
@@ -1823,16 +1835,23 @@ def test_withholds_inspection_tools_after_sixteen_inspection_only_rounds() -> No
         provider,
         request,
         registry,
-        max_tool_rounds=17,
+        max_tool_rounds=max_tool_rounds,
+        tool_approval_handler=lambda approval: (
+            approvals.append(approval) or ToolApprovalDecision.APPROVE
+        ),
     )
 
     assert result is final_response
-    assert len(read_executions) == 16
+    assert len(read_executions) == inspection_count
     assert calculator_executions == [{"expression": "2 + 2"}]
-    assert provider.requests[16].tools == (calculator,)
-    assert provider.requests[16].system_prompt is not None
-    assert "module-0.py" not in provider.requests[16].system_prompt
-    assert provider.requests[17].tools is request.tools
+    assert len(approvals) == 1
+    assert provider.requests[inspection_count].tools == (calculator,)
+    assert provider.requests[inspection_count].system_prompt is not None
+    assert "use the repository evidence already gathered" in (
+        provider.requests[inspection_count].system_prompt.lower()
+    )
+    assert "module-0.py" not in provider.requests[inspection_count].system_prompt
+    assert provider.requests[inspection_count + 1].tools == (calculator,)
     assert request.tools == (read_file, calculator)
 
 
@@ -1901,14 +1920,15 @@ def test_recovers_once_from_inspection_requested_while_tools_are_withheld() -> N
     assert provider.requests[17].tools == (calculator,)
     assert provider.requests[17].system_prompt is not None
     assert "forbidden.py" not in provider.requests[17].system_prompt
-    assert provider.requests[18].tools is request.tools
+    assert provider.requests[18].tools == (calculator,)
 
 
-def test_rejects_second_inspection_requested_while_tools_are_withheld() -> None:
-    """Fail safely after one ignored-withholding recovery attempt."""
+def test_rejects_inspection_after_budget_guidance_with_safe_diagnostics() -> None:
+    """Fail safely when bounded synthesis recovery still requests inspection."""
 
     executions: list[dict[str, object]] = []
     read_file = create_read_file_definition()
+    calculator = create_calculator_definition()
     registry = ToolRegistry()
     registry.register(
         read_file,
@@ -1922,7 +1942,7 @@ def test_rejects_second_inspection_requested_while_tools_are_withheld() -> None:
                 arguments={"path": f"module-{index}.py"},
             )
         )
-        for index in range(16)
+        for index in range(19)
     ]
     first_ignored = create_tool_response(
         ToolInvocation(
@@ -1945,26 +1965,31 @@ def test_rejects_second_inspection_requested_while_tools_are_withheld() -> None:
         match=(
             r"repeatedly requested a read-only inspection tool.*"
             r"requested_inspection=read_file.*"
-            r"tool_round_count=16/17.*"
+            r"tool_round_count=19/20.*"
+            r"productive_inspection_count=19.*"
             r"duplicate_count=0.*"
-            r"inspection_streak_count=16.*"
+            r"inspection_streak_count=19.*"
+            r"inspection_budget=19.*"
+            r"reserved_synthesis_action_rounds=1.*"
             r"response_repair_attempt_count=0.*"
             r"alternative_inspection_tools_available=false"
         ),
-    ):
+    ) as raised_error:
         run_tool_calling_loop(
             provider,
-            ChatRequest(messages=[], tools=(read_file,)),
+            ChatRequest(messages=[], tools=(read_file, calculator)),
             registry,
-            max_tool_rounds=17,
+            max_tool_rounds=20,
         )
 
-    assert len(provider.requests) == 18
-    assert len(executions) == 16
-    assert provider.requests[16].tools == ()
-    assert provider.requests[17].tools == ()
-    assert provider.requests[17].system_prompt is not None
-    assert "first-forbidden.py" not in provider.requests[17].system_prompt
+    assert len(provider.requests) == 21
+    assert len(executions) == 19
+    assert provider.requests[19].tools == (calculator,)
+    assert provider.requests[20].tools == (calculator,)
+    assert provider.requests[20].system_prompt is not None
+    assert "first-forbidden.py" not in provider.requests[20].system_prompt
+    assert "first-forbidden.py" not in str(raised_error.value)
+    assert "second-forbidden.py" not in str(raised_error.value)
 
 
 def test_duplicate_rejection_allows_a_different_inspection() -> None:
@@ -2101,8 +2126,8 @@ def test_noninspection_round_resets_the_inspection_streak() -> None:
     )
 
 
-def test_existing_sixteen_round_inspection_streak_starts_withheld_recovery() -> None:
-    """Recover immediately when request history already reaches the limit."""
+def test_existing_derived_inspection_budget_starts_withheld_recovery() -> None:
+    """Recover immediately when request history reaches the derived budget."""
 
     read_file = create_read_file_definition()
     calculator = create_calculator_definition()
@@ -2137,7 +2162,7 @@ def test_existing_sixteen_round_inspection_streak_starts_withheld_recovery() -> 
         provider,
         request,
         ToolRegistry(),
-        max_tool_rounds=1,
+        max_tool_rounds=17,
     )
 
     assert result is final_response
@@ -2289,4 +2314,4 @@ def test_unsafe_batch_recovery_keeps_inspection_tools_withheld() -> None:
     assert calculator_executions == [{"expression": "2 + 2"}]
     assert provider.requests[16].tools == (calculator,)
     assert provider.requests[17].tools == (calculator,)
-    assert provider.requests[18].tools is request.tools
+    assert provider.requests[18].tools == (calculator,)
