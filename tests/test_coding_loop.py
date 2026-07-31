@@ -726,6 +726,112 @@ def test_repeated_invalid_controlled_action_arguments_remain_bounded(
         assert "\x1b[31m" not in event.reason
 
 
+def test_multi_file_edit_recovers_after_successful_controlled_action(
+    tmp_path: Path,
+) -> None:
+    """Treat malformed action recovery as consecutive within one EDIT sequence."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    original_module = (repository / "module.py").read_text(encoding="utf-8")
+    updated_module = original_module.replace("left - right", "left + right")
+    original_test = (repository / "test_module.py").read_text(encoding="utf-8")
+    updated_test = original_test.replace("def test_add()", "def test_add_numbers()")
+
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            tool_response(
+                "invalid-module",
+                "apply_file_rewrite",
+                {
+                    "path": "module.py",
+                    "expected_file_sha256": hashlib.sha256(
+                        original_module.encode("utf-8")
+                    ).hexdigest(),
+                    "replacement_content": updated_module,
+                    "unsupported": "field",
+                },
+            ),
+            tool_response(
+                "corrected-module",
+                "apply_file_rewrite",
+                {
+                    "path": "module.py",
+                    "expected_file_sha256": hashlib.sha256(
+                        original_module.encode("utf-8")
+                    ).hexdigest(),
+                    "replacement_content": updated_module,
+                },
+            ),
+            tool_response(
+                "invalid-test",
+                "apply_text_replacement",
+                {
+                    "path": "test_module.py",
+                    "expected_text": "def test_add() -> None:\n",
+                },
+            ),
+            tool_response(
+                "corrected-test",
+                "apply_text_replacement",
+                {
+                    "path": "test_module.py",
+                    "expected_text": "def test_add() -> None:\n",
+                    "replacement_text": "def test_add_numbers() -> None:\n",
+                    "expected_file_sha256": hashlib.sha256(
+                        original_test.encode("utf-8")
+                    ).hexdigest(),
+                },
+            ),
+            tool_response(
+                "apply-init",
+                "apply_file_patch",
+                {
+                    "path": "__init__.py",
+                    "expected_content": "",
+                    "replacement_content": '"""Project package marker."""\n',
+                    "create_if_missing": True,
+                },
+            ),
+            ChatResponse(text="Edit complete."),
+        ]
+    )
+    progress: list[CodingProgressEvent] = []
+
+    result = run_autonomous_coding_task(
+        create_session(repository, provider, max_tool_rounds=32),
+        "Update module and tests across multiple files.",
+        tool_approval_handler=approve,
+        progress_event_observer=progress.append,
+    )
+
+    assert result.final_phase is CodingPhase.DONE
+    assert result.validation_succeeded is True
+    assert result.approved_workspace_paths == (
+        "__init__.py",
+        "module.py",
+        "test_module.py",
+    )
+    assert (repository / "module.py").read_text(encoding="utf-8") == updated_module
+    assert (repository / "test_module.py").read_text(encoding="utf-8") == updated_test
+    assert (repository / "__init__.py").read_text(encoding="utf-8") == (
+        '"""Project package marker."""\n'
+    )
+
+    rejected_paths = [
+        event.path
+        for event in progress
+        if event.kind is CodingProgressKind.ACTION_ARGUMENTS_REJECTED
+    ]
+    changed_paths = [
+        event.path
+        for event in progress
+        if event.kind is CodingProgressKind.WORKSPACE_CHANGED
+    ]
+    assert rejected_paths == ["module.py", "test_module.py"]
+    assert changed_paths == ["module.py", "test_module.py", "__init__.py"]
+
+
 def test_edit_uses_derived_inspection_budget_before_approved_change(
     tmp_path: Path,
 ) -> None:
