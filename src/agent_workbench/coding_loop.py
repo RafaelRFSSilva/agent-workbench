@@ -10,7 +10,10 @@ from agent_workbench.errors import CompletionError, ConfigurationError
 from agent_workbench.messages import ChatResponse, ToolInteractionRound
 from agent_workbench.session import AgentSession
 from agent_workbench.tasks import TaskSpec
-from agent_workbench.tool_calling import ToolRoundObserver
+from agent_workbench.tool_calling import (
+    MAX_TOOL_ARGUMENT_VALIDATION_RECOVERIES,
+    ToolRoundObserver,
+)
 from agent_workbench.tool_registry import ToolRegistry
 from agent_workbench.tools import (
     JSONObject,
@@ -33,6 +36,9 @@ DEFAULT_DISCOVER_MAX_TOOL_ROUNDS = 4
 DEFAULT_EDIT_COMPLETION_CONTINUATIONS = 2
 DEFAULT_MAX_REPAIR_ATTEMPTS = 2
 DEFAULT_REPAIR_COMPLETION_CONTINUATIONS = 2
+MAX_CONTROLLED_ACTION_ARGUMENT_VALIDATION_FAILURES = (
+    MAX_TOOL_ARGUMENT_VALIDATION_RECOVERIES + 1
+)
 MAX_DISCOVERY_EVIDENCE_ITEMS = 12
 MAX_DISCOVERY_EVIDENCE_ITEM_CHARACTERS = 800
 MAX_DISCOVERY_EVIDENCE_CHARACTERS = 4_000
@@ -158,6 +164,7 @@ class CodingProgressKind(StrEnum):
     PHASE_STARTED = "phase_started"
     PHASE_COMPLETED = "phase_completed"
     WORKSPACE_CHANGED = "workspace_changed"
+    ACTION_ARGUMENTS_REJECTED = "action_arguments_rejected"
     ACTION_FAILED = "action_failed"
     VALIDATION_RESULT = "validation_result"
     REPAIR_STARTED = "repair_started"
@@ -328,6 +335,8 @@ class _WorkflowState:
     completion_continuation_count: int = 0
     controller_invocation_count: int = 0
     current_action_attempt_number: int = 0
+    controlled_action_argument_validation_failures: int = 0
+    last_argument_validation_tool_name: str | None = None
     baseline_changed_paths: tuple[str, ...] = ()
     baseline_unsafe_changed_path_count: int = 0
     skipped_validation_runs: list[ValidationRun] = field(default_factory=list)
@@ -374,6 +383,7 @@ def run_autonomous_coding_task(
 
     def observe_tool_round(round_: ToolInteractionRound) -> None:
         state.rounds.append(round_)
+        _capture_argument_validation_failures(state, round_)
         _capture_action_failure_evidence(state, round_)
         _emit_action_progress(state, round_)
         if tool_round_observer is not None:
@@ -666,6 +676,8 @@ def _run_model_change_phase(
     """Require a successful workspace action during EDIT or one REPAIR attempt."""
 
     state.phase = phase
+    state.controlled_action_argument_validation_failures = 0
+    state.last_argument_validation_tool_name = None
     local_continuations = 0
     outstanding = (
         "Apply at least one successful controlled workspace change.",
@@ -696,6 +708,13 @@ def _run_model_change_phase(
                 recover_approval_preview_errors=True,
             )
         except CompletionError as exc:
+            if str(exc).startswith("Tool argument validation recovery limit reached;"):
+                raise _argument_validation_workflow_failure(
+                    state,
+                    phase,
+                    session,
+                    len(state.rounds) - call_start,
+                ) from None
             if str(exc) != _MAXIMUM_ROUNDS_ERROR:
                 raise _workflow_failure(
                     state,
@@ -722,6 +741,17 @@ def _run_model_change_phase(
             ):
                 return True
             incomplete_reason = "no successful new workspace change was observed"
+
+        if (
+            state.controlled_action_argument_validation_failures
+            >= MAX_CONTROLLED_ACTION_ARGUMENT_VALIDATION_FAILURES
+        ):
+            raise _argument_validation_workflow_failure(
+                state,
+                phase,
+                session,
+                len(current_call_rounds),
+            )
 
         if local_continuations >= continuation_limit:
             if phase is CodingPhase.EDIT:
@@ -927,7 +957,14 @@ def _emit_action_progress(
         _emit_progress(
             state,
             CodingProgressEvent(
-                kind=CodingProgressKind.ACTION_FAILED,
+                kind=(
+                    CodingProgressKind.ACTION_ARGUMENTS_REJECTED
+                    if _is_argument_validation_error(
+                        invocation.tool_name,
+                        result.error,
+                    )
+                    else CodingProgressKind.ACTION_FAILED
+                ),
                 path=evidence.path,
                 reason=evidence.error_message,
                 later_action_rejected=(
@@ -940,6 +977,58 @@ def _emit_action_progress(
                 **event_fields,
             ),
         )
+
+
+def _capture_argument_validation_failures(
+    state: _WorkflowState,
+    round_: ToolInteractionRound,
+) -> None:
+    """Count only model-correctable schema failures for controlled actions."""
+
+    if state.phase not in {CodingPhase.EDIT, CodingPhase.REPAIR}:
+        return
+    for invocation, result in zip(
+        round_.response.tool_invocations,
+        round_.results,
+        strict=True,
+    ):
+        if (
+            invocation.tool_name in _WORKSPACE_CHANGE_TOOL_NAMES
+            and result.status == "error"
+            and _is_argument_validation_error(invocation.tool_name, result.error)
+        ):
+            state.controlled_action_argument_validation_failures += 1
+            state.last_argument_validation_tool_name = invocation.tool_name
+
+
+def _is_argument_validation_error(tool_name: str, error: str | None) -> bool:
+    """Identify one deterministic registry-produced schema failure."""
+
+    return error is not None and error.startswith(
+        f"Tool '{tool_name}' argument validation failed:"
+    )
+
+
+def _argument_validation_workflow_failure(
+    state: _WorkflowState,
+    phase: CodingPhase,
+    session: AgentSession,
+    tool_round_count: int,
+) -> CompletionError:
+    """Return one sanitized terminal failure for bounded argument recovery."""
+
+    tool_name = state.last_argument_validation_tool_name or "unavailable"
+    return _workflow_failure(
+        state,
+        phase,
+        "controlled action argument recovery limit reached; "
+        f"phase={phase.value}; "
+        f"tool={tool_name}; "
+        "argument_validation_failures="
+        f"{state.controlled_action_argument_validation_failures}; "
+        f"tool_round_count={tool_round_count}/{session.max_tool_rounds}; "
+        "correction_opportunity_provided=true",
+    )
 
 
 def _emit_progress(

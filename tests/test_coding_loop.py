@@ -9,6 +9,7 @@ import pytest
 
 from agent_workbench import validation_tools, workspace_actions
 from agent_workbench.coding_loop import (
+    MAX_CONTROLLED_ACTION_ARGUMENT_VALIDATION_FAILURES,
     DEFAULT_DISCOVER_MAX_TOOL_ROUNDS,
     DEFAULT_EDIT_COMPLETION_CONTINUATIONS,
     DEFAULT_MAX_REPAIR_ATTEMPTS,
@@ -339,6 +340,157 @@ def test_controller_runs_discover_edit_validate_verify_and_done(
     assert not edit_tools.intersection(
         {"run_ruff_format", "run_ruff_check", "run_pytest"}
     )
+
+
+def test_invalid_patch_arguments_are_corrected_before_one_approved_edit(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Return shape guidance, then preview, approve, and execute exactly once."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    original = (repository / "module.py").read_text(encoding="utf-8")
+    corrected = original.replace("left - right", "left + right")
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            tool_response(
+                "invalid-edit",
+                "apply_file_patch",
+                {
+                    "path": "module.py",
+                    "patch": "legacy unstructured patch text",
+                },
+            ),
+            tool_response(
+                "corrected-edit",
+                "apply_file_patch",
+                {
+                    "path": "module.py",
+                    "expected_content": original,
+                    "replacement_content": corrected,
+                },
+            ),
+            ChatResponse(text="Edit complete."),
+        ]
+    )
+    replacements = []
+    original_replace = workspace_actions._replace_file_atomically
+
+    def record_replace(workspace, patch):
+        replacements.append(patch.relative_path)
+        original_replace(workspace, patch)
+
+    monkeypatch.setattr(
+        workspace_actions,
+        "_replace_file_atomically",
+        record_replace,
+    )
+    approvals = []
+
+    def approve_corrected(request):
+        if request.invocation.tool_name == "apply_file_patch":
+            assert (repository / "module.py").read_text(encoding="utf-8") == original
+        approvals.append(request)
+        return ToolApprovalDecision.APPROVE
+
+    progress: list[CodingProgressEvent] = []
+    result = run_autonomous_coding_task(
+        create_session(repository, provider, max_tool_rounds=1),
+        "Correct the add implementation.",
+        tool_approval_handler=approve_corrected,
+        progress_event_observer=progress.append,
+    )
+
+    invalid_result = provider.requests[2].tool_interactions[0].results[0]
+    assert invalid_result.status == "error"
+    assert invalid_result.error is not None
+    assert "Tool 'apply_file_patch' argument validation failed" in invalid_result.error
+    assert "missing required fields: expected_content, replacement_content" in (
+        invalid_result.error
+    )
+    assert "Required structured shape" in invalid_result.error
+    assert "Issue a corrected apply_file_patch tool call" in invalid_result.error
+    assert "legacy unstructured patch text" not in invalid_result.error
+    assert [
+        request.invocation.id
+        for request in approvals
+        if request.invocation.tool_name == "apply_file_patch"
+    ] == ["corrected-edit"]
+    assert replacements == ["module.py"]
+    rejected = [
+        event
+        for event in progress
+        if event.kind is CodingProgressKind.ACTION_ARGUMENTS_REJECTED
+    ]
+    assert len(rejected) == 1
+    assert rejected[0].path == "module.py"
+    assert result.final_phase is CodingPhase.DONE
+    assert (repository / "module.py").read_text(encoding="utf-8") == corrected
+
+
+def test_repeated_invalid_patch_arguments_terminate_with_safe_diagnostics(
+    tmp_path: Path,
+) -> None:
+    """Preserve the workspace after the fixed controlled-action recovery bound."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    original = (repository / "module.py").read_text(encoding="utf-8")
+    invalid_responses = [
+        tool_response(
+            f"invalid-{index}",
+            "apply_file_patch",
+            {
+                "path": "module.py",
+                "replacement_content": index,
+            },
+        )
+        for index in range(MAX_CONTROLLED_ACTION_ARGUMENT_VALIDATION_FAILURES)
+    ]
+    responses = [ChatResponse(text="Discovery complete.")]
+    for invalid_response in invalid_responses:
+        responses.extend(
+            [
+                invalid_response,
+                ChatResponse(text="I did not correct the invocation."),
+            ]
+        )
+    provider = ScriptedProvider(responses)
+    approvals = []
+    progress: list[CodingProgressEvent] = []
+
+    with pytest.raises(CompletionError) as raised:
+        run_autonomous_coding_task(
+            create_session(repository, provider),
+            "Correct the add implementation.",
+            tool_approval_handler=(
+                lambda request: (
+                    approvals.append(request) or ToolApprovalDecision.APPROVE
+                )
+            ),
+            progress_event_observer=progress.append,
+        )
+
+    message = str(raised.value)
+    assert "controlled action argument recovery limit reached" in message
+    assert "phase=EDIT" in message
+    assert "tool=apply_file_patch" in message
+    assert "argument_validation_failures=2" in message
+    assert "tool_round_count=" in message
+    assert "correction_opportunity_provided=true" in message
+    assert str(repository) not in message
+    assert approvals == []
+    assert (repository / "module.py").read_text(encoding="utf-8") == original
+    assert run_git(repository, "status", "--short").stdout == ""
+    assert (
+        sum(
+            event.kind is CodingProgressKind.ACTION_ARGUMENTS_REJECTED
+            for event in progress
+        )
+        == MAX_CONTROLLED_ACTION_ARGUMENT_VALIDATION_FAILURES
+    )
+    assert progress[-1].kind is CodingProgressKind.TERMINAL_FAILURE
+    assert progress[-1].workspace_preserved is True
 
 
 def test_edit_uses_derived_inspection_budget_before_approved_change(

@@ -323,6 +323,83 @@ def test_registration_preserves_existing_tools_and_exact_definition(
     )
 
 
+@pytest.mark.parametrize(
+    ("arguments", "issue"),
+    [
+        (
+            {"path": "module.py"},
+            "missing required fields: expected_content, replacement_content",
+        ),
+        (
+            {
+                "path": "module.py",
+                "expected_content": "",
+                "replacement_content": 1,
+            },
+            "replacement_content must be a string",
+        ),
+        (
+            {
+                "path": "module.py",
+                "expected_content": "",
+                "replacement_content": "updated\n",
+                "patch": "legacy text",
+            },
+            "unsupported fields: patch",
+        ),
+    ],
+)
+def test_advertised_patch_schema_rejects_runtime_invalid_shapes_before_preview(
+    tmp_path: Path,
+    arguments: dict[str, object],
+    issue: str,
+) -> None:
+    """Use the registered advertised schema before any approval preview."""
+
+    _, workspace = create_workspace(tmp_path)
+    registry = ToolRegistry()
+    register_workspace_action_tools(registry, workspace)
+    invocation = ToolInvocation(
+        id="invalid-patch",
+        tool_name="apply_file_patch",
+        arguments=arguments,
+    )
+
+    error = registry.argument_validation_error(invocation)
+
+    assert error is not None
+    assert issue in error
+    assert (
+        "Required structured shape: {path: string, expected_content: string, "
+        "replacement_content: string, create_if_missing?: boolean}"
+    ) in error
+
+
+def test_advertised_patch_schema_accepts_the_runtime_patch_shape(
+    tmp_path: Path,
+) -> None:
+    """Keep valid structured patch arguments unchanged through both validators."""
+
+    root, workspace = create_workspace(tmp_path)
+    (root / "module.py").write_text("old\n", encoding="utf-8")
+    arguments = patch_arguments(
+        path="module.py",
+        expected="old\n",
+        replacement="new\n",
+    )
+    registry = ToolRegistry()
+    register_workspace_action_tools(registry, workspace)
+    invocation = ToolInvocation(
+        id="valid-patch",
+        tool_name="apply_file_patch",
+        arguments=arguments,
+    )
+
+    assert registry.argument_validation_error(invocation) is None
+    assert preview_file_patch(workspace, invocation.arguments)["path"] == "module.py"
+    assert (root / "module.py").read_text(encoding="utf-8") == "old\n"
+
+
 def test_existing_file_preview_is_complete_deterministic_and_non_mutating(
     tmp_path: Path,
 ) -> None:

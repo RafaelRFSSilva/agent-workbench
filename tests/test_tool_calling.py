@@ -14,6 +14,7 @@ from agent_workbench.messages import (
 )
 from agent_workbench.structured_outputs import JSONResponseFormat
 from agent_workbench.tool_calling import (
+    MAX_TOOL_ARGUMENT_VALIDATION_RECOVERIES,
     MAX_TOOL_INVOCATIONS_PER_RESPONSE,
     RESERVED_SYNTHESIS_ACTION_TOOL_ROUNDS,
     run_tool_calling_loop,
@@ -1743,6 +1744,118 @@ def test_recovers_approval_preview_failure_as_tool_error_when_enabled() -> None:
     assert approvals == []
     assert observed_rounds == [expected_round]
     assert provider.requests[1].tool_interactions == (expected_round,)
+
+
+def test_invalid_arguments_are_returned_before_approval_then_corrected() -> None:
+    """Reject the advertised wrong shape and preserve one round for correction."""
+
+    calculator = create_calculator_definition()
+    registry = ToolRegistry()
+    executions = []
+    approvals = []
+    previews = []
+    registry.register(
+        calculator,
+        lambda arguments: executions.append(arguments) or {"value": 4},
+        requires_approval=True,
+        approval_preview=(
+            lambda arguments: (
+                previews.append(arguments) or {"expression": arguments["expression"]}
+            )
+        ),
+    )
+    invalid_response = create_tool_response(
+        ToolInvocation(
+            id="invalid-call",
+            tool_name="calculator",
+            arguments={"expression": 4},
+        )
+    )
+    corrected_response = create_tool_response(
+        ToolInvocation(
+            id="corrected-call",
+            tool_name="calculator",
+            arguments={"expression": "2 + 2"},
+        )
+    )
+    provider = FakeProvider(
+        [
+            invalid_response,
+            corrected_response,
+            ChatResponse(text="Corrected."),
+        ]
+    )
+
+    result = run_tool_calling_loop(
+        provider,
+        ChatRequest(messages=[], tools=(calculator,)),
+        registry,
+        max_tool_rounds=1,
+        tool_approval_handler=(
+            lambda request: approvals.append(request) or ToolApprovalDecision.APPROVE
+        ),
+    )
+
+    assert result.text == "Corrected."
+    assert executions == [{"expression": "2 + 2"}]
+    assert previews == [{"expression": "2 + 2"}]
+    assert [request.invocation.id for request in approvals] == ["corrected-call"]
+    error = provider.requests[1].tool_interactions[0].results[0].error
+    assert error == (
+        "Tool 'calculator' argument validation failed: expression must be a "
+        "string. Required structured shape: {expression: string}. Issue a "
+        "corrected calculator tool call matching the advertised schema."
+    )
+    assert "4" not in error
+
+
+def test_repeated_invalid_arguments_stop_through_explicit_bounded_policy() -> None:
+    """Bound provider-independent schema recovery without approval or execution."""
+
+    calculator = create_calculator_definition()
+    registry = ToolRegistry()
+    executions = []
+    approvals = []
+    registry.register(
+        calculator,
+        lambda arguments: executions.append(arguments),
+        requires_approval=True,
+        approval_preview=lambda arguments: arguments,
+    )
+    provider = FakeProvider(
+        [
+            create_tool_response(
+                ToolInvocation(
+                    id=f"invalid-{index}",
+                    tool_name="calculator",
+                    arguments={},
+                )
+            )
+            for index in range(MAX_TOOL_ARGUMENT_VALIDATION_RECOVERIES + 1)
+        ]
+    )
+
+    with pytest.raises(CompletionError) as raised:
+        run_tool_calling_loop(
+            provider,
+            ChatRequest(messages=[], tools=(calculator,)),
+            registry,
+            max_tool_rounds=1,
+            tool_approval_handler=(
+                lambda request: (
+                    approvals.append(request) or ToolApprovalDecision.APPROVE
+                )
+            ),
+        )
+
+    assert str(raised.value) == (
+        "Tool argument validation recovery limit reached; tool=calculator; "
+        "argument_validation_failures=2; tool_round_count=0/1; "
+        "correction_opportunity_provided=true"
+    )
+    assert len(provider.requests) == MAX_TOOL_ARGUMENT_VALIDATION_RECOVERIES + 1
+    assert executions == []
+    assert approvals == []
 
 
 def test_allows_more_than_sixteen_productive_inspection_rounds() -> None:

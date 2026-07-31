@@ -2328,6 +2328,12 @@ def test_progress_renderer_covers_repair_skip_plural_and_terminal_failure(
             max_repair_attempts=2,
         ),
         CodingProgressEvent(
+            phase=CodingPhase.EDIT,
+            kind=CodingProgressKind.ACTION_ARGUMENTS_REJECTED,
+            path="module.py",
+            reason="apply_file_patch requires corrected structured arguments",
+        ),
+        CodingProgressEvent(
             phase=CodingPhase.VERIFY,
             kind=CodingProgressKind.CHANGED_PATH_COUNT,
             changed_path_count=2,
@@ -2347,6 +2353,8 @@ def test_progress_renderer_covers_repair_skip_plural_and_terminal_failure(
         "[VALIDATE] Ruff format skipped: no approved changed Python files\n"
         "[REPAIR 1/2] Resolving validation failures\n"
         "[REPAIR 1/2] Changed module.py\n"
+        "[EDIT] Controlled action arguments rejected for module.py: "
+        "apply_file_patch requires corrected structured arguments\n"
         "[VERIFY] 2 changed files\n"
         "[FAILED] VERIFY: unexpected changed paths before DONE: unrelated.py; "
         "validation repair attempts 1/2; "
