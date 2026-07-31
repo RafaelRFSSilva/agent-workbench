@@ -1660,6 +1660,8 @@ def test_init_dry_run_prints_exact_canonical_configuration_without_files(
     assert captured.err == ""
     assert "Created .agent-workbench/config.toml" not in captured.out
     assert not (tmp_path / ".agent-workbench").exists()
+    assert not (tmp_path / "instructions.md").exists()
+    assert not any(tmp_path.iterdir())
     create_configuration_mock.assert_not_called()
 
 
