@@ -163,6 +163,38 @@ def test_file_rewrite_approval_renders_complete_diff(monkeypatch, capsys) -> Non
     assert "+new" in output
 
 
+def test_line_range_approval_renders_selected_range_and_complete_diff(
+    monkeypatch,
+    capsys,
+) -> None:
+    """Render exact inclusive line-range metadata before explicit approval."""
+
+    monkeypatch.setattr("builtins.input", lambda _prompt: "y")
+
+    decision = _prompt_for_tool_approval(
+        approval_request(
+            "apply_line_range_replacement",
+            {
+                "path": "module.py",
+                "operation": "update",
+                "old_size_bytes": 8,
+                "new_size_bytes": 8,
+                "changed_lines": 2,
+                "start_line": 20,
+                "end_line": 21,
+                "diff": "--- a/module.py\n+++ b/module.py\n-old\n+new\n",
+            },
+        )
+    )
+
+    output = capsys.readouterr().out
+    assert decision is ToolApprovalDecision.APPROVE
+    assert "Action approval required: apply_line_range_replacement" in output
+    assert "Selected line range: 20–21" in output
+    assert "Complete diff:" in output
+    assert "+new" in output
+
+
 def test_cli_approval_input_eof_denies(monkeypatch) -> None:
     """Treat unavailable approval input as denial."""
 
@@ -771,6 +803,51 @@ def test_file_rewrite_trace_redacts_content_but_keeps_safe_metadata(capsys) -> N
     assert "SECRET-NEW" not in output
     assert "0000000000000000" not in output
     assert '"path":"module.py"' in output
+    assert '"replacement_content_bytes":10' in output
+    assert '"expected_file_sha256_present":true' in output
+
+
+def test_line_range_trace_redacts_content_but_keeps_safe_metadata(capsys) -> None:
+    """Never expose replacement content or the exact digest in normal traces."""
+
+    invocation = ToolInvocation(
+        id="line-range",
+        tool_name="apply_line_range_replacement",
+        arguments={
+            "path": "module.py",
+            "start_line": 20,
+            "end_line": 21,
+            "replacement_content": "SECRET-NEW",
+            "expected_file_sha256": "0" * 64,
+        },
+    )
+    round_ = ToolInteractionRound(
+        response=ChatResponse(tool_invocations=(invocation,)),
+        results=(
+            ToolResult(
+                invocation_id="line-range",
+                status="success",
+                output={
+                    "path": "module.py",
+                    "operation": "update",
+                    "old_size_bytes": 10,
+                    "new_size_bytes": 10,
+                    "changed_lines": 2,
+                    "start_line": 20,
+                    "end_line": 21,
+                },
+            ),
+        ),
+    )
+
+    _display_tool_round(round_)
+
+    output = capsys.readouterr().out
+    assert "SECRET-NEW" not in output
+    assert "0000000000000000" not in output
+    assert '"path":"module.py"' in output
+    assert '"start_line":20' in output
+    assert '"end_line":21' in output
     assert '"replacement_content_bytes":10' in output
     assert '"expected_file_sha256_present":true' in output
 

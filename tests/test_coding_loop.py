@@ -216,6 +216,31 @@ def rewrite_response(
     )
 
 
+def line_range_response(
+    invocation_id: str,
+    *,
+    expected_content: str,
+    start_line: int,
+    end_line: int,
+    replacement_content: str,
+) -> ChatResponse:
+    """Create one optimistic SHA-guarded line-range response."""
+
+    return tool_response(
+        invocation_id,
+        "apply_line_range_replacement",
+        {
+            "path": "module.py",
+            "start_line": start_line,
+            "end_line": end_line,
+            "replacement_content": replacement_content,
+            "expected_file_sha256": hashlib.sha256(
+                expected_content.encode("utf-8")
+            ).hexdigest(),
+        },
+    )
+
+
 def approve(_request) -> ToolApprovalDecision:
     """Approve one action inside a disposable test repository."""
 
@@ -324,6 +349,7 @@ def test_controller_runs_discover_edit_validate_verify_and_done(
             "apply_file_patch",
             "apply_file_rewrite",
             "apply_text_replacement",
+            "apply_line_range_replacement",
             "apply_workspace_changes",
             "run_ruff_format",
             "run_ruff_check",
@@ -335,11 +361,49 @@ def test_controller_runs_discover_edit_validate_verify_and_done(
         "apply_file_patch",
         "apply_file_rewrite",
         "apply_text_replacement",
+        "apply_line_range_replacement",
         "apply_workspace_changes",
     }.issubset(edit_tools)
     assert not edit_tools.intersection(
         {"run_ruff_format", "run_ruff_check", "run_pytest"}
     )
+
+
+def test_line_range_action_is_compatible_with_final_workspace_verification(
+    tmp_path: Path,
+) -> None:
+    """Track an approved range edit through validation and final Git inspection."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    original = "def add(left: int, right: int) -> int:\n    return left - right\n"
+    provider = ScriptedProvider(
+        [
+            tool_response("read", "read_file", {"path": "module.py"}),
+            ChatResponse(text="Discovery complete."),
+            line_range_response(
+                "edit",
+                expected_content=original,
+                start_line=2,
+                end_line=2,
+                replacement_content="    return left + right\n",
+            ),
+            ChatResponse(text="Corrected the add implementation."),
+        ]
+    )
+
+    result = run_autonomous_coding_task(
+        create_session(repository, provider),
+        "Correct the add implementation.",
+        tool_approval_handler=approve,
+    )
+
+    assert result.final_phase is CodingPhase.DONE
+    assert result.workspace_change_applied is True
+    assert result.approved_workspace_paths == ("module.py",)
+    assert result.inspected_git_status_after_change is True
+    assert result.inspected_git_diff_after_change is True
+    assert "apply_line_range_replacement" in result.approved_action_names
+    assert run_git(repository, "status", "--short").stdout == " M module.py\n"
 
 
 def test_invalid_patch_arguments_are_corrected_before_one_approved_edit(

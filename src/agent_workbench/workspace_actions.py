@@ -122,6 +122,35 @@ APPLY_TEXT_REPLACEMENT_DEFINITION = ToolDefinition(
     },
 )
 
+APPLY_LINE_RANGE_REPLACEMENT_DEFINITION = ToolDefinition(
+    name="apply_line_range_replacement",
+    description=(
+        "Replace one exact one-based inclusive line range in an existing UTF-8 "
+        "file using its current SHA-256 digest."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "path": {"type": "string"},
+            "start_line": {"type": "integer", "minimum": 1},
+            "end_line": {"type": "integer", "minimum": 1},
+            "replacement_content": {"type": "string"},
+            "expected_file_sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$",
+            },
+        },
+        "required": [
+            "path",
+            "start_line",
+            "end_line",
+            "replacement_content",
+            "expected_file_sha256",
+        ],
+        "additionalProperties": False,
+    },
+)
+
 _CHANGE_SCHEMA: JSONObject = {
     "type": "object",
     "properties": {
@@ -205,6 +234,27 @@ class _PreparedTextReplacement:
 
 
 @dataclass(frozen=True, slots=True)
+class _PreparedLineRangeReplacement:
+    """Store one validated line range and its complete resulting file patch."""
+
+    patch: _PreparedPatch
+    start_line: int
+    end_line: int
+
+    def metadata(self, *, include_diff: bool) -> JSONObject:
+        """Return bounded result or complete range approval metadata."""
+
+        metadata = {
+            **self.patch.metadata(),
+            "start_line": self.start_line,
+            "end_line": self.end_line,
+        }
+        if include_diff:
+            metadata["diff"] = self.patch.diff
+        return metadata
+
+
+@dataclass(frozen=True, slots=True)
 class _WorkspaceChangePlan:
     """Store one immutable validated deterministic transaction plan."""
 
@@ -270,6 +320,15 @@ def register_workspace_action_tools(
         lambda arguments: apply_text_replacement(workspace, arguments),
         requires_approval=True,
         approval_preview=lambda arguments: preview_text_replacement(
+            workspace,
+            arguments,
+        ),
+    )
+    registry.register(
+        APPLY_LINE_RANGE_REPLACEMENT_DEFINITION,
+        lambda arguments: apply_line_range_replacement(workspace, arguments),
+        requires_approval=True,
+        approval_preview=lambda arguments: preview_line_range_replacement(
             workspace,
             arguments,
         ),
@@ -367,6 +426,28 @@ def apply_text_replacement(
     """Revalidate and atomically apply one exact literal text replacement."""
 
     prepared = _prepare_text_replacement(workspace, arguments)
+    _replace_file_atomically(workspace, prepared.patch)
+    return prepared.metadata(include_diff=False)
+
+
+def preview_line_range_replacement(
+    workspace: Workspace,
+    arguments: object,
+) -> JSONObject:
+    """Validate a line range and return its complete deterministic preview."""
+
+    return _prepare_line_range_replacement(workspace, arguments).metadata(
+        include_diff=True,
+    )
+
+
+def apply_line_range_replacement(
+    workspace: Workspace,
+    arguments: object,
+) -> JSONObject:
+    """Revalidate and atomically replace one exact inclusive line range."""
+
+    prepared = _prepare_line_range_replacement(workspace, arguments)
     _replace_file_atomically(workspace, prepared.patch)
     return prepared.metadata(include_diff=False)
 
@@ -605,6 +686,96 @@ def _prepare_text_replacement(
     )
 
 
+def _prepare_line_range_replacement(
+    workspace: Workspace,
+    arguments: object,
+) -> _PreparedLineRangeReplacement:
+    """Validate and prepare one SHA-guarded exact line-range replacement."""
+
+    (
+        path,
+        start_line,
+        end_line,
+        replacement_content,
+        expected_file_sha256,
+    ) = _get_line_range_replacement_arguments(arguments)
+    try:
+        _encode_patch_content("replacement_content", replacement_content)
+        target, relative_path, target_status = _resolve_write_target(workspace, path)
+    except ValueError as exc:
+        raise _as_line_range_replacement_error(exc) from None
+    if target_status is None:
+        raise ValueError("apply_line_range_replacement target does not exist.")
+
+    try:
+        old_bytes = _read_existing_file(target, target_status)
+    except ValueError as exc:
+        raise _as_line_range_replacement_error(exc) from None
+    if hashlib.sha256(old_bytes).hexdigest() != expected_file_sha256:
+        raise ValueError(
+            "apply_line_range_replacement expected_file_sha256 does not match "
+            "the current file."
+        )
+
+    try:
+        old_content = old_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError("apply_line_range_replacement requires valid UTF-8.") from None
+
+    lines = old_content.splitlines(keepends=True)
+    if end_line > len(lines):
+        raise ValueError(
+            "apply_line_range_replacement line range exceeds the current file."
+        )
+    replacement_file_content = (
+        "".join(lines[: start_line - 1])
+        + replacement_content
+        + "".join(lines[end_line:])
+    )
+    try:
+        replacement_bytes = _encode_patch_content(
+            "replacement_content",
+            replacement_file_content,
+        )
+    except ValueError as exc:
+        raise _as_line_range_replacement_error(exc) from None
+
+    changed_lines = _count_changed_lines(old_content, replacement_file_content)
+    if changed_lines > MAX_CHANGED_LINES:
+        raise ValueError(
+            "line-range replacement exceeds the "
+            f"{MAX_CHANGED_LINES}-changed-line limit."
+        )
+    diff = _create_unified_diff(
+        relative_path,
+        old_content,
+        replacement_file_content,
+        operation="update",
+    )
+    if len(diff.encode("utf-8")) > MAX_PATCH_PREVIEW_BYTES:
+        raise ValueError(
+            "complete line-range replacement preview exceeds the "
+            f"{MAX_PATCH_PREVIEW_BYTES}-byte limit."
+        )
+
+    return _PreparedLineRangeReplacement(
+        patch=_PreparedPatch(
+            target=target,
+            relative_path=relative_path,
+            operation="update",
+            expected_content=old_content,
+            replacement_content=replacement_file_content,
+            old_size_bytes=len(old_bytes),
+            new_size_bytes=len(replacement_bytes),
+            changed_lines=changed_lines,
+            diff=diff,
+            existing_mode=stat.S_IMODE(target_status.st_mode),
+        ),
+        start_line=start_line,
+        end_line=end_line,
+    )
+
+
 def _prepare_file_rewrite(
     workspace: Workspace,
     arguments: object,
@@ -829,6 +1000,76 @@ def _get_text_replacement_arguments(
     )
 
 
+def _get_line_range_replacement_arguments(
+    arguments: object,
+) -> tuple[str, int, int, str, str]:
+    """Validate one closed SHA-guarded line-range argument object."""
+
+    required = {
+        "path",
+        "start_line",
+        "end_line",
+        "replacement_content",
+        "expected_file_sha256",
+    }
+    if not isinstance(arguments, dict) or set(arguments) != required:
+        raise ValueError(
+            "apply_line_range_replacement requires path, start_line, end_line, "
+            "replacement_content, and expected_file_sha256."
+        )
+
+    path = arguments["path"]
+    start_line = arguments["start_line"]
+    end_line = arguments["end_line"]
+    replacement_content = arguments["replacement_content"]
+    expected_file_sha256 = arguments["expected_file_sha256"]
+
+    if not isinstance(path, str):
+        raise ValueError("apply_line_range_replacement path must be a string.")
+    if (
+        not isinstance(start_line, int)
+        or isinstance(start_line, bool)
+        or start_line < 1
+    ):
+        raise ValueError(
+            "apply_line_range_replacement start_line must be an integer greater "
+            "than or equal to 1."
+        )
+    if not isinstance(end_line, int) or isinstance(end_line, bool):
+        raise ValueError(
+            "apply_line_range_replacement end_line must be an integer greater "
+            "than or equal to start_line."
+        )
+    if end_line < start_line:
+        raise ValueError(
+            "apply_line_range_replacement end_line must be greater than or equal "
+            "to start_line."
+        )
+    if not isinstance(replacement_content, str):
+        raise ValueError(
+            "apply_line_range_replacement replacement_content must be a string."
+        )
+    if (
+        not isinstance(expected_file_sha256, str)
+        or len(expected_file_sha256) != 64
+        or any(
+            character not in "0123456789abcdef" for character in expected_file_sha256
+        )
+    ):
+        raise ValueError(
+            "apply_line_range_replacement expected_file_sha256 must contain "
+            "64 lowercase hexadecimal characters."
+        )
+
+    return (
+        path,
+        start_line,
+        end_line,
+        replacement_content,
+        expected_file_sha256,
+    )
+
+
 def _get_file_rewrite_arguments(
     arguments: object,
 ) -> tuple[str, str, str]:
@@ -932,6 +1173,16 @@ def _as_text_replacement_error(error: ValueError) -> ValueError:
     patch_prefix = "apply_file_patch"
     if message.startswith(patch_prefix):
         message = "apply_text_replacement" + message[len(patch_prefix) :]
+    return ValueError(message)
+
+
+def _as_line_range_replacement_error(error: ValueError) -> ValueError:
+    """Rewrite shared patch diagnostics for the line-range action."""
+
+    message = str(error)
+    patch_prefix = "apply_file_patch"
+    if message.startswith(patch_prefix):
+        message = "apply_line_range_replacement" + message[len(patch_prefix) :]
     return ValueError(message)
 
 

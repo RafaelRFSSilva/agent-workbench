@@ -623,6 +623,7 @@ def _prompt_for_tool_approval(
         "apply_file_patch",
         "apply_file_rewrite",
         "apply_text_replacement",
+        "apply_line_range_replacement",
     } and isinstance(preview, dict):
         print(f"  Path: {preview.get('path', '[unavailable]')}")
         print(f"  Operation: {preview.get('operation', '[unavailable]')}")
@@ -636,6 +637,12 @@ def _prompt_for_tool_approval(
             print(
                 "  Literal occurrences: "
                 f"{preview.get('occurrences_replaced', '[unavailable]')}"
+            )
+        elif tool_name == "apply_line_range_replacement":
+            print(
+                "  Selected line range: "
+                f"{preview.get('start_line', '[unavailable]')}–"
+                f"{preview.get('end_line', '[unavailable]')}"
             )
         print("  Complete diff:")
         diff = preview.get("diff")
@@ -782,6 +789,19 @@ def _trace_arguments(invocation) -> object:
             ),
             "replacement_text_bytes": _utf8_byte_count(
                 arguments.get("replacement_text"),
+            ),
+            "expected_file_sha256_present": isinstance(
+                arguments.get("expected_file_sha256"),
+                str,
+            ),
+        }
+    if invocation.tool_name == "apply_line_range_replacement":
+        return {
+            "path": arguments.get("path"),
+            "start_line": arguments.get("start_line"),
+            "end_line": arguments.get("end_line"),
+            "replacement_content_bytes": _utf8_byte_count(
+                arguments.get("replacement_content"),
             ),
             "expected_file_sha256_present": isinstance(
                 arguments.get("expected_file_sha256"),
