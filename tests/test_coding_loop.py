@@ -2742,6 +2742,55 @@ def test_validation_failure_command_counts_toward_existing_evidence_budget() -> 
     assert "STDERR-START" in rendered
 
 
+def test_oversized_validation_command_cannot_exceed_evidence_budget() -> None:
+    """Reject an oversized command without hiding a later bounded command."""
+
+    oversized_result = ToolResult(
+        invocation_id="oversized-command",
+        status="success",
+        output={
+            "command": ["python", "x" * 20_000],
+            "exit_code": 1,
+            "stdout": "ruff failure",
+            "stderr": "",
+        },
+    )
+    bounded_result = ToolResult(
+        invocation_id="bounded-command",
+        status="success",
+        output={
+            "command": ["python", "-m", "pytest", "-q"],
+            "exit_code": 1,
+            "stdout": "pytest failure",
+            "stderr": "AssertionError",
+        },
+    )
+
+    rendered = _format_validation_failure_evidence(
+        _bounded_validation_failure_evidence(
+            (
+                ("run_ruff_check", oversized_result),
+                ("run_pytest", bounded_result),
+            )
+        )
+    )
+
+    records = rendered.split("\n\n")
+
+    assert len(rendered) <= MAX_REPAIR_VALIDATION_EVIDENCE_CHARACTERS
+    assert len(records) == 2
+
+    assert "tool_name=run_ruff_check" in records[0]
+    assert "command=[unavailable]" in records[0]
+    assert "ruff failure" in records[0]
+    assert ("x" * 100) not in records[0]
+
+    assert "tool_name=run_pytest" in records[1]
+    assert 'command=["python","-m","pytest","-q"]' in records[1]
+    assert "pytest failure" in records[1]
+    assert "AssertionError" in records[1]
+
+
 def test_second_repair_resolves_every_failure_and_reaches_done(
     tmp_path: Path,
 ) -> None:

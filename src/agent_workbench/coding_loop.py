@@ -1562,6 +1562,7 @@ def _bounded_validation_failure_evidence(
     """Build fair per-stream excerpts within one combined prompt budget."""
 
     evidence = []
+    raw_commands: list[tuple[int, tuple[str, ...]]] = []
     raw_streams: list[tuple[int, str, str]] = []
     for index, (tool_name, result) in enumerate(failed_validations):
         stdout = ""
@@ -1588,16 +1589,36 @@ def _bounded_validation_failure_evidence(
             _ValidationFailureEvidence(
                 tool_name=tool_name,
                 result_status=str(result.status),
-                command=command,
+                command=None,
                 exit_code=_validation_exit_code(result.output),
                 stdout_excerpt="",
                 stderr_excerpt="",
             )
         )
+        if command is not None:
+            raw_commands.append((index, command))
         if stdout:
             raw_streams.append((index, "stdout", stdout))
         if stderr:
             raw_streams.append((index, "stderr", stderr))
+
+    for evidence_index, command in raw_commands:
+        current = evidence[evidence_index]
+        candidate = _ValidationFailureEvidence(
+            tool_name=current.tool_name,
+            result_status=current.result_status,
+            command=command,
+            exit_code=current.exit_code,
+            stdout_excerpt=current.stdout_excerpt,
+            stderr_excerpt=current.stderr_excerpt,
+        )
+        candidate_evidence = list(evidence)
+        candidate_evidence[evidence_index] = candidate
+        if (
+            len(_format_validation_failure_evidence(tuple(candidate_evidence)))
+            <= MAX_REPAIR_VALIDATION_EVIDENCE_CHARACTERS
+        ):
+            evidence[evidence_index] = candidate
 
     base_length = len(_format_validation_failure_evidence(tuple(evidence)))
     remaining = max(
