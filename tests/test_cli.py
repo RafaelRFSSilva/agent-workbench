@@ -2240,6 +2240,70 @@ def test_isolated_coding_interrupt_exits_cleanly_without_cleanup(
     assert sentinel.read_text(encoding="utf-8") == "approved isolated change\n"
 
 
+def test_isolated_preflight_identity_failure_exits_with_status_1(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    """Return exit status 1 before any worktree when local identity is absent."""
+
+    source = tmp_path / "source"
+    source.mkdir()
+    subprocess.run(
+        ["git", "init", "-b", "main"], cwd=source, check=True, capture_output=True
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(source),
+            "-c",
+            "user.name=Temp",
+            "-c",
+            "user.email=t@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "initial",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    target = tmp_path / "isolated"
+
+    with pytest.raises(SystemExit) as raised:
+        main(
+            [
+                "code",
+                "--provider",
+                "ollama",
+                "--model",
+                "test-model",
+                "--workspace",
+                str(source),
+                "--enable-actions",
+                "--task",
+                "Fix it.",
+                "--worktree-path",
+                str(target),
+                "--worktree-branch",
+                "agent/preflight-cli",
+                "--commit-message",
+                "fix: preflight",
+            ]
+        )
+
+    assert raised.value.code == 1
+    captured = capsys.readouterr()
+    assert "config --local" in captured.out
+    assert not target.exists()
+    result = subprocess.run(
+        ["git", "-C", str(source), "branch", "--list", "agent/preflight-cli"],
+        capture_output=True,
+        text=True,
+    )
+    assert result.stdout.strip() == ""
+
+
 def test_main_uses_interactive_runtime_setup(
     monkeypatch,
 ) -> None:

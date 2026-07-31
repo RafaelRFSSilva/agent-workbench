@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
+import shlex
 import signal
 import stat
 import subprocess
@@ -590,22 +591,76 @@ def _validate_commit_message(message: object) -> str:
     return message
 
 
-def _read_local_identity(repository: Path, key: str) -> str:
-    """Return one safe exact repository-local identity value."""
+def _query_local_identity(repository: Path, key: str) -> str | None:
+    """Return a valid identity string, None if absent or blank, or raise on error.
+
+    Return None:  key not found (exit 1) or the decoded value is empty.
+    Return str:   non-empty value with no control characters.
+    Raise:        non-1 Git failure, invalid UTF-8, malformed output,
+                  or a value containing control characters.
+    """
 
     output = _run_git(repository, ("config", "--local", "--get", key))
+    if output.returncode == 1:
+        return None  # key absent
     if output.returncode != 0:
         raise ConfigurationError(
-            "isolated commit requires repository-local author identity."
+            "repository-local identity configuration returned an unexpected error."
         )
     value = _decode_line(output.stdout, "repository-local identity")
-    if not value or any(
-        ord(character) < 32 or ord(character) == 127 for character in value
-    ):
+    if not value:
+        return None  # blank value treated as absent
+    if any(ord(c) < 32 or ord(c) == 127 for c in value):
         raise ConfigurationError(
             "repository-local author identity is missing or invalid."
         )
     return value
+
+
+def _read_local_identity(repository: Path, key: str) -> str:
+    """Return one safe exact repository-local identity value."""
+
+    value = _query_local_identity(repository, key)
+    if value is None:
+        raise ConfigurationError(
+            "isolated commit requires repository-local author identity."
+        )
+    return value
+
+
+_IDENTITY_EXAMPLES: dict[str, str] = {
+    "user.name": '"Your Name"',
+    "user.email": '"you@example.com"',
+}
+
+
+def require_local_author_identity(workspace: Path) -> None:
+    """Raise ConfigurationError early if repository-local Git identity is missing.
+
+    Checks only local config; global and system identity are never accepted.
+    Absent or blank fields are aggregated into one actionable error message.
+    Operational failures and invalid data (UTF-8, control characters) propagate.
+    """
+
+    missing: list[str] = []
+    for key in ("user.name", "user.email"):
+        value = _query_local_identity(workspace, key)  # raises on error; None if absent
+        if value is None:
+            missing.append(key)
+
+    if not missing:
+        return
+
+    fields = " and ".join(missing)
+    quoted = shlex.quote(str(workspace))
+    configure_lines = "\n".join(
+        f"    git -C {quoted} config --local {key} {_IDENTITY_EXAMPLES[key]}"
+        for key in missing
+    )
+    raise ConfigurationError(
+        f"isolated commit requires repository-local Git author identity; "
+        f"missing or blank: {fields}. Configure with:\n{configure_lines}"
+    )
 
 
 def _read_symbolic_branch(repository: Path) -> str:
