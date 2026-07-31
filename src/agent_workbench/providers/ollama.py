@@ -296,4 +296,5 @@ class OllamaProvider:
         return ChatResponse(
             text=response.message.content or "",
             tool_invocations=tool_invocations,
+            response_repair_attempt_count=malformed_tool_call_retries,
         )

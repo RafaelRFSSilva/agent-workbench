@@ -432,7 +432,8 @@ def _display_coding_progress(event: CodingProgressEvent) -> None:
         message = "Task completed successfully"
     elif event.kind is CodingProgressKind.TERMINAL_FAILURE:
         attempts = (
-            f"; repair attempts {event.repair_attempt}/{event.max_repair_attempts}"
+            f"; validation repair attempts "
+            f"{event.repair_attempt}/{event.max_repair_attempts}"
             if event.max_repair_attempts
             else ""
         )

@@ -2349,7 +2349,8 @@ def test_progress_renderer_covers_repair_skip_plural_and_terminal_failure(
         "[REPAIR 1/2] Changed module.py\n"
         "[VERIFY] 2 changed files\n"
         "[FAILED] VERIFY: unexpected changed paths before DONE: unrelated.py; "
-        "repair attempts 1/2; workspace preserved for manual recovery\n"
+        "validation repair attempts 1/2; "
+        "workspace preserved for manual recovery\n"
     )
 
 
@@ -2459,7 +2460,7 @@ def test_terminal_failure_progress_is_not_duplicated_by_cli_error(
 
     assert capsys.readouterr().out == (
         "[FAILED] VALIDATE: unexpected changed paths after run_ruff_format: "
-        "unrelated.py; repair attempts 1/2; "
+        "unrelated.py; validation repair attempts 1/2; "
         "workspace preserved for manual recovery\n"
     )
 
@@ -2803,7 +2804,7 @@ def test_scripted_cli_unexpected_formatter_path_fails_without_done(
     lines = capsys.readouterr().out.splitlines()
     assert lines[-1] == (
         "[FAILED] VALIDATE: unexpected changed paths after run_ruff_format: "
-        "unexpected.txt; repair attempts 0/2; "
+        "unexpected.txt; validation repair attempts 0/2; "
         "workspace preserved for manual recovery"
     )
     assert "[DONE] Task completed successfully" not in lines

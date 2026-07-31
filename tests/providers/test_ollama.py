@@ -164,7 +164,10 @@ def test_malformed_tool_call_error_is_retried_once_with_fresh_user_guidance(
         tools=(calculator,),
     )
 
-    assert provider.complete(request) == ChatResponse(text="Recovered response.")
+    assert provider.complete(request) == ChatResponse(
+        text="Recovered response.",
+        response_repair_attempt_count=1,
+    )
     assert len(calls) == 2
     assert calls[0]["messages"] == [
         {

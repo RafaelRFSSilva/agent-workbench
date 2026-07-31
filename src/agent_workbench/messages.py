@@ -27,6 +27,19 @@ class ChatResponse:
 
     text: str = ""
     tool_invocations: tuple[ToolInvocation, ...] = ()
+    response_repair_attempt_count: int = 0
+
+    def __post_init__(self) -> None:
+        """Validate provider-reported response-repair accounting."""
+
+        if (
+            isinstance(self.response_repair_attempt_count, bool)
+            or not isinstance(self.response_repair_attempt_count, int)
+            or self.response_repair_attempt_count < 0
+        ):
+            raise ConfigurationError(
+                "response repair attempt count must be a non-negative integer."
+            )
 
 
 @dataclass(frozen=True, slots=True)

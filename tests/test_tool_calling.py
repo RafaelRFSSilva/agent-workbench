@@ -95,12 +95,14 @@ def create_read_file_definition() -> ToolDefinition:
 def create_tool_response(
     *invocations: ToolInvocation,
     text: str = "",
+    response_repair_attempt_count: int = 0,
 ) -> ChatResponse:
     """Create a provider response that requests one or more tools."""
 
     return ChatResponse(
         text=text,
         tool_invocations=invocations,
+        response_repair_attempt_count=response_repair_attempt_count,
     )
 
 
@@ -529,6 +531,122 @@ def test_recovers_one_repeated_inspection_batch_without_reexecuting_it() -> None
     assert continued_request.system_prompt == request.system_prompt
     assert continued_request.tools is request.tools
     assert continued_request.tool_interactions == tuple(observed_rounds)
+
+
+def test_executes_one_repeated_inspection_before_duplicate_recovery() -> None:
+    """Return one fresh repeated inspection result before requiring progress."""
+
+    executions: list[dict[str, object]] = []
+    observed_rounds: list[ToolInteractionRound] = []
+    read_file = create_read_file_definition()
+    calculator = create_calculator_definition()
+    registry = ToolRegistry()
+    registry.register(
+        read_file,
+        lambda arguments: executions.append(arguments) or {"content": "value"},
+    )
+    registry.register(calculator, lambda arguments: {"value": 4})
+    first_response = create_tool_response(
+        ToolInvocation(
+            id="first",
+            tool_name="read_file",
+            arguments={"path": "module.py"},
+        )
+    )
+    repeated_response = create_tool_response(
+        ToolInvocation(
+            id="repeated-after-response-repair",
+            tool_name="read_file",
+            arguments={"path": "module.py"},
+        ),
+        response_repair_attempt_count=1,
+    )
+    calculator_response = create_tool_response(
+        ToolInvocation(
+            id="calculate",
+            tool_name="calculator",
+            arguments={"expression": "2 + 2"},
+        )
+    )
+    final_response = ChatResponse(text="Completed.")
+    provider = FakeProvider(
+        [
+            first_response,
+            repeated_response,
+            calculator_response,
+            final_response,
+        ]
+    )
+    request = ChatRequest(messages=[], tools=(read_file, calculator))
+
+    result = run_tool_calling_loop(
+        provider,
+        request,
+        registry,
+        max_tool_rounds=3,
+        tool_round_observer=observed_rounds.append,
+    )
+
+    assert result is final_response
+    assert executions == [{"path": "module.py"}, {"path": "module.py"}]
+    assert tuple(round_.response for round_ in observed_rounds) == (
+        first_response,
+        repeated_response,
+        calculator_response,
+    )
+    assert provider.requests[2].tools is request.tools
+    assert provider.requests[2].tool_interactions == tuple(observed_rounds[:2])
+
+
+def test_repaired_repeated_inspections_stop_at_tool_round_limit() -> None:
+    """Count repaired repeated inspections and stop at the execution-round limit."""
+
+    executions: list[dict[str, object]] = []
+    observed_rounds: list[ToolInteractionRound] = []
+    read_file = create_read_file_definition()
+    registry = ToolRegistry()
+    registry.register(
+        read_file,
+        lambda arguments: executions.append(arguments) or {"content": "value"},
+    )
+
+    def repeated_response(identifier: str, *, repaired: bool) -> ChatResponse:
+        return create_tool_response(
+            ToolInvocation(
+                id=identifier,
+                tool_name="read_file",
+                arguments={"path": "module.py"},
+            ),
+            response_repair_attempt_count=int(repaired),
+        )
+
+    provider = FakeProvider(
+        [
+            repeated_response("first", repaired=False),
+            repeated_response("second", repaired=True),
+            repeated_response("third", repaired=True),
+        ]
+    )
+
+    with pytest.raises(
+        CompletionError,
+        match="maximum number of tool execution rounds was exceeded",
+    ):
+        run_tool_calling_loop(
+            provider,
+            ChatRequest(messages=[], tools=(read_file,)),
+            registry,
+            max_tool_rounds=2,
+            tool_round_observer=observed_rounds.append,
+        )
+
+    assert executions == [{"path": "module.py"}, {"path": "module.py"}]
+    assert len(observed_rounds) == 2
+    assert (
+        sum(round_.response.response_repair_attempt_count for round_ in observed_rounds)
+        == 1
+    )
+    assert all(request.tools == (read_file,) for request in provider.requests)
 
 
 def test_repeated_inspection_recovery_withholds_every_inspection_definition() -> None:
