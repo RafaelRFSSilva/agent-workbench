@@ -1,5 +1,6 @@
 """Provider-independent tool-calling execution loop."""
 
+import json
 from collections.abc import Callable
 from dataclasses import replace
 
@@ -11,6 +12,7 @@ from agent_workbench.tools import (
     ToolApprovalDecision,
     ToolApprovalHandler,
     ToolDefinition,
+    ToolInvocation,
     ToolResult,
 )
 
@@ -18,7 +20,6 @@ type ToolRoundObserver = Callable[[ToolInteractionRound], None]
 
 MAX_TOOL_INVOCATIONS_PER_RESPONSE = 8
 _MAX_TOOL_BATCH_RECOVERIES = 1
-_MAX_REPEATED_TOOL_BATCH_RECOVERIES = 1
 _MAX_WITHHELD_INSPECTION_RECOVERIES = 1
 _MAX_CONSECUTIVE_INSPECTION_ROUNDS = 16
 _REPEATED_INSPECTION_TOOL_NAMES = frozenset(
@@ -50,12 +51,10 @@ _WITHHELD_INSPECTION_RECOVERY_INSTRUCTION = (
     "Use the inspection information already returned to perform an available "
     "non-inspection operation, or respond normally if no operation is needed."
 )
-_REPEATED_TOOL_BATCH_RECOVERY_INSTRUCTION = (
-    "The previous response repeated the same read-only inspection tool-call batch "
-    "as the immediately preceding completed round. Choose a different next "
-    "operation based on the returned tool result, or respond normally if no "
-    "additional tool call is needed. Do not immediately repeat an identical "
-    "inspection tool name and arguments."
+_DUPLICATE_INSPECTION_ERROR = (
+    "Duplicate inspection rejected: the same read-only invocation already "
+    "completed successfully. Use the existing result, choose a different "
+    "inspection, or produce the next controlled edit."
 )
 
 
@@ -78,36 +77,114 @@ def _requires_tool_batch_recovery(response: ChatResponse) -> bool:
     return False
 
 
-def _repeats_previous_inspection_batch(
+def _inspection_signature(invocation: ToolInvocation) -> tuple[str, str]:
+    """Return one deterministic read-only invocation signature."""
+
+    return (
+        invocation.tool_name,
+        json.dumps(
+            invocation.arguments,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+    )
+
+
+def _completed_inspection_signatures(
+    completed_rounds: tuple[ToolInteractionRound, ...],
+) -> frozenset[tuple[str, str]]:
+    """Return successful inspection signatures since non-inspection progress."""
+
+    signatures: set[tuple[str, str]] = set()
+
+    for round_ in reversed(completed_rounds):
+        if any(
+            invocation.tool_name not in _REPEATED_INSPECTION_TOOL_NAMES
+            for invocation in round_.response.tool_invocations
+        ):
+            break
+
+        for invocation, result in zip(
+            round_.response.tool_invocations,
+            round_.results,
+            strict=True,
+        ):
+            if result.status == "success":
+                signatures.add(_inspection_signature(invocation))
+
+    return frozenset(signatures)
+
+
+def _matching_completed_inspection_ids(
     response: ChatResponse,
     completed_rounds: tuple[ToolInteractionRound, ...],
-) -> bool:
-    """Return whether a response repeats the previous read-only inspection batch."""
+) -> frozenset[str]:
+    """Return inspections matching successful signatures since progress."""
 
-    if not response.tool_invocations or not completed_rounds:
-        return False
+    completed_signatures = _completed_inspection_signatures(completed_rounds)
 
-    if any(
-        invocation.tool_name not in _REPEATED_INSPECTION_TOOL_NAMES
+    return frozenset(
+        invocation.id
         for invocation in response.tool_invocations
-    ):
-        return False
+        if invocation.tool_name in _REPEATED_INSPECTION_TOOL_NAMES
+        and _inspection_signature(invocation) in completed_signatures
+    )
 
-    previous_round = completed_rounds[-1]
 
-    if any(result.status != "success" for result in previous_round.results):
-        return False
+def _duplicate_inspection_ids(
+    response: ChatResponse,
+    completed_rounds: tuple[ToolInteractionRound, ...],
+) -> frozenset[str]:
+    """Return matching inspections that should be rejected this round."""
 
-    previous_invocations = previous_round.response.tool_invocations
+    if response.response_repair_attempt_count > 0:
+        return frozenset()
 
-    return len(response.tool_invocations) == len(previous_invocations) and all(
-        current.tool_name == previous.tool_name
-        and current.arguments == previous.arguments
-        for current, previous in zip(
-            response.tool_invocations,
-            previous_invocations,
-            strict=True,
-        )
+    return _matching_completed_inspection_ids(response, completed_rounds)
+
+
+def _inspection_failure_diagnostics(
+    response: ChatResponse,
+    request: ChatRequest,
+    *,
+    allowed_tool_names: frozenset[str] | None,
+    executed_rounds: int,
+    max_tool_rounds: int,
+    duplicate_count: int,
+    inspection_streak_count: int,
+) -> str:
+    """Return sanitized lifecycle fields for one repeated-inspection failure."""
+
+    invocation = next(
+        invocation
+        for invocation in response.tool_invocations
+        if invocation.tool_name in _REPEATED_INSPECTION_TOOL_NAMES
+    )
+    requested_inspection_names = frozenset(
+        invocation.tool_name
+        for invocation in response.tool_invocations
+        if invocation.tool_name in _REPEATED_INSPECTION_TOOL_NAMES
+    )
+    permitted_inspection_names = frozenset(
+        definition.name
+        for definition in request.tools
+        if definition.name in _REPEATED_INSPECTION_TOOL_NAMES
+        and (allowed_tool_names is None or definition.name in allowed_tool_names)
+    )
+    alternatives_available = bool(
+        permitted_inspection_names - requested_inspection_names
+    )
+
+    return (
+        f"requested_inspection={invocation.tool_name}; "
+        f"tool_round_count={executed_rounds}/{max_tool_rounds}; "
+        f"duplicate_count={duplicate_count}; "
+        f"inspection_streak_count={inspection_streak_count}; "
+        "response_repair_attempt_count="
+        f"{response.response_repair_attempt_count}; "
+        "alternative_inspection_tools_available="
+        f"{str(alternatives_available).lower()}"
     )
 
 
@@ -205,16 +282,18 @@ def run_tool_calling_loop(
     current_request = request
     executed_rounds = 0
     tool_batch_recoveries = 0
-    repeated_tool_batch_recoveries = 0
+    duplicate_inspection_rejections = 0
     withheld_inspection_recoveries = 0
     consecutive_inspection_rounds = _count_trailing_successful_inspection_rounds(
         completed_rounds
     )
+    withheld_inspection_streak_count = 0
     inspection_tools_withheld = (
         consecutive_inspection_rounds >= _MAX_CONSECUTIVE_INSPECTION_ROUNDS
     )
 
     if inspection_tools_withheld:
+        withheld_inspection_streak_count = consecutive_inspection_rounds
         withheld_inspection_recoveries = 0
         current_request = _add_temporary_recovery_instruction(
             request,
@@ -231,20 +310,21 @@ def run_tool_calling_loop(
             invocation.tool_name in _REPEATED_INSPECTION_TOOL_NAMES
             for invocation in response.tool_invocations
         ):
-            if (
-                _repeats_previous_inspection_batch(response, completed_rounds)
-                and repeated_tool_batch_recoveries
-                >= _MAX_REPEATED_TOOL_BATCH_RECOVERIES
-            ):
-                raise CompletionError(
-                    "The provider repeatedly requested the same read-only "
-                    "inspection tool-call batch."
-                )
-
             if withheld_inspection_recoveries >= _MAX_WITHHELD_INSPECTION_RECOVERIES:
                 raise CompletionError(
                     "The provider repeatedly requested a read-only inspection "
-                    "tool while inspection tools were withheld during recovery."
+                    "tool while inspection tools were withheld during recovery; "
+                    + _inspection_failure_diagnostics(
+                        response,
+                        current_request,
+                        allowed_tool_names=allowed_tool_names,
+                        executed_rounds=executed_rounds,
+                        max_tool_rounds=max_tool_rounds,
+                        duplicate_count=len(
+                            _duplicate_inspection_ids(response, completed_rounds)
+                        ),
+                        inspection_streak_count=withheld_inspection_streak_count,
+                    )
                 )
 
             withheld_inspection_recoveries += 1
@@ -271,31 +351,35 @@ def run_tool_calling_loop(
             )
             continue
 
-        if (
-            response.response_repair_attempt_count == 0
-            and _repeats_previous_inspection_batch(response, completed_rounds)
-        ):
-            if repeated_tool_batch_recoveries >= _MAX_REPEATED_TOOL_BATCH_RECOVERIES:
-                raise CompletionError(
-                    "The provider repeatedly requested the same read-only inspection "
-                    "tool-call batch."
-                )
-
-            repeated_tool_batch_recoveries += 1
-            withheld_inspection_recoveries = 0
-            inspection_tools_withheld = True
-            current_request = _add_temporary_recovery_instruction(
-                request,
-                completed_rounds,
-                _REPEATED_TOOL_BATCH_RECOVERY_INSTRUCTION,
-                withhold_inspection_tools=True,
-            )
-            continue
-
         if not response.tool_invocations:
             return response
 
+        duplicate_inspection_ids = _duplicate_inspection_ids(
+            response,
+            completed_rounds,
+        )
+        matching_inspection_ids = _matching_completed_inspection_ids(
+            response,
+            completed_rounds,
+        )
+
         if executed_rounds >= max_tool_rounds:
+            if matching_inspection_ids:
+                raise CompletionError(
+                    "The maximum number of tool execution rounds was exceeded. "
+                    + _inspection_failure_diagnostics(
+                        response,
+                        current_request,
+                        allowed_tool_names=allowed_tool_names,
+                        executed_rounds=executed_rounds,
+                        max_tool_rounds=max_tool_rounds,
+                        duplicate_count=(
+                            duplicate_inspection_rejections
+                            + len(matching_inspection_ids)
+                        ),
+                        inspection_streak_count=consecutive_inspection_rounds,
+                    )
+                )
             raise CompletionError(
                 "The maximum number of tool execution rounds was exceeded."
             )
@@ -369,21 +453,30 @@ def run_tool_calling_loop(
 
         results = tuple(
             (
-                registry.execute(invocation)
-                if (
-                    allowed_tool_names is None
-                    or invocation.tool_name in allowed_tool_names
-                )
-                else ToolResult(
+                ToolResult(
                     invocation_id=invocation.id,
                     status="error",
-                    error=(
-                        f"Tool '{invocation.tool_name}' is not allowed for this send."
-                    ),
+                    error=_DUPLICATE_INSPECTION_ERROR,
+                )
+                if invocation.id in duplicate_inspection_ids
+                else (
+                    registry.execute(invocation)
+                    if (
+                        allowed_tool_names is None
+                        or invocation.tool_name in allowed_tool_names
+                    )
+                    else ToolResult(
+                        invocation_id=invocation.id,
+                        status="error",
+                        error=(
+                            f"Tool '{invocation.tool_name}' is not allowed for this send."
+                        ),
+                    )
                 )
             )
             for invocation in response.tool_invocations
         )
+        duplicate_inspection_rejections += len(duplicate_inspection_ids)
         completed_round = ToolInteractionRound(
             response=response,
             results=results,
@@ -402,6 +495,7 @@ def run_tool_calling_loop(
             consecutive_inspection_rounds = 0
 
         if consecutive_inspection_rounds >= _MAX_CONSECUTIVE_INSPECTION_ROUNDS:
+            withheld_inspection_streak_count = consecutive_inspection_rounds
             current_request = _add_temporary_recovery_instruction(
                 request,
                 completed_rounds,

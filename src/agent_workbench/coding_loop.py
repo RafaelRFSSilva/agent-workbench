@@ -639,7 +639,7 @@ def _run_discover_phase(
             recover_approval_preview_errors=True,
         )
     except CompletionError as exc:
-        if str(exc) != _MAXIMUM_ROUNDS_ERROR:
+        if not str(exc).startswith(_MAXIMUM_ROUNDS_ERROR):
             raise _workflow_failure(
                 state,
                 CodingPhase.DISCOVER,

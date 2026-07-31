@@ -406,6 +406,123 @@ def test_edit_executes_repeated_safe_read_then_applies_approved_change(
     assert run_git(repository, "status", "--short").stdout == " M module.py\n"
 
 
+def test_edit_rejects_ordinary_duplicate_then_allows_alternative_inspection(
+    tmp_path: Path,
+) -> None:
+    """Reach DONE after an ordinary duplicate result and a different inspection."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    original = "def add(left: int, right: int) -> int:\n    return left - right\n"
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            tool_response("initial-read", "read_file", {"path": "module.py"}),
+            tool_response("duplicate-read", "read_file", {"path": "module.py"}),
+            tool_response(
+                "alternative-search",
+                "search_text",
+                {"query": "assert add", "path": "test_module.py"},
+            ),
+            replacement_response(
+                "edit",
+                expected_content=original,
+                expected_text="return left - right",
+                replacement_text="return left + right",
+            ),
+            ChatResponse(text="Edit complete."),
+        ]
+    )
+    approval_names: list[str] = []
+
+    def record_approval(request) -> ToolApprovalDecision:
+        approval_names.append(request.invocation.tool_name)
+        return ToolApprovalDecision.APPROVE
+
+    result = run_autonomous_coding_task(
+        create_session(repository, provider),
+        "Correct the add implementation.",
+        tool_approval_handler=record_approval,
+    )
+
+    assert result.final_phase is CodingPhase.DONE
+    assert result.repair_attempt_count == 0
+    assert approval_names == [
+        "apply_text_replacement",
+        "run_ruff_format",
+        "run_ruff_check",
+        "run_pytest",
+    ]
+    duplicate_round = provider.requests[3].tool_interactions[1]
+    assert duplicate_round.results[0].status == "error"
+    assert duplicate_round.results[0].error is not None
+    assert "same read-only invocation already completed" in (
+        duplicate_round.results[0].error
+    )
+    alternative_round = provider.requests[4].tool_interactions[2]
+    assert alternative_round.response.tool_invocations[0].tool_name == "search_text"
+    assert alternative_round.results[0].status == "success"
+    available_after_duplicate = {
+        definition.name for definition in provider.requests[3].tools
+    }
+    assert {
+        "list_files",
+        "read_file",
+        "search_text",
+        "search_symbols",
+        "inspect_git_status",
+        "inspect_git_diff",
+    }.issubset(available_after_duplicate)
+    assert run_git(repository, "status", "--short").stdout == " M module.py\n"
+
+
+def test_edit_infinite_duplicate_stops_with_diagnostics_and_no_approval(
+    tmp_path: Path,
+) -> None:
+    """Bound ordinary duplicate repetition without changing the workspace."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            *(
+                tool_response(
+                    f"repeated-read-{index}",
+                    "read_file",
+                    {"path": "module.py"},
+                )
+                for index in range(4)
+            ),
+        ]
+    )
+    approval_names: list[str] = []
+
+    def record_approval(request) -> ToolApprovalDecision:
+        approval_names.append(request.invocation.tool_name)
+        return ToolApprovalDecision.APPROVE
+
+    with pytest.raises(
+        CompletionError,
+        match=(
+            r"phase EDIT: model-facing phase failed: The maximum number of tool "
+            r"execution rounds was exceeded.*"
+            r"requested_inspection=read_file.*"
+            r"tool_round_count=3/3.*"
+            r"duplicate_count=3.*"
+            r"inspection_streak_count=0.*"
+            r"response_repair_attempt_count=0.*"
+            r"alternative_inspection_tools_available=true"
+        ),
+    ):
+        run_autonomous_coding_task(
+            create_session(repository, provider, max_tool_rounds=3),
+            "Correct the add implementation.",
+            tool_approval_handler=record_approval,
+        )
+
+    assert approval_names == []
+    assert run_git(repository, "status", "--short").stdout == ""
+
+
 def test_formats_only_successful_approved_python_path_and_preserves_baseline_dirty(
     tmp_path: Path,
 ) -> None:
