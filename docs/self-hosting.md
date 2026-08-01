@@ -33,8 +33,41 @@ Observed end-to-end behavior for a bounded Python implementation task:
 15. Process exit status `0`.
 
 This evidence validates supervised isolated operation for small bounded tasks.
-It does not claim fully autonomous or production-ready operation for broad,
-multi-file, or high-risk changes.
+It does not claim fully autonomous or production-ready operation for larger,
+long-running, cross-language, architectural, dependency-changing, or high-risk
+changes.
+
+### Multi-file validation evidence
+
+A subsequent supervised run with Ollama `gpt-oss:20b` validated a bounded
+three-file Python task end-to-end:
+
+1. Approved creation of one isolated worktree and branch.
+2. Completed repository discovery.
+3. Encountered several malformed structured workspace-action calls; each was
+   rejected with schema or preview guidance.
+4. Continued after corrected actions were successfully applied.
+5. Modified exactly three approved files: one implementation module, one
+   package init, and one test file.
+6. Controller-owned Ruff formatting on each changed Python file.
+7. Controller-owned Ruff linting and pytest execution.
+8. All 15 target-project tests passed.
+9. Verified exactly three changed files.
+10. Explicit approval of one isolated local commit.
+11. One created isolated commit with exactly three modified files.
+12. Clean isolated worktree after commit.
+13. Unchanged primary workspace.
+14. Process exit status `0`.
+
+The task added a new typed public Python function, preserved the existing
+function and behavior, exported the new function through the package public API,
+extended the existing test file, and covered normal behavior, ascending and
+descending ranges, extrapolation, and the required error case.
+
+This validates supervised isolated operation for bounded multi-file Python tasks
+involving implementation, public package export, new tests, formatting, linting,
+and isolated commit creation. It does not claim fully autonomous or
+production-ready operation.
 
 ## Prerequisites
 
@@ -200,6 +233,23 @@ A controlled patch can be rejected when expected content no longer matches the
 current file state. Rejection is explicit and safe; the failed patch is not
 silently applied. The model may then propose another controlled action (for
 example, a whole-file rewrite) that still requires explicit approval.
+
+## Controlled-action argument recovery
+
+Malformed controlled-action arguments are rejected before execution. The
+workspace does not change, and the model is told to correct and resubmit.
+
+After a corrected controlled action is approved and successfully applies a real
+workspace mutation, later files in the same task receive a fresh consecutive
+argument-recovery allowance. This allows normal progress across multiple files
+without accumulating earlier-stage failures.
+
+- Malformed calls remain bounded; the global tool-round limit is always
+  enforced.
+- No-op or unapplied actions do not count as productive recovery and do not
+  reset the consecutive counter.
+- Approval-preview failures do not reset the consecutive recovery counter.
+- Every corrected mutation still requires explicit operator approval.
 
 ## Evidence checklist after an isolated run
 
@@ -415,8 +465,12 @@ cannot satisfy VERIFY and requires manual review.
 - Isolated commits are local only and are not pushed or merged automatically.
 - Failure-preserved worktrees require deliberate manual inspection and cleanup.
 - Output quality depends on the selected provider/model and task complexity.
-- The validated `gpt-oss:20b` smoke task was intentionally small.
-- Broader multi-file tasks still require additional end-to-end validation.
+- A bounded three-file Python task (implementation, public export, new tests,
+  formatting, linting, and isolated commit) has been validated end-to-end.
+- Larger, longer-running, cross-language, dependency-changing, architectural,
+  and high-risk tasks still require additional validation.
+- Provider/model quality and tool-call reliability affect execution on all task
+  sizes.
 
 ## Tasks suitable for `gpt-oss:20b`
 
