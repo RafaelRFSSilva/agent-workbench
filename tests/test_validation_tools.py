@@ -242,6 +242,7 @@ def test_minimal_environment_is_offline_and_excludes_parent_secrets(
     monkeypatch.setenv("OPENAI_API_KEY", "secret")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secret")
     monkeypatch.setenv("ARBITRARY_PARENT_VALUE", "secret")
+    monkeypatch.setenv("PYTHONPATH", "/tmp/host/path")
 
     environment = _minimal_environment()
 
@@ -258,6 +259,178 @@ def test_minimal_environment_is_offline_and_excludes_parent_secrets(
     }
     assert "OPENAI_API_KEY" not in environment
     assert "AWS_SECRET_ACCESS_KEY" not in environment
+    assert "PYTHONPATH" not in environment
+
+
+def test_pytest_uses_workspace_src_for_import_resolution(tmp_path: Path) -> None:
+    """Resolve pytest imports from workspace src when that directory exists."""
+
+    root, workspace = create_workspace(tmp_path)
+    package_root = root / "src" / "example_package"
+    package_root.mkdir(parents=True)
+    (package_root / "__init__.py").write_text(
+        "def marker() -> str:\n    return 'workspace-src'\n",
+        encoding="utf-8",
+    )
+    tests_root = root / "tests"
+    tests_root.mkdir()
+    (tests_root / "test_example.py").write_text(
+        "from example_package import marker\n\n"
+        "def test_import_from_workspace_src() -> None:\n"
+        "    assert marker() == 'workspace-src'\n",
+        encoding="utf-8",
+    )
+
+    result = run_validation(workspace, "run_pytest", {"path": "."})
+
+    assert result["exit_code"] == 0
+    assert "1 passed" in result["stdout"]
+
+
+def test_pytest_receives_contained_workspace_src_pythonpath_only(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Add PYTHONPATH only for pytest and do not expose it in public output."""
+
+    root, workspace = create_workspace(tmp_path)
+    (root / "src").mkdir()
+    captured_environment: dict[str, str] = {}
+
+    def fake_run_process(command, cwd, environment, timeout):
+        captured_environment.clear()
+        captured_environment.update(environment)
+        return 0, b"ok\n", b"", False, False, 1
+
+    monkeypatch.setattr(
+        "agent_workbench.validation_tools._run_process",
+        fake_run_process,
+    )
+
+    result = run_validation(workspace, "run_pytest", {"path": "."})
+
+    assert captured_environment["PYTHONPATH"] == str((root / "src").resolve())
+    assert "PYTHONPATH" not in result
+    assert str((root / "src").resolve()) not in str(result)
+
+
+def test_ruff_does_not_receive_workspace_src_pythonpath(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Keep Ruff tools on the minimal environment without PYTHONPATH."""
+
+    root, workspace = create_workspace(tmp_path)
+    (root / "src").mkdir()
+    target = root / "module.py"
+    target.write_text("value = 1\n", encoding="utf-8")
+    captured_environment: dict[str, str] = {}
+
+    def fake_run_process(command, cwd, environment, timeout):
+        captured_environment.clear()
+        captured_environment.update(environment)
+        return 0, b"", b"", False, False, 1
+
+    monkeypatch.setattr(
+        "agent_workbench.validation_tools._run_process",
+        fake_run_process,
+    )
+
+    run_validation(workspace, "run_ruff_check", {"path": "module.py"})
+
+    assert "PYTHONPATH" not in captured_environment
+
+
+def test_pytest_without_src_layout_still_runs_successfully(tmp_path: Path) -> None:
+    """Continue supporting workspaces that do not use a src layout."""
+
+    root, workspace = create_workspace(tmp_path)
+    (root / "helper_module.py").write_text(
+        "def ready() -> bool:\n    return True\n",
+        encoding="utf-8",
+    )
+    (root / "test_no_src_layout.py").write_text(
+        "from helper_module import ready\n\n"
+        "def test_no_src_layout() -> None:\n"
+        "    assert ready()\n",
+        encoding="utf-8",
+    )
+
+    result = run_validation(workspace, "run_pytest", {"path": "."})
+
+    assert result["exit_code"] == 0
+    assert "1 passed" in result["stdout"]
+
+
+def test_external_src_symlink_is_rejected_before_pytest_execution(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Reject an external src symlink through the existing Workspace boundary."""
+
+    root, workspace = create_workspace(tmp_path)
+    external_src = tmp_path / "external-src"
+    external_src.mkdir()
+    (external_src / "example_package").mkdir()
+    (external_src / "example_package" / "__init__.py").write_text(
+        "value = 'outside'\n",
+        encoding="utf-8",
+    )
+    (root / "src").symlink_to(external_src, target_is_directory=True)
+    run_process = Mock(side_effect=AssertionError("must not execute pytest"))
+    monkeypatch.setattr("agent_workbench.validation_tools._run_process", run_process)
+
+    with pytest.raises(WorkspacePathError, match="outside"):
+        run_validation(workspace, "run_pytest", {"path": "."})
+
+    run_process.assert_not_called()
+
+
+def test_external_src_file_symlink_is_rejected_before_pytest_execution(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Reject a present src symlink to an external non-directory target."""
+
+    root, workspace = create_workspace(tmp_path)
+    external_file = tmp_path / "external-src-file"
+    external_file.write_text("outside\n", encoding="utf-8")
+    (root / "src").symlink_to(external_file)
+    run_process = Mock(side_effect=AssertionError("must not execute pytest"))
+    monkeypatch.setattr("agent_workbench.validation_tools._run_process", run_process)
+
+    with pytest.raises(WorkspacePathError, match="outside"):
+        run_validation(workspace, "run_pytest", {"path": "."})
+
+    run_process.assert_not_called()
+
+
+def test_internal_src_directory_symlink_sets_canonical_pythonpath(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Allow contained src symlinks and use canonical contained target path."""
+
+    root, workspace = create_workspace(tmp_path)
+    internal_src = root / "internal-src"
+    internal_src.mkdir()
+    (root / "src").symlink_to(internal_src, target_is_directory=True)
+    captured_environment: dict[str, str] = {}
+
+    def fake_run_process(command, cwd, environment, timeout):
+        captured_environment.clear()
+        captured_environment.update(environment)
+        return 0, b"ok\n", b"", False, False, 1
+
+    monkeypatch.setattr(
+        "agent_workbench.validation_tools._run_process",
+        fake_run_process,
+    )
+
+    result = run_validation(workspace, "run_pytest", {"path": "."})
+
+    assert result["exit_code"] == 0
+    assert captured_environment["PYTHONPATH"] == str(internal_src.resolve())
 
 
 def test_real_ruff_format_and_check_are_fixed_and_scoped(tmp_path: Path) -> None:
