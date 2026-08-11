@@ -41,6 +41,7 @@ def test_task_spec_without_task_id_defaults_to_none() -> None:
 def test_task_spec_with_valid_task_id() -> None:
     tid = TaskId("id")
     spec = TaskSpec(objective="obj", acceptance_criteria=["c1"], task_id=tid)
+    assert spec.task_id is tid
     assert spec.task_id == tid
 
 
@@ -48,6 +49,26 @@ def test_task_spec_rejects_invalid_task_id() -> None:
     for invalid in [123, "id"]:
         with pytest.raises(ConfigurationError):
             TaskSpec(objective="obj", acceptance_criteria=["c1"], task_id=invalid)  # type: ignore[arg-type]
+
+
+def test_task_spec_equality_and_hashability_with_distinct_equal_task_ids() -> None:
+    task_id_a = TaskId("task-1")
+    task_id_b = TaskId("task-1")
+
+    spec_a = TaskSpec(
+        objective="obj",
+        acceptance_criteria=["c1", "c2"],
+        task_id=task_id_a,
+    )
+    spec_b = TaskSpec(
+        objective="obj",
+        acceptance_criteria=["c1", "c2"],
+        task_id=task_id_b,
+    )
+
+    assert task_id_a is not task_id_b
+    assert spec_a == spec_b
+    assert hash(spec_a) == hash(spec_b)
 
 
 # Existing tests below remain unchanged.
