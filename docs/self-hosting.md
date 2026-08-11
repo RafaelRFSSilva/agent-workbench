@@ -1,8 +1,9 @@
 # Self-Hosting Agent Workbench Development
 
 This playbook documents the current supervised local-model workflow validated
-with Ollama `gpt-oss:20b` on a bounded Python smoke task. The model may inspect
-and request controlled edits. The application controller, rather than the
+with Ollama `gpt-oss:20b` on bounded Python smoke tasks and on a real Agent
+Workbench feature implemented by Agent Workbench on its own repository. The
+model may inspect and request controlled edits. The application controller, rather than the
 model, formats only approved changed Python paths, runs project-wide Ruff check
 and pytest, and inspects Git status and diff in fixed phases. Worktree creation,
 controlled actions, executable validation, and isolated commit creation remain
@@ -68,6 +69,93 @@ This validates supervised isolated operation for bounded multi-file Python tasks
 involving implementation, public package export, new tests, formatting, linting,
 and isolated commit creation. It does not claim fully autonomous or
 production-ready operation.
+
+### Real Agent Workbench self-hosting evidence
+
+A subsequent supervised run used Agent Workbench to implement a real roadmap
+change on the Agent Workbench repository itself, from source main `b2498b7`
+using Ollama `gpt-oss:20b`.
+
+**Task:** Add provider-independent task identifiers to Agent Workbench itself.
+
+**Isolated branch:** `agent/add-task-identifiers-self-hosted-v3`
+
+Feature implementation produced by the model:
+
+- Added an immutable `TaskId` type.
+- Added optional `TaskSpec.task_id` metadata.
+- Updated tests.
+- Updated task-specification documentation.
+
+Controller-owned validation during the run:
+
+- Ruff format passed.
+- Ruff check passed.
+- Complete pytest suite passed with 1345 tests.
+- Final verification found exactly three changed files:
+  - `docs/task-specifications.md`
+  - `src/agent_workbench/tasks.py`
+  - `tests/test_tasks.py`
+
+The model-produced isolated commit was approved and created:
+
+    be33ccf feat: add task identifiers
+
+Final self-hosting state:
+
+- workflow exit status `0`;
+- isolated local commit created after explicit approval;
+- isolated worktree clean after commit;
+- primary main workspace unchanged;
+- worktree and local branch preserved for external review;
+- no automatic push or merge occurred.
+
+**External review:** External review found small acceptance-coverage and
+documentation-quality issues but did not rewrite or amend the original
+self-hosted commit. The review was deliberately recorded as a separate commit:
+
+    105f678 fix: complete task identifier acceptance coverage
+
+The review:
+
+- added explicit exact-object preservation coverage;
+- added `TaskSpec` equality and hash coverage for equivalent `TaskId` values;
+- restored pre-existing documentation accidentally removed by the model;
+- removed documentation formatting churn.
+
+After review, the complete suite passed with 1346 tests. The feature was later
+merged to main through PR #68.
+
+**Historical significance:** This run provides stronger evidence than the
+earlier smoke tests:
+
+- the target repository was Agent Workbench itself;
+- the task was a real roadmap change rather than a disposable smoke fixture;
+- the workflow performed discovery, controlled edits, controller-owned
+  validation, final verification, and isolated commit creation end-to-end;
+- the primary source workspace remained unchanged throughout.
+
+Supervised external review remains required. Not every model edit was perfect;
+the review commit demonstrates that.
+
+**Immediate history leading to this run:**
+
+1. An earlier `TaskId` self-hosting attempt failed after bounded
+   controlled-action argument recovery was exhausted.
+2. A later retry produced valid `TaskId` code and tests but pytest falsely
+   imported Agent Workbench from the primary repository's editable environment
+   instead of the isolated worktree.
+3. That failure exposed an isolated-validation import-leakage defect.
+4. PR #67 fixed pytest import resolution so workspace-local `src` code takes
+   precedence during isolated validation.
+5. The clean third `TaskId` run completed successfully and produced `be33ccf`.
+
+This evidence supports only the following bounded claim: Agent Workbench has
+completed one real supervised self-hosting feature on its own repository through
+isolated discovery, controlled editing, controller-owned validation, final
+verification, and approved local commit creation. It does not claim fully
+autonomous or production-ready operation, eliminate the existing explicit approval requirements, or prove that arbitrary repositories, languages, dependency
+changes, or high-risk changes are safe.
 
 ## Prerequisites
 
