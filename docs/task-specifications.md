@@ -14,12 +14,25 @@ OpenAI, Anthropic, provider request formats, workspace tools, or the CLI.
 
 ```text
 TaskSpec
-├── objective
-└── acceptance_criteria
+├─ objective
+├─ acceptance_criteria
+└─ task_id
 ```
 
 - `objective` is the exact non-blank string supplied by the caller.
 - `acceptance_criteria` is an ordered immutable tuple of non-blank strings.
+- `task_id` is an optional `TaskId` instance or `None`. It preserves the
+  original string value and enforces that it is a non-blank string.
+
+### TaskId
+
+```text
+TaskId
+└─ value
+```
+
+- `value` is the exact string supplied by the caller. Leading or trailing
+  whitespace is preserved.
 
 The model is frozen, slotted, value-comparable, and hashable.
 
@@ -27,21 +40,22 @@ The model is frozen, slotted, value-comparable, and hashable.
 
 A valid task specification requires:
 
-- An objective that is a string.
-- At least one non-whitespace character in the objective.
-- An iterable of acceptance criteria.
+- An objective that is a string with at least one non-whitespace character.
+- An iterable of acceptance criteria, each a string with at least one
+  non-whitespace character.
 - At least one acceptance criterion.
-- Every criterion to be a string.
-- At least one non-whitespace character in every criterion.
+- A `task_id` that is either `None` or an instance of `TaskId`. If provided,
+  the underlying value must be a non-blank string.
 
 A bare string is rejected as the acceptance-criteria collection because it
 would otherwise be interpreted as an iterable of individual characters.
 
-Invalid values raise `ConfigurationError`.
+Invalid values raise `ConfigurationError` with messages matching the
+specification above.
 
 ## Preservation Semantics
 
-Valid text is preserved exactly.
+Valid text is preserved exactly, including any leading or trailing whitespace.
 
 Agent Workbench does not:
 
@@ -50,9 +64,11 @@ Agent Workbench does not:
 - Reorder acceptance criteria.
 - Deduplicate criteria.
 - Normalise capitalisation or punctuation.
+- Alter the `task_id` value once set.
 
-The acceptance-criteria iterable is converted to a tuple during construction.
-Later mutation of an original list therefore cannot change the stored task.
+The acceptance-criteria iterable is converted to a tuple during construction,
+and the optional `task_id` is stored as an immutable object. Later mutation of
+an original list therefore cannot change the stored task.
 
 ## AgentSession Integration
 
@@ -165,7 +181,6 @@ implementation.
 
 Possible future additions include:
 
-- Task identifiers.
 - Task lifecycle states.
 - Dependencies.
 - Manual task assignment.
@@ -178,8 +193,9 @@ Possible future additions include:
 - Terminal and VS Code task interfaces.
 - Multi-agent orchestration traces.
 
-These should remain provider-independent and must not bypass workspace,
-permission, approval, or isolation boundaries.
+Task identifiers are now part of the current data model; they no longer appear
+in this list. All future extensions must remain provider-independent and
+must not bypass workspace, permission, approval, or isolation boundaries.
 
 ## Related Documentation
 

@@ -1,7 +1,77 @@
 import dataclasses
 import pytest
 from agent_workbench.errors import ConfigurationError
-from agent_workbench.tasks import TaskSpec
+from agent_workbench.tasks import TaskSpec, TaskId
+
+
+def test_task_id_value_preservation() -> None:
+    tid = TaskId("  id123  ")
+    assert tid.value == "  id123  "
+
+
+def test_task_id_equality_and_hashability() -> None:
+    a = TaskId("id")
+    b = TaskId("id")
+    c = TaskId("other")
+    assert a == b
+    assert hash(a) == hash(b)
+    s = {a, b, c}
+    assert len(s) == 2
+
+
+def test_task_id_frozen_and_slotted() -> None:
+    tid = TaskId("id")
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        # type: ignore[assignment]
+        tid.value = "new"
+    assert not hasattr(tid, "__dict__")
+
+
+def test_task_id_rejection_of_invalid_values() -> None:
+    for invalid in ["", "   ", 123, None]:
+        with pytest.raises(ConfigurationError):
+            TaskId(invalid)  # type: ignore[arg-type]
+
+
+def test_task_spec_without_task_id_defaults_to_none() -> None:
+    spec = TaskSpec(objective="obj", acceptance_criteria=["c1"])
+    assert spec.task_id is None
+
+
+def test_task_spec_with_valid_task_id() -> None:
+    tid = TaskId("id")
+    spec = TaskSpec(objective="obj", acceptance_criteria=["c1"], task_id=tid)
+    assert spec.task_id is tid
+    assert spec.task_id == tid
+
+
+def test_task_spec_rejects_invalid_task_id() -> None:
+    for invalid in [123, "id"]:
+        with pytest.raises(ConfigurationError):
+            TaskSpec(objective="obj", acceptance_criteria=["c1"], task_id=invalid)  # type: ignore[arg-type]
+
+
+def test_task_spec_equality_and_hashability_with_distinct_equal_task_ids() -> None:
+    task_id_a = TaskId("task-1")
+    task_id_b = TaskId("task-1")
+
+    spec_a = TaskSpec(
+        objective="obj",
+        acceptance_criteria=["c1", "c2"],
+        task_id=task_id_a,
+    )
+    spec_b = TaskSpec(
+        objective="obj",
+        acceptance_criteria=["c1", "c2"],
+        task_id=task_id_b,
+    )
+
+    assert task_id_a is not task_id_b
+    assert spec_a == spec_b
+    assert hash(spec_a) == hash(spec_b)
+
+
+# Existing tests below remain unchanged.
 
 
 def test_preserves_valid_text() -> None:

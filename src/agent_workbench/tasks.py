@@ -4,12 +4,28 @@ from dataclasses import dataclass
 from agent_workbench.errors import ConfigurationError
 
 
+@dataclass(frozen=True, slots=True)
+class TaskId:
+    value: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.value, str) or not self.value.strip():
+            raise ConfigurationError("task id must be a non-blank string.")
+
+
 @dataclass(frozen=True, slots=True, init=False)
 class TaskSpec:
     objective: str
     acceptance_criteria: tuple[str, ...]
+    task_id: "TaskId | None"
 
-    def __init__(self, objective: str, acceptance_criteria: Iterable[str]) -> None:
+    def __init__(
+        self,
+        objective: str,
+        acceptance_criteria: Iterable[str],
+        *,
+        task_id: "TaskId | None" = None,
+    ) -> None:
         if not isinstance(objective, str) or not objective.strip():
             raise ConfigurationError("objective must be a non-empty string")
         if isinstance(acceptance_criteria, str):
@@ -25,5 +41,10 @@ class TaskSpec:
         for c in criteria:
             if not isinstance(c, str) or not c.strip():
                 raise ConfigurationError(f"criterion '{c}' must be a non-empty string")
+
+        if task_id is not None and not isinstance(task_id, TaskId):
+            raise ConfigurationError("task id must be a TaskId or None.")
+
         object.__setattr__(self, "objective", objective)
         object.__setattr__(self, "acceptance_criteria", criteria)
+        object.__setattr__(self, "task_id", task_id)
