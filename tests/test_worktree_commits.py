@@ -710,6 +710,241 @@ def test_commit_requires_one_explicit_approval_before_staging(
     assert run_git(worktree, "rev-parse", "HEAD").stdout.strip() == old_head
 
 
+def test_pre_mutation_handler_runs_once_after_approval_and_revalidation_before_add(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Invoke the optional pre-mutation hook exactly once at the last safe point."""
+
+    _, handle = create_isolated_worktree(tmp_path)
+    worktree = handle.worktree_path
+    (worktree / "tracked.txt").write_text("changed\n", encoding="utf-8")
+    plan = plan_isolated_commit(handle, "fix: hook ordering")
+    module = pytest.importorskip("agent_workbench.worktree_commits")
+    original_plan_isolated_commit = module.plan_isolated_commit
+    original_run_git = module._run_git
+    events: list[str] = []
+    revalidated_plans: list[IsolatedCommitPlan] = []
+    hook_plans: list[IsolatedCommitPlan] = []
+
+    def wrapped_plan_isolated_commit(*args, **kwargs):
+        current_plan = original_plan_isolated_commit(*args, **kwargs)
+        events.append("revalidation")
+        revalidated_plans.append(current_plan)
+        return current_plan
+
+    def recording_run_git(repository, arguments, *, input_bytes=None):
+        arguments = tuple(arguments)
+        if arguments[:2] == ("add", "--"):
+            events.append("add")
+        if "commit" in arguments:
+            events.append("commit")
+        return original_run_git(repository, arguments, input_bytes=input_bytes)
+
+    def approval_handler(_request):
+        events.append("approval")
+        return ToolApprovalDecision.APPROVE
+
+    def pre_mutation_handler(current_plan: IsolatedCommitPlan) -> None:
+        events.append("handler")
+        hook_plans.append(current_plan)
+
+    monkeypatch.setattr(module, "plan_isolated_commit", wrapped_plan_isolated_commit)
+    monkeypatch.setattr(module, "_run_git", recording_run_git)
+
+    result = create_isolated_commit(
+        plan,
+        approval_handler,
+        pre_mutation_handler=pre_mutation_handler,
+    )
+
+    assert result.old_head == plan.old_head
+    assert events.index("approval") < events.index("revalidation")
+    assert events.index("revalidation") < events.index("handler")
+    assert events.index("handler") < events.index("add")
+    assert hook_plans == [revalidated_plans[0]]
+    assert hook_plans[0] is revalidated_plans[0]
+    assert hook_plans[0] == plan
+    assert events.count("handler") == 1
+
+
+@pytest.mark.parametrize("approval_kind", ["missing", "deny", "invalid", "failure"])
+def test_pre_mutation_handler_is_not_called_without_successful_approval(
+    tmp_path: Path,
+    approval_kind: str,
+) -> None:
+    """Never invoke the hook unless approval succeeds."""
+
+    _, handle = create_isolated_worktree(tmp_path)
+    worktree = handle.worktree_path
+    (worktree / "tracked.txt").write_text("changed\n", encoding="utf-8")
+    plan = plan_isolated_commit(handle, "fix: approval boundary")
+    hook_calls = 0
+
+    def pre_mutation_handler(_plan: IsolatedCommitPlan) -> None:
+        nonlocal hook_calls
+        hook_calls += 1
+
+    def approval_handler(_request):
+        if approval_kind == "deny":
+            return ToolApprovalDecision.DENY
+        if approval_kind == "invalid":
+            return False
+        raise RuntimeError("injected")
+
+    selected = None if approval_kind == "missing" else approval_handler
+    with pytest.raises(CompletionError, match="approval"):
+        create_isolated_commit(
+            plan,
+            selected,  # type: ignore[arg-type]
+            pre_mutation_handler=pre_mutation_handler,
+        )
+
+    assert hook_calls == 0
+    assert run_git(worktree, "diff", "--cached", "--quiet").returncode == 0
+    assert run_git(worktree, "rev-parse", "HEAD").stdout.strip() == plan.old_head
+
+
+@pytest.mark.parametrize(
+    "stale_kind",
+    [
+        "content",
+        "unexpected",
+        "head",
+        "branch",
+        "source_dirty",
+        "index",
+        "operation",
+    ],
+)
+def test_pre_mutation_handler_is_not_called_for_stale_plan(
+    tmp_path: Path,
+    stale_kind: str,
+) -> None:
+    """Skip the hook entirely when the post-approval revalidation is stale."""
+
+    source, handle = create_isolated_worktree(tmp_path)
+    worktree = handle.worktree_path
+    tracked = worktree / "tracked.txt"
+    tracked.write_text("changed\n", encoding="utf-8")
+    plan = plan_isolated_commit(handle, "fix: stale hook")
+    old_head = plan.old_head
+    hook_calls = 0
+
+    def pre_mutation_handler(_plan: IsolatedCommitPlan) -> None:
+        nonlocal hook_calls
+        hook_calls += 1
+
+    def approve(_request):
+        if stale_kind == "content":
+            tracked.write_text("changed again\n", encoding="utf-8")
+        elif stale_kind == "unexpected":
+            (worktree / "unexpected.txt").write_text("unexpected\n", encoding="utf-8")
+        elif stale_kind == "head":
+            run_git(worktree, "add", "--", "tracked.txt")
+            run_git(worktree, "commit", "-m", "concurrent")
+        elif stale_kind == "branch":
+            run_git(worktree, "branch", "agent/other")
+            run_git(worktree, "symbolic-ref", "HEAD", "refs/heads/agent/other")
+        elif stale_kind == "source_dirty":
+            (source / "tracked.txt").write_text("source dirty\n", encoding="utf-8")
+        elif stale_kind == "index":
+            run_git(worktree, "add", "--", "tracked.txt")
+        else:
+            git_path = Path(
+                run_git(
+                    worktree,
+                    "rev-parse",
+                    "--git-path",
+                    "MERGE_HEAD",
+                ).stdout.strip()
+            )
+            git_path.write_text(old_head + "\n", encoding="utf-8")
+        return ToolApprovalDecision.APPROVE
+
+    with pytest.raises(CompletionError, match="stale"):
+        create_isolated_commit(
+            plan,
+            approve,
+            pre_mutation_handler=pre_mutation_handler,
+        )
+
+    assert hook_calls == 0
+
+
+def test_pre_mutation_handler_failure_aborts_before_git_add_and_commit(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Convert hook failures into bounded CompletionError before mutation begins."""
+
+    _, handle = create_isolated_worktree(tmp_path)
+    worktree = handle.worktree_path
+    (worktree / "tracked.txt").write_text("changed\n", encoding="utf-8")
+    plan = plan_isolated_commit(handle, "fix: hook failure")
+    module = pytest.importorskip("agent_workbench.worktree_commits")
+    original_run_git = module._run_git
+    commands: list[tuple[str, ...]] = []
+    hook_calls = 0
+
+    def recording_run_git(repository, arguments, *, input_bytes=None):
+        arguments = tuple(arguments)
+        commands.append(arguments)
+        return original_run_git(repository, arguments, input_bytes=input_bytes)
+
+    def pre_mutation_handler(_plan: IsolatedCommitPlan) -> None:
+        nonlocal hook_calls
+        hook_calls += 1
+        raise RuntimeError("injected secret failure")
+
+    monkeypatch.setattr(module, "_run_git", recording_run_git)
+
+    with pytest.raises(
+        CompletionError,
+        match="Pre-mutation checkpoint failed; no commit mutation was started",
+    ) as raised:
+        create_isolated_commit(
+            plan,
+            lambda _request: ToolApprovalDecision.APPROVE,
+            pre_mutation_handler=pre_mutation_handler,
+        )
+
+    assert hook_calls == 1
+    assert "injected secret failure" not in str(raised.value)
+    assert not any(arguments[:2] == ("add", "--") for arguments in commands)
+    assert not any("commit" in arguments for arguments in commands)
+    assert run_git(worktree, "diff", "--cached", "--quiet").returncode == 0
+    assert run_git(worktree, "rev-parse", "HEAD").stdout.strip() == plan.old_head
+
+
+def test_non_callable_pre_mutation_handler_is_rejected_before_approval(
+    tmp_path: Path,
+) -> None:
+    """Reject invalid hook values before approval or mutation."""
+
+    _, handle = create_isolated_worktree(tmp_path)
+    worktree = handle.worktree_path
+    (worktree / "tracked.txt").write_text("changed\n", encoding="utf-8")
+    plan = plan_isolated_commit(handle, "fix: invalid hook")
+    approval_calls = 0
+
+    def approval_handler(_request):
+        nonlocal approval_calls
+        approval_calls += 1
+        return ToolApprovalDecision.APPROVE
+
+    with pytest.raises(ConfigurationError, match="pre-mutation handler"):
+        create_isolated_commit(
+            plan,
+            approval_handler,
+            pre_mutation_handler=True,  # type: ignore[arg-type]
+        )
+
+    assert approval_calls == 0
+    assert run_git(worktree, "diff", "--cached", "--quiet").returncode == 0
+    assert run_git(worktree, "rev-parse", "HEAD").stdout.strip() == plan.old_head
+
+
 def test_approved_commit_stages_exact_paths_and_verifies_result(
     tmp_path: Path,
     monkeypatch,

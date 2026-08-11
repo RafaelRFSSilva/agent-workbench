@@ -249,6 +249,8 @@ type IsolatedCommitApprovalHandler = Callable[
     ToolApprovalDecision,
 ]
 
+type IsolatedCommitPreMutationHandler = Callable[[IsolatedCommitPlan], None]
+
 
 @dataclass(frozen=True, slots=True)
 class IsolatedCommitResult:
@@ -367,12 +369,18 @@ def plan_isolated_commit(
 def create_isolated_commit(
     plan: IsolatedCommitPlan,
     approval_handler: IsolatedCommitApprovalHandler | None,
+    *,
+    pre_mutation_handler: IsolatedCommitPreMutationHandler | None = None,
 ) -> IsolatedCommitResult:
     """Stage, commit, and verify one exact approved isolated plan."""
 
     if not isinstance(plan, IsolatedCommitPlan):
         raise ConfigurationError(
             "isolated commit creation requires an IsolatedCommitPlan."
+        )
+    if pre_mutation_handler is not None and not callable(pre_mutation_handler):
+        raise ConfigurationError(
+            "isolated commit pre-mutation handler must be callable."
         )
     _require_commit_approval(plan, approval_handler)
 
@@ -392,6 +400,8 @@ def create_isolated_commit(
             "Isolated commit plan is stale; no paths were staged and no "
             "commit was created."
         )
+
+    _run_pre_mutation_handler(current_plan, pre_mutation_handler)
 
     try:
         stage_outcome = _run_git(
@@ -506,6 +516,22 @@ def _require_commit_approval(
         raise CompletionError("Isolated commit approval was denied.")
     if decision is not ToolApprovalDecision.APPROVE:
         raise CompletionError("Isolated commit approval decision is invalid.")
+
+
+def _run_pre_mutation_handler(
+    plan: IsolatedCommitPlan,
+    pre_mutation_handler: IsolatedCommitPreMutationHandler | None,
+) -> None:
+    """Run one optional pre-mutation callback before starting Git mutation."""
+
+    if pre_mutation_handler is None:
+        return
+    try:
+        pre_mutation_handler(plan)
+    except Exception:
+        raise CompletionError(
+            "Pre-mutation checkpoint failed; no commit mutation was started."
+        ) from None
 
 
 @dataclass(frozen=True, slots=True)
