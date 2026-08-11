@@ -169,7 +169,7 @@ def run_validation(
     ) = _run_process(
         command,
         workspace.root,
-        _minimal_environment(),
+        _validation_environment(workspace, spec),
         spec.timeout_seconds,
     )
     stdout, stdout_was_limited = _decode_and_sanitize(
@@ -262,6 +262,28 @@ def _minimal_environment() -> dict[str, str]:
         "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
         "UV_OFFLINE": "1",
     }
+
+
+def _validation_environment(
+    workspace: Workspace,
+    spec: _ValidationSpec,
+) -> dict[str, str]:
+    """Build one validation environment with optional workspace-local imports."""
+
+    environment = _minimal_environment()
+    if spec.module != "pytest":
+        return environment
+
+    src_path = workspace.root / "src"
+    if not src_path.exists() and not src_path.is_symlink():
+        return environment
+
+    contained_src_path = workspace.resolve(Path("src"))
+    if not contained_src_path.is_dir():
+        return environment
+
+    environment["PYTHONPATH"] = str(contained_src_path)
+    return environment
 
 
 def _module_available(module: str) -> bool:
