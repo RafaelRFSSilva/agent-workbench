@@ -1,6 +1,7 @@
 """Tests for the complete isolated autonomous coding workflow."""
 
 from dataclasses import FrozenInstanceError, replace
+import hashlib
 from pathlib import Path
 import subprocess
 from types import SimpleNamespace
@@ -24,11 +25,22 @@ from agent_workbench.isolated_coding import (
     IsolatedAutonomousWorkflowResult,
     run_isolated_autonomous_workflow,
 )
+from agent_workbench.lifecycle import (
+    IsolatedCommitLifecyclePhase,
+    IsolatedCommitLifecycleRecord,
+)
+from agent_workbench.lifecycle_store import IsolatedCommitLifecycleStore
 from agent_workbench.session import SessionId
 from agent_workbench.messages import ChatRequest, ChatResponse
 from agent_workbench.tasks import TaskSpec
 from agent_workbench.tools import ToolApprovalDecision
 from agent_workbench.worktree_commits import MAX_COMMIT_MESSAGE_BYTES
+
+SHA1_OLD = "a" * 40
+SHA1_NEW = "b" * 40
+SHA1_SOURCE = "c" * 40
+DIFF_FP = "0" * 64
+CMF = "1" * 64
 
 
 def run_git(
@@ -158,6 +170,118 @@ def coding_result(
         latest_git_diff_sequence_index=(git_offset + 1 if inspected_git_diff else None),
         approved_workspace_paths=approved_workspace_paths,
     )
+
+
+class RecordingLifecycleStore(IsolatedCommitLifecycleStore):
+    """Capture lifecycle writes while delegating to the real crash-safe store."""
+
+    __slots__ = ("writes", "fail_on_call", "failure", "delegate_before_failure")
+
+    def __init__(
+        self,
+        directory: Path,
+        *,
+        fail_on_call: int | None = None,
+        failure: Exception | None = None,
+        delegate_before_failure: bool = False,
+    ) -> None:
+        super().__init__(directory)
+        self.writes: list[IsolatedCommitLifecycleRecord] = []
+        self.fail_on_call = fail_on_call
+        self.failure = failure or CompletionError("injected lifecycle store failure")
+        self.delegate_before_failure = delegate_before_failure
+
+    def write(self, record: IsolatedCommitLifecycleRecord) -> None:
+        self.writes.append(record)
+        should_fail = self.fail_on_call == len(self.writes)
+        if should_fail and not self.delegate_before_failure:
+            raise self.failure
+        super().write(record)
+        if should_fail and self.delegate_before_failure:
+            raise self.failure
+
+
+def create_lifecycle_store(
+    tmp_path: Path,
+    *,
+    fail_on_call: int | None = None,
+    failure: Exception | None = None,
+    delegate_before_failure: bool = False,
+) -> RecordingLifecycleStore:
+    """Create one dedicated existing lifecycle store directory for testing."""
+
+    directory = tmp_path / "lifecycle-store"
+    directory.mkdir()
+    return RecordingLifecycleStore(
+        directory,
+        fail_on_call=fail_on_call,
+        failure=failure,
+        delegate_before_failure=delegate_before_failure,
+    )
+
+
+def expected_lifecycle_filename(session_id: SessionId) -> str:
+    """Return one deterministic lifecycle filename."""
+
+    digest = hashlib.sha256(session_id.value.encode("utf-8")).hexdigest()
+    return f"isolated-commit-{digest}.json"
+
+
+def make_existing_lifecycle_record(
+    session_id: SessionId,
+    *,
+    phase: IsolatedCommitLifecyclePhase = IsolatedCommitLifecyclePhase.PLANNED,
+) -> IsolatedCommitLifecycleRecord:
+    """Return one valid pre-existing lifecycle record for a session."""
+
+    new_head = SHA1_NEW if phase is IsolatedCommitLifecyclePhase.VERIFIED else None
+    return IsolatedCommitLifecycleRecord(
+        session_id=session_id,
+        phase=phase,
+        target_display="../isolated",
+        source_head=SHA1_SOURCE,
+        source_branch="main",
+        branch_name="agent/task",
+        old_head=SHA1_OLD,
+        paths=("module.py",),
+        diff_fingerprint=DIFF_FP,
+        commit_message_fingerprint=CMF,
+        new_head=new_head,
+    )
+
+
+def install_successful_coding_stub(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    approved_workspace_paths: tuple[str, ...] = ("module.py",),
+) -> dict[str, object]:
+    """Patch isolated session creation and successful coding for workflow tests."""
+
+    captured: dict[str, object] = {}
+
+    def create_isolated(_session_id, _runtime, worktree, *, max_tool_rounds):
+        assert max_tool_rounds == 16
+        captured["worktree"] = worktree
+        return SimpleNamespace(worktree=worktree, session=object())
+
+    def run_coding(_session, _prompt, **_kwargs):
+        worktree = captured["worktree"]
+        worktree_path = worktree.worktree_path
+        (worktree_path / "module.py").write_text(
+            "def add(left: int, right: int) -> int:\n    return left + right\n",
+            encoding="utf-8",
+        )
+        return coding_result(approved_workspace_paths=approved_workspace_paths)
+
+    monkeypatch.setattr(
+        "agent_workbench.isolated_coding.create_isolated_agent_session",
+        create_isolated,
+    )
+    monkeypatch.setattr(
+        "agent_workbench.isolated_coding.run_autonomous_coding_task",
+        run_coding,
+    )
+    return captured
 
 
 def assert_no_worktree_mutation(
@@ -436,6 +560,514 @@ def test_commits_exact_new_files_after_untracked_verification(
     assert run_git(source, "status", "--short").stdout == ""
     assert not (source / "created_module.py").exists()
     assert not (source / "test_created_module.py").exists()
+
+
+def test_lifecycle_store_none_preserves_existing_successful_behavior(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Keep the workflow unchanged when no lifecycle store is injected."""
+
+    source = create_repository(tmp_path / "source")
+    target = tmp_path / "isolated"
+    install_successful_coding_stub(monkeypatch)
+    monkeypatch.setattr(
+        "agent_workbench.isolated_coding._build_lifecycle_record",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("lifecycle records must not be constructed")
+        ),
+    )
+
+    result = run_isolated_autonomous_workflow(
+        SessionId("no-store"),
+        configuration(source),
+        "agent/no-store",
+        target,
+        "Correct the add implementation.",
+        "fix: correct add implementation",
+        worktree_approval_handler=approve,
+        tool_approval_handler=approve,
+        commit_approval_handler=approve,
+        lifecycle_store=None,
+    )
+
+    assert result.commit_result.branch_name == "agent/no-store"
+
+
+def test_invalid_lifecycle_store_is_rejected_before_worktree_creation(
+    tmp_path: Path,
+) -> None:
+    """Reject invalid lifecycle store values before creating any worktree."""
+
+    source = create_repository(tmp_path / "source")
+    target = tmp_path / "isolated"
+
+    with pytest.raises(ConfigurationError, match="lifecycle store"):
+        run_isolated_autonomous_workflow(
+            SessionId("invalid-store"),
+            configuration(source),
+            "agent/invalid-store",
+            target,
+            "Correct the add implementation.",
+            "fix: valid",
+            worktree_approval_handler=approve,
+            tool_approval_handler=approve,
+            commit_approval_handler=approve,
+            lifecycle_store=object(),  # type: ignore[arg-type]
+        )
+
+    assert_no_worktree_mutation(source, target, "agent/invalid-store")
+
+
+def test_existing_lifecycle_record_blocks_session_reuse_before_worktree_creation(
+    tmp_path: Path,
+) -> None:
+    """Refuse to overwrite unresolved persisted lifecycle state for a session."""
+
+    source = create_repository(tmp_path / "source")
+    target = tmp_path / "isolated"
+    session_id = SessionId("existing-lifecycle")
+    store = create_lifecycle_store(tmp_path)
+    existing = make_existing_lifecycle_record(session_id)
+    store.write(existing)
+
+    with pytest.raises(CompletionError, match="persisted lifecycle state"):
+        run_isolated_autonomous_workflow(
+            session_id,
+            configuration(source),
+            "agent/existing-lifecycle",
+            target,
+            "Correct the add implementation.",
+            "fix: valid",
+            worktree_approval_handler=approve,
+            tool_approval_handler=approve,
+            commit_approval_handler=approve,
+            lifecycle_store=store,
+        )
+
+    assert store.read(session_id) == existing
+    assert_no_worktree_mutation(source, target, "agent/existing-lifecycle")
+
+
+def test_corrupt_existing_lifecycle_state_fails_before_worktree_creation(
+    tmp_path: Path,
+) -> None:
+    """Propagate invalid persisted lifecycle data before creating any worktree."""
+
+    source = create_repository(tmp_path / "source")
+    target = tmp_path / "isolated"
+    session_id = SessionId("corrupt-lifecycle")
+    store = create_lifecycle_store(tmp_path)
+    payload_path = store._directory / expected_lifecycle_filename(session_id)  # type: ignore[attr-defined]
+    payload_path.write_bytes(b"{not-json\n")
+
+    with pytest.raises(ConfigurationError, match="valid JSON"):
+        run_isolated_autonomous_workflow(
+            session_id,
+            configuration(source),
+            "agent/corrupt-lifecycle",
+            target,
+            "Correct the add implementation.",
+            "fix: valid",
+            worktree_approval_handler=approve,
+            tool_approval_handler=approve,
+            commit_approval_handler=approve,
+            lifecycle_store=store,
+        )
+
+    assert_no_worktree_mutation(source, target, "agent/corrupt-lifecycle")
+
+
+def test_successful_workflow_persists_planned_execution_started_and_verified(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Persist lifecycle checkpoints in order with stable fields across phases."""
+
+    source = create_repository(tmp_path / "source")
+    target = tmp_path / "isolated"
+    session_id = SessionId("checkpoint-order")
+    commit_message = "fix: correct add implementation"
+    store = create_lifecycle_store(tmp_path)
+    install_successful_coding_stub(monkeypatch)
+    approval_calls = 0
+
+    def commit_approval_handler(_request):
+        nonlocal approval_calls
+        approval_calls += 1
+        return ToolApprovalDecision.APPROVE
+
+    result = run_isolated_autonomous_workflow(
+        session_id,
+        configuration(source),
+        "agent/checkpoint-order",
+        target,
+        "Correct the add implementation.",
+        commit_message,
+        worktree_approval_handler=approve,
+        tool_approval_handler=approve,
+        commit_approval_handler=commit_approval_handler,
+        lifecycle_store=store,
+    )
+
+    assert approval_calls == 1
+    assert [record.phase for record in store.writes] == [
+        IsolatedCommitLifecyclePhase.PLANNED,
+        IsolatedCommitLifecyclePhase.EXECUTION_STARTED,
+        IsolatedCommitLifecyclePhase.VERIFIED,
+    ]
+    persisted = store.read(session_id)
+    assert persisted is not None
+    assert persisted.phase is IsolatedCommitLifecyclePhase.VERIFIED
+    assert persisted.new_head == result.commit_result.new_head
+
+    first = store.writes[0]
+    expected_message_fingerprint = hashlib.sha256(
+        commit_message.encode("utf-8")
+    ).hexdigest()
+    for record in store.writes:
+        assert record.session_id == session_id
+        assert (
+            record.target_display
+            == first.target_display
+            == result.worktree.target_display
+        )
+        assert record.source_head == first.source_head == result.worktree.source_head
+        assert record.source_branch == first.source_branch == "main"
+        assert record.branch_name == first.branch_name == result.worktree.branch_name
+        assert record.old_head == first.old_head == result.commit_result.old_head
+        assert record.paths == first.paths == result.commit_result.paths
+        assert record.diff_fingerprint == first.diff_fingerprint
+        assert record.commit_message_fingerprint == expected_message_fingerprint
+    assert store.writes[0].new_head is None
+    assert store.writes[1].new_head is None
+    assert store.writes[2].new_head == result.commit_result.new_head
+
+    stored_bytes = (
+        tmp_path / "lifecycle-store" / expected_lifecycle_filename(session_id)
+    ).read_text(encoding="utf-8")
+    assert commit_message not in stored_bytes
+
+
+def test_planned_persistence_failure_prevents_approval_and_commit_mutation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Abort before commit approval or Git mutation when PLANNED persistence fails."""
+
+    source = create_repository(tmp_path / "source")
+    target = tmp_path / "isolated"
+    session_id = SessionId("planned-failure")
+    store = create_lifecycle_store(
+        tmp_path,
+        fail_on_call=1,
+        failure=CompletionError("injected planned failure"),
+    )
+    install_successful_coding_stub(monkeypatch)
+    commit_approval = Mock(
+        side_effect=AssertionError("commit approval must not be requested")
+    )
+
+    with pytest.raises(
+        CompletionError, match="PLANNED lifecycle checkpoint persistence"
+    ):
+        run_isolated_autonomous_workflow(
+            session_id,
+            configuration(source),
+            "agent/planned-failure",
+            target,
+            "Correct the add implementation.",
+            "fix: valid",
+            worktree_approval_handler=approve,
+            tool_approval_handler=approve,
+            commit_approval_handler=commit_approval,
+            lifecycle_store=store,
+        )
+
+    assert not commit_approval.called
+    assert store.read(session_id) is None
+    assert target.exists()
+    assert run_git(target, "diff", "--cached", "--quiet").returncode == 0
+    assert run_git(target, "log", "-1", "--pretty=%s").stdout.strip() == "initial"
+
+
+def test_approval_denial_leaves_planned_as_latest_lifecycle_record(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Keep PLANNED persisted when commit approval is denied."""
+
+    source = create_repository(tmp_path / "source")
+    target = tmp_path / "isolated"
+    session_id = SessionId("approval-denied")
+    store = create_lifecycle_store(tmp_path)
+    install_successful_coding_stub(monkeypatch)
+
+    with pytest.raises(CompletionError, match="approval was denied"):
+        run_isolated_autonomous_workflow(
+            session_id,
+            configuration(source),
+            "agent/approval-denied",
+            target,
+            "Correct the add implementation.",
+            "fix: valid",
+            worktree_approval_handler=approve,
+            tool_approval_handler=approve,
+            commit_approval_handler=lambda _request: ToolApprovalDecision.DENY,
+            lifecycle_store=store,
+        )
+
+    persisted = store.read(session_id)
+    assert persisted is not None
+    assert persisted.phase is IsolatedCommitLifecyclePhase.PLANNED
+    assert [record.phase for record in store.writes] == [
+        IsolatedCommitLifecyclePhase.PLANNED
+    ]
+
+
+def test_post_approval_stale_plan_leaves_planned_and_never_writes_execution_started(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Do not advance lifecycle state when post-approval revalidation is stale."""
+
+    source = create_repository(tmp_path / "source")
+    target = tmp_path / "isolated"
+    session_id = SessionId("stale-plan")
+    store = create_lifecycle_store(tmp_path)
+    captured = install_successful_coding_stub(monkeypatch)
+
+    def stale_after_approval(_request):
+        worktree = captured["worktree"]
+        (worktree.worktree_path / "module.py").write_text(
+            "def add(left: int, right: int) -> int:\n    return left * right\n",
+            encoding="utf-8",
+        )
+        return ToolApprovalDecision.APPROVE
+
+    with pytest.raises(CompletionError, match="stale"):
+        run_isolated_autonomous_workflow(
+            session_id,
+            configuration(source),
+            "agent/stale-plan",
+            target,
+            "Correct the add implementation.",
+            "fix: valid",
+            worktree_approval_handler=approve,
+            tool_approval_handler=approve,
+            commit_approval_handler=stale_after_approval,
+            lifecycle_store=store,
+        )
+
+    persisted = store.read(session_id)
+    assert persisted is not None
+    assert persisted.phase is IsolatedCommitLifecyclePhase.PLANNED
+    assert [record.phase for record in store.writes] == [
+        IsolatedCommitLifecyclePhase.PLANNED
+    ]
+
+
+def test_execution_started_persistence_failure_occurs_before_git_add(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Abort before staging when EXECUTION_STARTED persistence fails."""
+
+    source = create_repository(tmp_path / "source")
+    target = tmp_path / "isolated"
+    session_id = SessionId("execution-started-failure")
+    store = create_lifecycle_store(
+        tmp_path,
+        fail_on_call=2,
+        failure=CompletionError("injected execution-started failure"),
+    )
+    install_successful_coding_stub(monkeypatch)
+
+    with pytest.raises(CompletionError, match="Pre-mutation checkpoint failed"):
+        run_isolated_autonomous_workflow(
+            session_id,
+            configuration(source),
+            "agent/execution-started-failure",
+            target,
+            "Correct the add implementation.",
+            "fix: valid",
+            worktree_approval_handler=approve,
+            tool_approval_handler=approve,
+            commit_approval_handler=approve,
+            lifecycle_store=store,
+        )
+
+    persisted = store.read(session_id)
+    assert persisted is not None
+    assert persisted.phase is IsolatedCommitLifecyclePhase.PLANNED
+    assert target.exists()
+    assert run_git(target, "diff", "--cached", "--quiet").returncode == 0
+    assert run_git(target, "log", "-1", "--pretty=%s").stdout.strip() == "initial"
+
+
+def test_staging_failure_after_execution_started_leaves_that_phase_persisted(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Preserve EXECUTION_STARTED when staging fails after the checkpoint."""
+
+    source = create_repository(tmp_path / "source")
+    target = tmp_path / "isolated"
+    session_id = SessionId("stage-failure")
+    store = create_lifecycle_store(tmp_path)
+    install_successful_coding_stub(monkeypatch)
+    module = pytest.importorskip("agent_workbench.worktree_commits")
+    original_run_git = module._run_git
+
+    def fail_stage(repository, arguments, *, input_bytes=None):
+        arguments = tuple(arguments)
+        if arguments[:2] == ("add", "--"):
+            original_run_git(repository, ("add", "--", "module.py"))
+            return module._GitOutput(1, b"", b"injected")
+        return original_run_git(repository, arguments, input_bytes=input_bytes)
+
+    monkeypatch.setattr(module, "_run_git", fail_stage)
+
+    with pytest.raises(CompletionError, match="Isolated commit creation failed"):
+        run_isolated_autonomous_workflow(
+            session_id,
+            configuration(source),
+            "agent/stage-failure",
+            target,
+            "Correct the add implementation.",
+            "fix: valid",
+            worktree_approval_handler=approve,
+            tool_approval_handler=approve,
+            commit_approval_handler=approve,
+            lifecycle_store=store,
+        )
+
+    persisted = store.read(session_id)
+    assert persisted is not None
+    assert persisted.phase is IsolatedCommitLifecyclePhase.EXECUTION_STARTED
+
+
+def test_commit_failure_after_execution_started_leaves_that_phase_persisted(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Preserve EXECUTION_STARTED when commit creation fails after staging."""
+
+    source = create_repository(tmp_path / "source")
+    target = tmp_path / "isolated"
+    session_id = SessionId("commit-failure")
+    store = create_lifecycle_store(tmp_path)
+    install_successful_coding_stub(monkeypatch)
+    module = pytest.importorskip("agent_workbench.worktree_commits")
+    original_run_git = module._run_git
+
+    def fail_commit(repository, arguments, *, input_bytes=None):
+        arguments = tuple(arguments)
+        if "commit" in arguments:
+            return module._GitOutput(1, b"", b"injected")
+        return original_run_git(repository, arguments, input_bytes=input_bytes)
+
+    monkeypatch.setattr(module, "_run_git", fail_commit)
+
+    with pytest.raises(CompletionError, match="Isolated commit creation failed"):
+        run_isolated_autonomous_workflow(
+            session_id,
+            configuration(source),
+            "agent/commit-failure",
+            target,
+            "Correct the add implementation.",
+            "fix: valid",
+            worktree_approval_handler=approve,
+            tool_approval_handler=approve,
+            commit_approval_handler=approve,
+            lifecycle_store=store,
+        )
+
+    persisted = store.read(session_id)
+    assert persisted is not None
+    assert persisted.phase is IsolatedCommitLifecyclePhase.EXECUTION_STARTED
+
+
+def test_verified_persistence_failure_reports_failure_without_rolling_back_commit(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Keep the created commit and preserved worktree when VERIFIED persistence fails."""
+
+    source = create_repository(tmp_path / "source")
+    target = tmp_path / "isolated"
+    session_id = SessionId("verified-failure")
+    store = create_lifecycle_store(
+        tmp_path,
+        fail_on_call=3,
+        failure=CompletionError("injected verified failure"),
+    )
+    install_successful_coding_stub(monkeypatch)
+
+    with pytest.raises(
+        CompletionError, match="VERIFIED lifecycle checkpoint persistence"
+    ):
+        run_isolated_autonomous_workflow(
+            session_id,
+            configuration(source),
+            "agent/verified-failure",
+            target,
+            "Correct the add implementation.",
+            "fix: verified failure",
+            worktree_approval_handler=approve,
+            tool_approval_handler=approve,
+            commit_approval_handler=approve,
+            lifecycle_store=store,
+        )
+
+    persisted = store.read(session_id)
+    assert persisted is not None
+    assert persisted.phase is IsolatedCommitLifecyclePhase.EXECUTION_STARTED
+    assert (
+        run_git(target, "log", "-1", "--pretty=%s").stdout.strip()
+        == "fix: verified failure"
+    )
+    assert (
+        run_git(target, "branch", "--show-current").stdout.strip()
+        == "agent/verified-failure"
+    )
+
+
+def test_final_worktree_verification_failure_leaves_verified_persisted(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Keep VERIFIED persisted even if the final workflow inspection later fails."""
+
+    source = create_repository(tmp_path / "source")
+    target = tmp_path / "isolated"
+    session_id = SessionId("final-verification-failure")
+    store = create_lifecycle_store(tmp_path)
+    install_successful_coding_stub(monkeypatch)
+    monkeypatch.setattr(
+        "agent_workbench.isolated_coding.inspect_git_worktree",
+        lambda _worktree: (_ for _ in ()).throw(
+            CompletionError("injected final failure")
+        ),
+    )
+
+    with pytest.raises(CompletionError, match="Final worktree verification failed"):
+        run_isolated_autonomous_workflow(
+            session_id,
+            configuration(source),
+            "agent/final-verification-failure",
+            target,
+            "Correct the add implementation.",
+            "fix: final verification failure",
+            worktree_approval_handler=approve,
+            tool_approval_handler=approve,
+            commit_approval_handler=approve,
+            lifecycle_store=store,
+        )
+
+    persisted = store.read(session_id)
+    assert persisted is not None
+    assert persisted.phase is IsolatedCommitLifecyclePhase.VERIFIED
 
 
 def test_rejects_unrelated_untracked_file_before_commit_mutation(
