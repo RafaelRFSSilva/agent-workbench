@@ -14,34 +14,45 @@ OpenAI, Anthropic, provider request formats, workspace tools, or the CLI.
 
 ```text
 TaskSpec
-├── objective
-└── acceptance_criteria
+├─ objective
+├─ acceptance_criteria
+└─ task_id
 ```
 
-- `objective` is the exact non-blank string supplied by the caller.
-- `acceptance_criteria` is an ordered immutable tuple of non-blank strings.
+- `objective` is the exact non‑blank string supplied by the caller.
+- `acceptance_criteria` is an ordered immutable tuple of non‑blank strings.
+- `task_id` is an optional `TaskId` instance or `None`. It preserves the
+  original string value and enforces that it is a non‑blank string.
 
-The model is frozen, slotted, value-comparable, and hashable.
+### TaskId
 
-## Validation
+```text
+TaskId
+└─ value
+```
+
+- `value` is the exact string supplied by the caller. Leading or trailing
+  whitespace is preserved.
+
+The model is frozen, slotted, value‑comparable, and hashable.
+
+## Validation (updated)
 
 A valid task specification requires:
 
-- An objective that is a string.
-- At least one non-whitespace character in the objective.
-- An iterable of acceptance criteria.
+- An objective that is a string with at least one non‑whitespace character.
+- An iterable of acceptance criteria, each a string with at least one
+  non‑whitespace character.
 - At least one acceptance criterion.
-- Every criterion to be a string.
-- At least one non-whitespace character in every criterion.
+- A `task_id` that is either `None` or an instance of `TaskId`. If provided,
+  the underlying value must be a non‑blank string.
 
-A bare string is rejected as the acceptance-criteria collection because it
-would otherwise be interpreted as an iterable of individual characters.
+Invalid values raise `ConfigurationError` with messages matching the
+specification above.
 
-Invalid values raise `ConfigurationError`.
+## Preservation Semantics (updated)
 
-## Preservation Semantics
-
-Valid text is preserved exactly.
+Valid text is preserved exactly, including any leading or trailing whitespace.
 
 Agent Workbench does not:
 
@@ -50,9 +61,11 @@ Agent Workbench does not:
 - Reorder acceptance criteria.
 - Deduplicate criteria.
 - Normalise capitalisation or punctuation.
+- Alter the `task_id` value once set.
 
-The acceptance-criteria iterable is converted to a tuple during construction.
-Later mutation of an original list therefore cannot change the stored task.
+The acceptance‑criteria iterable is converted to a tuple during construction,
+and the optional `task_id` is stored as an immutable object. Later mutation of
+an original list therefore cannot change the stored task.
 
 ## AgentSession Integration
 
@@ -78,7 +91,7 @@ session = AgentSession(
 )
 ```
 
-The configured value is available through the read-only property:
+The configured value is available through the read‑only property:
 
 ```python
 session.task_spec
@@ -96,7 +109,7 @@ The exact `TaskSpec` instance supplied by the caller is preserved.
 
 `TaskSpec` belongs to the shared application layer.
 
-It is not translated into provider-specific request fields and does not change
+It is not translated into provider‑specific request fields and does not change
 the behavior of:
 
 - `OllamaProvider`.
@@ -161,25 +174,25 @@ Review and user approval
 Those orchestration and lifecycle capabilities are not part of the current
 implementation.
 
-## Future Work
+## Future Work (updated)
 
 Possible future additions include:
 
-- Task identifiers.
 - Task lifecycle states.
 - Dependencies.
 - Manual task assignment.
-- Planner-proposed tasks.
+- Planner‑proposed tasks.
 - Agent handoffs.
-- Progress and blocked-work tracking.
-- Acceptance-criteria evaluation.
-- Task-aware prompt construction.
+- Progress and blocked‑work tracking.
+- Acceptance‑criteria evaluation.
+- Task‑aware prompt construction.
 - Persistence and serialization.
 - Terminal and VS Code task interfaces.
-- Multi-agent orchestration traces.
+- Multi‑agent orchestration traces.
 
-These should remain provider-independent and must not bypass workspace,
-permission, approval, or isolation boundaries.
+Task identifiers are now part of the current data model; they no longer appear
+in this list. All future extensions must remain provider‑independent and
+must not bypass workspace, permission, approval, or isolation boundaries.
 
 ## Related Documentation
 
@@ -187,5 +200,6 @@ permission, approval, or isolation boundaries.
 - [Agent Profiles](agent-profiles.md)
 - [Product Vision](product-vision.md)
 - [Project Configuration](project-configuration.md)
-- [Self-Hosting](self-hosting.md)
+- [Self‑Hosting](self-hosting.md)
 - [Roadmap](roadmap.md)
+*** End of File ***
