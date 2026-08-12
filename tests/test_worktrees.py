@@ -15,10 +15,12 @@ from agent_workbench.worktrees import (
     WorktreeAction,
     WorktreeApprovalRequest,
     WorktreeHandle,
+    WorktreeRestartObservation,
     WorktreePlan,
     WorktreeRemovalPlan,
     create_git_worktree,
     inspect_git_worktree,
+    inspect_worktree_restart_state,
     plan_git_worktree,
     plan_git_worktree_removal,
     remove_git_worktree,
@@ -1211,3 +1213,890 @@ def test_collects_unknown_worktree_recovery_state_when_inspection_fails(
     assert evidence.registered is RecoveryStatus.UNKNOWN
     assert evidence.source_head_changed is RecoveryStatus.UNKNOWN
     assert evidence.worktree_head_changed is RecoveryStatus.UNKNOWN
+
+
+def test_restart_observation_is_frozen_slotted_value_comparable_and_hashable() -> None:
+    """Provide immutable value semantics for restart observations without path leakage."""
+
+    first = WorktreeRestartObservation(
+        observed_source_head="a" * 40,
+        observed_source_branch="main",
+        branch_present=RecoveryStatus.YES,
+        observed_branch_head="b" * 40,
+        registered=RecoveryStatus.YES,
+        observed_registered_branch="agent/task",
+        observed_registered_head="c" * 40,
+        registration_locked=RecoveryStatus.NO,
+        registration_prunable=RecoveryStatus.NO,
+        target_present=RecoveryStatus.YES,
+        target_is_directory=RecoveryStatus.YES,
+        worktree_identity_valid=RecoveryStatus.YES,
+        observed_worktree_branch="agent/task",
+        observed_worktree_head="c" * 40,
+        index_dirty=RecoveryStatus.NO,
+        staged_paths=(),
+        staged_paths_complete=RecoveryStatus.YES,
+        worktree_dirty=RecoveryStatus.NO,
+    )
+    second = WorktreeRestartObservation(
+        observed_source_head="a" * 40,
+        observed_source_branch="main",
+        branch_present=RecoveryStatus.YES,
+        observed_branch_head="b" * 40,
+        registered=RecoveryStatus.YES,
+        observed_registered_branch="agent/task",
+        observed_registered_head="c" * 40,
+        registration_locked=RecoveryStatus.NO,
+        registration_prunable=RecoveryStatus.NO,
+        target_present=RecoveryStatus.YES,
+        target_is_directory=RecoveryStatus.YES,
+        worktree_identity_valid=RecoveryStatus.YES,
+        observed_worktree_branch="agent/task",
+        observed_worktree_head="c" * 40,
+        index_dirty=RecoveryStatus.NO,
+        staged_paths=(),
+        staged_paths_complete=RecoveryStatus.YES,
+        worktree_dirty=RecoveryStatus.NO,
+    )
+
+    assert first == second
+    assert hash(first) == hash(second)
+    assert len({first, second}) == 1
+    assert not hasattr(first, "__dict__")
+    with pytest.raises(FrozenInstanceError):
+        first.observed_source_branch = "other"  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    ("branch_present", "observed_branch_head"),
+    [
+        (RecoveryStatus.NO, "b" * 40),
+        (RecoveryStatus.UNKNOWN, "b" * 40),
+    ],
+)
+def test_restart_observation_rejects_branch_head_without_branch_presence(
+    branch_present: RecoveryStatus,
+    observed_branch_head: str,
+) -> None:
+    """A branch head cannot be observed unless branch presence is YES."""
+
+    with pytest.raises(ConfigurationError, match="branch observation"):
+        WorktreeRestartObservation(
+            observed_source_head="a" * 40,
+            observed_source_branch="main",
+            branch_present=branch_present,
+            observed_branch_head=observed_branch_head,
+            registered=RecoveryStatus.UNKNOWN,
+            observed_registered_branch=None,
+            observed_registered_head=None,
+            registration_locked=RecoveryStatus.UNKNOWN,
+            registration_prunable=RecoveryStatus.UNKNOWN,
+            target_present=RecoveryStatus.UNKNOWN,
+            target_is_directory=RecoveryStatus.UNKNOWN,
+            worktree_identity_valid=RecoveryStatus.UNKNOWN,
+            observed_worktree_branch=None,
+            observed_worktree_head=None,
+            index_dirty=RecoveryStatus.UNKNOWN,
+            staged_paths=(),
+            staged_paths_complete=RecoveryStatus.UNKNOWN,
+            worktree_dirty=RecoveryStatus.UNKNOWN,
+        )
+
+
+@pytest.mark.parametrize(
+    ("observed_registered_branch", "observed_registered_head", "locked", "prunable"),
+    [
+        ("agent/task", None, RecoveryStatus.NO, RecoveryStatus.NO),
+        (None, "c" * 40, RecoveryStatus.NO, RecoveryStatus.NO),
+        (None, None, RecoveryStatus.YES, RecoveryStatus.NO),
+        (None, None, RecoveryStatus.UNKNOWN, RecoveryStatus.NO),
+        (None, None, RecoveryStatus.NO, RecoveryStatus.YES),
+        (None, None, RecoveryStatus.NO, RecoveryStatus.UNKNOWN),
+    ],
+)
+def test_restart_observation_rejects_registered_no_with_other_registration_facts(
+    observed_registered_branch: str | None,
+    observed_registered_head: str | None,
+    locked: RecoveryStatus,
+    prunable: RecoveryStatus,
+) -> None:
+    """Registered NO requires absent identities and definite NO flags."""
+
+    with pytest.raises(ConfigurationError, match="registration observation"):
+        WorktreeRestartObservation(
+            observed_source_head="a" * 40,
+            observed_source_branch="main",
+            branch_present=RecoveryStatus.NO,
+            observed_branch_head=None,
+            registered=RecoveryStatus.NO,
+            observed_registered_branch=observed_registered_branch,
+            observed_registered_head=observed_registered_head,
+            registration_locked=locked,
+            registration_prunable=prunable,
+            target_present=RecoveryStatus.UNKNOWN,
+            target_is_directory=RecoveryStatus.UNKNOWN,
+            worktree_identity_valid=RecoveryStatus.UNKNOWN,
+            observed_worktree_branch=None,
+            observed_worktree_head=None,
+            index_dirty=RecoveryStatus.UNKNOWN,
+            staged_paths=(),
+            staged_paths_complete=RecoveryStatus.UNKNOWN,
+            worktree_dirty=RecoveryStatus.UNKNOWN,
+        )
+
+
+@pytest.mark.parametrize(
+    ("locked", "prunable"),
+    [
+        (RecoveryStatus.NO, RecoveryStatus.UNKNOWN),
+        (RecoveryStatus.UNKNOWN, RecoveryStatus.NO),
+        (RecoveryStatus.YES, RecoveryStatus.UNKNOWN),
+    ],
+)
+def test_restart_observation_rejects_registered_unknown_with_definite_flags(
+    locked: RecoveryStatus,
+    prunable: RecoveryStatus,
+) -> None:
+    """Registered UNKNOWN requires unknown lock and prunable facts."""
+
+    with pytest.raises(ConfigurationError, match="registration observation"):
+        WorktreeRestartObservation(
+            observed_source_head="a" * 40,
+            observed_source_branch="main",
+            branch_present=RecoveryStatus.NO,
+            observed_branch_head=None,
+            registered=RecoveryStatus.UNKNOWN,
+            observed_registered_branch=None,
+            observed_registered_head=None,
+            registration_locked=locked,
+            registration_prunable=prunable,
+            target_present=RecoveryStatus.UNKNOWN,
+            target_is_directory=RecoveryStatus.UNKNOWN,
+            worktree_identity_valid=RecoveryStatus.UNKNOWN,
+            observed_worktree_branch=None,
+            observed_worktree_head=None,
+            index_dirty=RecoveryStatus.UNKNOWN,
+            staged_paths=(),
+            staged_paths_complete=RecoveryStatus.UNKNOWN,
+            worktree_dirty=RecoveryStatus.UNKNOWN,
+        )
+
+
+@pytest.mark.parametrize(
+    ("locked", "prunable"),
+    [
+        (RecoveryStatus.UNKNOWN, RecoveryStatus.NO),
+        (RecoveryStatus.NO, RecoveryStatus.UNKNOWN),
+    ],
+)
+def test_restart_observation_rejects_registered_yes_with_unknown_flags(
+    locked: RecoveryStatus,
+    prunable: RecoveryStatus,
+) -> None:
+    """Registered YES requires definite lock and prunable facts."""
+
+    with pytest.raises(ConfigurationError, match="registration observation"):
+        WorktreeRestartObservation(
+            observed_source_head="a" * 40,
+            observed_source_branch="main",
+            branch_present=RecoveryStatus.NO,
+            observed_branch_head=None,
+            registered=RecoveryStatus.YES,
+            observed_registered_branch=None,
+            observed_registered_head=None,
+            registration_locked=locked,
+            registration_prunable=prunable,
+            target_present=RecoveryStatus.UNKNOWN,
+            target_is_directory=RecoveryStatus.UNKNOWN,
+            worktree_identity_valid=RecoveryStatus.UNKNOWN,
+            observed_worktree_branch=None,
+            observed_worktree_head=None,
+            index_dirty=RecoveryStatus.UNKNOWN,
+            staged_paths=(),
+            staged_paths_complete=RecoveryStatus.UNKNOWN,
+            worktree_dirty=RecoveryStatus.UNKNOWN,
+        )
+
+
+@pytest.mark.parametrize("registered", [RecoveryStatus.NO, RecoveryStatus.UNKNOWN])
+def test_restart_observation_rejects_target_or_deeper_evidence_without_registration_authority(
+    registered: RecoveryStatus,
+) -> None:
+    """No unique registration means target and deeper worktree facts stay unavailable."""
+
+    with pytest.raises(ConfigurationError, match="target observation"):
+        WorktreeRestartObservation(
+            observed_source_head="a" * 40,
+            observed_source_branch="main",
+            branch_present=RecoveryStatus.NO,
+            observed_branch_head=None,
+            registered=registered,
+            observed_registered_branch=None,
+            observed_registered_head=None,
+            registration_locked=(
+                RecoveryStatus.NO
+                if registered is RecoveryStatus.NO
+                else RecoveryStatus.UNKNOWN
+            ),
+            registration_prunable=(
+                RecoveryStatus.NO
+                if registered is RecoveryStatus.NO
+                else RecoveryStatus.UNKNOWN
+            ),
+            target_present=RecoveryStatus.YES,
+            target_is_directory=RecoveryStatus.YES,
+            worktree_identity_valid=RecoveryStatus.YES,
+            observed_worktree_branch="agent/task",
+            observed_worktree_head="c" * 40,
+            index_dirty=RecoveryStatus.NO,
+            staged_paths=(),
+            staged_paths_complete=RecoveryStatus.YES,
+            worktree_dirty=RecoveryStatus.NO,
+        )
+
+
+def test_restart_observation_rejects_impossible_target_presence_and_directory_pairs() -> (
+    None
+):
+    """Target absence or unknown presence cannot expose deeper target facts."""
+
+    with pytest.raises(ConfigurationError, match="target observation"):
+        WorktreeRestartObservation(
+            observed_source_head="a" * 40,
+            observed_source_branch="main",
+            branch_present=RecoveryStatus.NO,
+            observed_branch_head=None,
+            registered=RecoveryStatus.YES,
+            observed_registered_branch=None,
+            observed_registered_head=None,
+            registration_locked=RecoveryStatus.NO,
+            registration_prunable=RecoveryStatus.NO,
+            target_present=RecoveryStatus.NO,
+            target_is_directory=RecoveryStatus.YES,
+            worktree_identity_valid=RecoveryStatus.UNKNOWN,
+            observed_worktree_branch=None,
+            observed_worktree_head=None,
+            index_dirty=RecoveryStatus.UNKNOWN,
+            staged_paths=(),
+            staged_paths_complete=RecoveryStatus.UNKNOWN,
+            worktree_dirty=RecoveryStatus.UNKNOWN,
+        )
+
+    with pytest.raises(ConfigurationError, match="target observation"):
+        WorktreeRestartObservation(
+            observed_source_head="a" * 40,
+            observed_source_branch="main",
+            branch_present=RecoveryStatus.NO,
+            observed_branch_head=None,
+            registered=RecoveryStatus.YES,
+            observed_registered_branch=None,
+            observed_registered_head=None,
+            registration_locked=RecoveryStatus.NO,
+            registration_prunable=RecoveryStatus.NO,
+            target_present=RecoveryStatus.UNKNOWN,
+            target_is_directory=RecoveryStatus.NO,
+            worktree_identity_valid=RecoveryStatus.UNKNOWN,
+            observed_worktree_branch=None,
+            observed_worktree_head=None,
+            index_dirty=RecoveryStatus.UNKNOWN,
+            staged_paths=(),
+            staged_paths_complete=RecoveryStatus.UNKNOWN,
+            worktree_dirty=RecoveryStatus.UNKNOWN,
+        )
+
+
+def test_restart_observation_rejects_non_directory_target_with_identity_or_deeper_worktree_facts() -> (
+    None
+):
+    """A non-directory target cannot expose validated worktree identity or deeper state."""
+
+    with pytest.raises(ConfigurationError, match="target observation"):
+        WorktreeRestartObservation(
+            observed_source_head="a" * 40,
+            observed_source_branch="main",
+            branch_present=RecoveryStatus.NO,
+            observed_branch_head=None,
+            registered=RecoveryStatus.YES,
+            observed_registered_branch=None,
+            observed_registered_head=None,
+            registration_locked=RecoveryStatus.NO,
+            registration_prunable=RecoveryStatus.NO,
+            target_present=RecoveryStatus.YES,
+            target_is_directory=RecoveryStatus.NO,
+            worktree_identity_valid=RecoveryStatus.YES,
+            observed_worktree_branch="agent/task",
+            observed_worktree_head="c" * 40,
+            index_dirty=RecoveryStatus.NO,
+            staged_paths=(),
+            staged_paths_complete=RecoveryStatus.YES,
+            worktree_dirty=RecoveryStatus.NO,
+        )
+
+
+@pytest.mark.parametrize("identity", [RecoveryStatus.NO, RecoveryStatus.UNKNOWN])
+def test_restart_observation_rejects_deeper_worktree_evidence_without_valid_identity(
+    identity: RecoveryStatus,
+) -> None:
+    """Worktree identity gates worktree branch, head, index, and dirtiness evidence."""
+
+    with pytest.raises(ConfigurationError, match="worktree-state observation"):
+        WorktreeRestartObservation(
+            observed_source_head="a" * 40,
+            observed_source_branch="main",
+            branch_present=RecoveryStatus.NO,
+            observed_branch_head=None,
+            registered=RecoveryStatus.YES,
+            observed_registered_branch=None,
+            observed_registered_head=None,
+            registration_locked=RecoveryStatus.NO,
+            registration_prunable=RecoveryStatus.NO,
+            target_present=RecoveryStatus.YES,
+            target_is_directory=RecoveryStatus.YES,
+            worktree_identity_valid=identity,
+            observed_worktree_branch="agent/task",
+            observed_worktree_head="c" * 40,
+            index_dirty=RecoveryStatus.NO,
+            staged_paths=(),
+            staged_paths_complete=RecoveryStatus.YES,
+            worktree_dirty=RecoveryStatus.NO,
+        )
+
+
+def test_restart_observation_accepts_complete_clean_and_complete_dirty_staged_states() -> (
+    None
+):
+    """Allow the exact complete clean and complete dirty staged-state representations."""
+
+    clean = WorktreeRestartObservation(
+        observed_source_head="a" * 40,
+        observed_source_branch="main",
+        branch_present=RecoveryStatus.NO,
+        observed_branch_head=None,
+        registered=RecoveryStatus.YES,
+        observed_registered_branch=None,
+        observed_registered_head=None,
+        registration_locked=RecoveryStatus.NO,
+        registration_prunable=RecoveryStatus.NO,
+        target_present=RecoveryStatus.YES,
+        target_is_directory=RecoveryStatus.YES,
+        worktree_identity_valid=RecoveryStatus.YES,
+        observed_worktree_branch=None,
+        observed_worktree_head=None,
+        index_dirty=RecoveryStatus.NO,
+        staged_paths=(),
+        staged_paths_complete=RecoveryStatus.YES,
+        worktree_dirty=RecoveryStatus.NO,
+    )
+    assert clean.index_dirty is RecoveryStatus.NO
+
+    dirty = WorktreeRestartObservation(
+        observed_source_head="a" * 40,
+        observed_source_branch="main",
+        branch_present=RecoveryStatus.NO,
+        observed_branch_head=None,
+        registered=RecoveryStatus.YES,
+        observed_registered_branch=None,
+        observed_registered_head=None,
+        registration_locked=RecoveryStatus.NO,
+        registration_prunable=RecoveryStatus.NO,
+        target_present=RecoveryStatus.YES,
+        target_is_directory=RecoveryStatus.YES,
+        worktree_identity_valid=RecoveryStatus.YES,
+        observed_worktree_branch=None,
+        observed_worktree_head=None,
+        index_dirty=RecoveryStatus.YES,
+        staged_paths=("tracked.txt",),
+        staged_paths_complete=RecoveryStatus.YES,
+        worktree_dirty=RecoveryStatus.YES,
+    )
+    assert dirty.staged_paths == ("tracked.txt",)
+
+
+@pytest.mark.parametrize(
+    ("index_dirty", "staged_paths", "staged_paths_complete"),
+    [
+        (RecoveryStatus.YES, (), RecoveryStatus.YES),
+        (RecoveryStatus.UNKNOWN, (), RecoveryStatus.YES),
+        (RecoveryStatus.YES, ("tracked.txt",), RecoveryStatus.UNKNOWN),
+        (RecoveryStatus.NO, (), RecoveryStatus.UNKNOWN),
+    ],
+)
+def test_restart_observation_rejects_inconsistent_staged_path_combinations(
+    index_dirty: RecoveryStatus,
+    staged_paths: tuple[str, ...],
+    staged_paths_complete: RecoveryStatus,
+) -> None:
+    """Reject incomplete or contradictory staged-path evidence combinations."""
+
+    with pytest.raises(ConfigurationError, match="staged-path observation"):
+        WorktreeRestartObservation(
+            observed_source_head="a" * 40,
+            observed_source_branch="main",
+            branch_present=RecoveryStatus.NO,
+            observed_branch_head=None,
+            registered=RecoveryStatus.YES,
+            observed_registered_branch=None,
+            observed_registered_head=None,
+            registration_locked=RecoveryStatus.NO,
+            registration_prunable=RecoveryStatus.NO,
+            target_present=RecoveryStatus.YES,
+            target_is_directory=RecoveryStatus.YES,
+            worktree_identity_valid=RecoveryStatus.YES,
+            observed_worktree_branch=None,
+            observed_worktree_head=None,
+            index_dirty=index_dirty,
+            staged_paths=staged_paths,
+            staged_paths_complete=staged_paths_complete,
+            worktree_dirty=RecoveryStatus.YES,
+        )
+
+
+def test_restart_observation_accepts_incomplete_unsafe_name_representation() -> None:
+    """Allow dirty-but-incomplete staged evidence when unsafe names cannot be exposed."""
+
+    observation = WorktreeRestartObservation(
+        observed_source_head="a" * 40,
+        observed_source_branch="main",
+        branch_present=RecoveryStatus.NO,
+        observed_branch_head=None,
+        registered=RecoveryStatus.YES,
+        observed_registered_branch=None,
+        observed_registered_head=None,
+        registration_locked=RecoveryStatus.NO,
+        registration_prunable=RecoveryStatus.NO,
+        target_present=RecoveryStatus.YES,
+        target_is_directory=RecoveryStatus.YES,
+        worktree_identity_valid=RecoveryStatus.YES,
+        observed_worktree_branch=None,
+        observed_worktree_head=None,
+        index_dirty=RecoveryStatus.YES,
+        staged_paths=(),
+        staged_paths_complete=RecoveryStatus.UNKNOWN,
+        worktree_dirty=RecoveryStatus.YES,
+    )
+
+    assert observation.index_dirty is RecoveryStatus.YES
+    assert observation.staged_paths_complete is RecoveryStatus.UNKNOWN
+
+
+@pytest.mark.parametrize(
+    ("index_dirty", "worktree_dirty"),
+    [
+        (RecoveryStatus.YES, RecoveryStatus.NO),
+        (RecoveryStatus.YES, RecoveryStatus.UNKNOWN),
+        (RecoveryStatus.UNKNOWN, RecoveryStatus.NO),
+    ],
+)
+def test_restart_observation_rejects_inconsistent_worktree_dirtiness(
+    index_dirty: RecoveryStatus,
+    worktree_dirty: RecoveryStatus,
+) -> None:
+    """Staged dirtiness implies worktree dirtiness, and a clean worktree implies a clean index."""
+
+    with pytest.raises(ConfigurationError, match="worktree-dirty observation"):
+        WorktreeRestartObservation(
+            observed_source_head="a" * 40,
+            observed_source_branch="main",
+            branch_present=RecoveryStatus.NO,
+            observed_branch_head=None,
+            registered=RecoveryStatus.YES,
+            observed_registered_branch=None,
+            observed_registered_head=None,
+            registration_locked=RecoveryStatus.NO,
+            registration_prunable=RecoveryStatus.NO,
+            target_present=RecoveryStatus.YES,
+            target_is_directory=RecoveryStatus.YES,
+            worktree_identity_valid=RecoveryStatus.YES,
+            observed_worktree_branch=None,
+            observed_worktree_head=None,
+            index_dirty=index_dirty,
+            staged_paths=()
+            if index_dirty is not RecoveryStatus.YES
+            else ("tracked.txt",),
+            staged_paths_complete=(
+                RecoveryStatus.UNKNOWN
+                if index_dirty is RecoveryStatus.UNKNOWN
+                else RecoveryStatus.YES
+            ),
+            worktree_dirty=worktree_dirty,
+        )
+
+
+def test_restart_inspection_rejects_invalid_source_type() -> None:
+    """Require a Path for the restart source API."""
+
+    with pytest.raises(ConfigurationError, match="Path"):
+        inspect_worktree_restart_state(
+            "not-a-path",  # type: ignore[arg-type]
+            "../isolated",
+            "agent/task",
+        )
+
+
+@pytest.mark.parametrize("kind", ["subdirectory", "bare", "linked"])
+def test_restart_source_must_be_exact_primary_non_bare_git_working_tree(
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    """Accept only the exact primary non-bare Git top-level for restart inspection."""
+
+    if kind == "bare":
+        source = tmp_path / "bare.git"
+        source.mkdir()
+        run_git(source, "init", "--bare")
+    else:
+        source = create_repository(tmp_path / "source")
+        if kind == "subdirectory":
+            source = source / "nested"
+            source.mkdir()
+        else:
+            linked = tmp_path / "linked"
+            run_git(source, "worktree", "add", "-b", "linked-source", str(linked))
+            source = linked
+
+    with pytest.raises(ConfigurationError, match="primary|top-level|Git repository"):
+        inspect_worktree_restart_state(source, "../isolated", "agent/task")
+
+
+def test_restart_observes_dirty_advanced_source_and_existing_branch(
+    tmp_path: Path,
+) -> None:
+    """Observe current source facts without requiring source cleanliness or branch absence."""
+
+    source = create_repository(tmp_path / "source")
+    (source / "advanced.txt").write_text("advanced\n", encoding="utf-8")
+    run_git(source, "add", "advanced.txt")
+    run_git(source, "commit", "-m", "advance")
+    advanced_head = run_git(source, "rev-parse", "HEAD").stdout.strip()
+    run_git(source, "branch", "agent/existing")
+    (source / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+
+    observation = inspect_worktree_restart_state(
+        source,
+        "../missing-worktree",
+        "agent/existing",
+    )
+
+    assert observation.observed_source_head == advanced_head
+    assert observation.observed_source_branch == "main"
+    assert observation.branch_present is RecoveryStatus.YES
+    assert observation.observed_branch_head == advanced_head
+    assert observation.registered is RecoveryStatus.NO
+
+
+def test_restart_no_registration_match_never_uses_target_display_as_filesystem_authority(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Do not lstat or run Git against a guessed path derived from persisted display."""
+
+    source = create_repository(tmp_path / "source")
+    target_display = "../../should-not-be-probed"
+    guessed_target = source / target_display
+    from agent_workbench import worktrees
+
+    lstat_paths: list[Path] = []
+    original_lstat = worktrees.os.lstat
+    original_run_git = worktrees._run_git
+    git_repositories: list[Path] = []
+    git_arguments: list[tuple[str, ...]] = []
+
+    def recording_lstat(path):
+        candidate = Path(path)
+        lstat_paths.append(candidate)
+        if candidate == guessed_target:
+            raise AssertionError("guessed target must not be probed")
+        return original_lstat(path)
+
+    def recording_run_git(repository, arguments):
+        git_repositories.append(repository)
+        git_arguments.append(tuple(arguments))
+        if repository == guessed_target:
+            raise AssertionError("guessed target must not be used for Git inspection")
+        return original_run_git(repository, arguments)
+
+    monkeypatch.setattr(worktrees.os, "lstat", recording_lstat)
+    monkeypatch.setattr(worktrees, "_run_git", recording_run_git)
+
+    observation = inspect_worktree_restart_state(
+        source,
+        target_display,
+        "agent/missing",
+    )
+
+    assert observation.registered is RecoveryStatus.NO
+    assert observation.target_present is RecoveryStatus.UNKNOWN
+    assert observation.target_is_directory is RecoveryStatus.UNKNOWN
+    assert observation.worktree_identity_valid is RecoveryStatus.UNKNOWN
+    assert guessed_target not in lstat_paths
+    assert all(repository == source.resolve() for repository in git_repositories)
+    forbidden = {
+        "add",
+        "commit",
+        "reset",
+        "restore",
+        "clean",
+        "stash",
+        "checkout",
+        "switch",
+        "merge",
+        "rebase",
+        "fetch",
+        "pull",
+        "push",
+    }
+    assert not any(forbidden.intersection(arguments) for arguments in git_arguments)
+
+
+def test_restart_observes_absent_branch_without_registration_match(
+    tmp_path: Path,
+) -> None:
+    """Report exact local branch absence independently of worktree registration."""
+
+    source = create_repository(tmp_path / "source")
+
+    observation = inspect_worktree_restart_state(
+        source,
+        "../missing-worktree",
+        "agent/absent",
+    )
+
+    assert observation.branch_present is RecoveryStatus.NO
+    assert observation.observed_branch_head is None
+    assert observation.registered is RecoveryStatus.NO
+
+
+def test_restart_matches_registration_by_derived_display_and_observes_worktree_state(
+    tmp_path: Path,
+) -> None:
+    """Match registration by Git-reported path display and inspect the exact worktree."""
+
+    source, _plan, handle = create_approved_worktree(tmp_path, branch="agent/restart")
+
+    observation = inspect_worktree_restart_state(
+        source,
+        handle.target_display,
+        handle.branch_name,
+    )
+
+    assert observation.registered is RecoveryStatus.YES
+    assert observation.observed_registered_branch == handle.branch_name
+    assert observation.observed_registered_head == handle.source_head
+    assert observation.registration_locked is RecoveryStatus.NO
+    assert observation.registration_prunable is RecoveryStatus.NO
+    assert observation.target_present is RecoveryStatus.YES
+    assert observation.target_is_directory is RecoveryStatus.YES
+    assert observation.worktree_identity_valid is RecoveryStatus.YES
+    assert observation.observed_worktree_branch == handle.branch_name
+    assert observation.observed_worktree_head == handle.source_head
+    assert observation.index_dirty is RecoveryStatus.NO
+    assert observation.staged_paths == ()
+    assert observation.staged_paths_complete is RecoveryStatus.YES
+    assert observation.worktree_dirty is RecoveryStatus.NO
+    assert str(source.resolve()) not in repr(observation)
+    assert str(handle.worktree_path) not in repr(observation)
+
+
+def test_restart_observes_locked_registration_without_mutation(
+    tmp_path: Path,
+) -> None:
+    """Expose lock state from the matched registered worktree record."""
+
+    source, _plan, handle = create_approved_worktree(tmp_path, branch="agent/locked")
+    run_git(source, "worktree", "lock", str(handle.worktree_path))
+
+    observation = inspect_worktree_restart_state(
+        source,
+        handle.target_display,
+        handle.branch_name,
+    )
+
+    assert observation.registered is RecoveryStatus.YES
+    assert observation.registration_locked is RecoveryStatus.YES
+
+
+def test_restart_missing_registered_target_keeps_deeper_facts_unknown(
+    tmp_path: Path,
+) -> None:
+    """Do not inspect deeper worktree facts when the registered target is missing."""
+
+    source, _plan, handle = create_approved_worktree(
+        tmp_path, branch="agent/missing-target"
+    )
+    shutil.rmtree(handle.worktree_path)
+
+    observation = inspect_worktree_restart_state(
+        source,
+        handle.target_display,
+        handle.branch_name,
+    )
+
+    assert observation.registered is RecoveryStatus.YES
+    assert observation.target_present is RecoveryStatus.NO
+    assert observation.target_is_directory is RecoveryStatus.NO
+    assert observation.worktree_identity_valid is RecoveryStatus.UNKNOWN
+    assert observation.observed_worktree_branch is None
+    assert observation.observed_worktree_head is None
+    assert observation.index_dirty is RecoveryStatus.UNKNOWN
+    assert observation.staged_paths_complete is RecoveryStatus.UNKNOWN
+    assert observation.worktree_dirty is RecoveryStatus.UNKNOWN
+
+
+def test_restart_does_not_follow_symlink_or_special_targets(
+    tmp_path: Path,
+) -> None:
+    """Reject symlinked or non-directory targets without using them as worktrees."""
+
+    source, _plan, handle = create_approved_worktree(tmp_path, branch="agent/non-dir")
+    shutil.rmtree(handle.worktree_path)
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    handle.worktree_path.symlink_to(replacement, target_is_directory=True)
+
+    observation = inspect_worktree_restart_state(
+        source,
+        handle.target_display,
+        handle.branch_name,
+    )
+
+    assert observation.registered is RecoveryStatus.YES
+    assert observation.target_present is RecoveryStatus.YES
+    assert observation.target_is_directory is RecoveryStatus.NO
+    assert observation.worktree_identity_valid is RecoveryStatus.UNKNOWN
+
+    handle.worktree_path.unlink()
+    handle.worktree_path.write_text("not a directory\n", encoding="utf-8")
+
+    file_observation = inspect_worktree_restart_state(
+        source,
+        handle.target_display,
+        handle.branch_name,
+    )
+
+    assert file_observation.target_present is RecoveryStatus.YES
+    assert file_observation.target_is_directory is RecoveryStatus.NO
+    assert file_observation.worktree_identity_valid is RecoveryStatus.UNKNOWN
+
+
+def test_restart_observes_detached_branch_and_safe_staged_paths(
+    tmp_path: Path,
+) -> None:
+    """Observe detached worktree branch state and exact safe staged paths."""
+
+    source, _plan, handle = create_approved_worktree(tmp_path, branch="agent/staged")
+    (handle.worktree_path / "tracked.txt").write_text("changed\n", encoding="utf-8")
+    run_git(handle.worktree_path, "add", "tracked.txt")
+
+    staged = inspect_worktree_restart_state(
+        source,
+        handle.target_display,
+        handle.branch_name,
+    )
+
+    assert staged.index_dirty is RecoveryStatus.YES
+    assert staged.staged_paths == ("tracked.txt",)
+    assert staged.staged_paths_complete is RecoveryStatus.YES
+    assert staged.worktree_dirty is RecoveryStatus.YES
+
+    run_git(handle.worktree_path, "reset", "--hard", "HEAD")
+    run_git(handle.worktree_path, "switch", "--detach")
+    detached = inspect_worktree_restart_state(
+        source,
+        handle.target_display,
+        handle.branch_name,
+    )
+
+    assert detached.worktree_identity_valid is RecoveryStatus.YES
+    assert detached.observed_worktree_branch is None
+    assert detached.observed_worktree_head is not None
+
+
+def test_restart_hides_unsafe_staged_names_and_keeps_completeness_conservative(
+    tmp_path: Path,
+) -> None:
+    """Do not expose unsafe staged path names from restart observation."""
+
+    source, _plan, handle = create_approved_worktree(
+        tmp_path, branch="agent/unsafe-stage"
+    )
+    unsafe = handle.worktree_path / "bad\nname.txt"
+    unsafe.write_text("unsafe\n", encoding="utf-8")
+    run_git(handle.worktree_path, "add", "--", unsafe.name)
+
+    observation = inspect_worktree_restart_state(
+        source,
+        handle.target_display,
+        handle.branch_name,
+    )
+
+    assert observation.index_dirty is RecoveryStatus.YES
+    assert observation.staged_paths == ()
+    assert observation.staged_paths_complete is RecoveryStatus.UNKNOWN
+    assert observation.worktree_dirty is RecoveryStatus.YES
+    assert "bad\nname.txt" not in repr(observation)
+
+
+def test_restart_worktree_dirty_observes_unstaged_untracked_and_clean_states(
+    tmp_path: Path,
+) -> None:
+    """Observe clean, unstaged, and untracked dirtiness without staging mutation."""
+
+    source, _plan, handle = create_approved_worktree(
+        tmp_path, branch="agent/dirty-states"
+    )
+
+    clean = inspect_worktree_restart_state(
+        source,
+        handle.target_display,
+        handle.branch_name,
+    )
+    assert clean.worktree_dirty is RecoveryStatus.NO
+
+    (handle.worktree_path / "tracked.txt").write_text("dirty\n", encoding="utf-8")
+    unstaged = inspect_worktree_restart_state(
+        source,
+        handle.target_display,
+        handle.branch_name,
+    )
+    assert unstaged.worktree_dirty is RecoveryStatus.YES
+
+    run_git(handle.worktree_path, "checkout", "--", "tracked.txt")
+    (handle.worktree_path / "untracked.txt").write_text("new\n", encoding="utf-8")
+    untracked = inspect_worktree_restart_state(
+        source,
+        handle.target_display,
+        handle.branch_name,
+    )
+    assert untracked.worktree_dirty is RecoveryStatus.YES
+
+
+def test_restart_observation_uses_unknown_when_runtime_inspection_fails(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Report unknown facts rather than fabricating data when safe inspection fails."""
+
+    source, _plan, handle = create_approved_worktree(tmp_path, branch="agent/unknowns")
+    from agent_workbench import worktrees
+
+    original_run_git = worktrees._run_git
+
+    def failing_run_git(repository, arguments):
+        arguments = tuple(arguments)
+        if arguments[:2] == ("worktree", "list"):
+            return worktrees._GitOutput(2, "", "injected")
+        return original_run_git(repository, arguments)
+
+    monkeypatch.setattr(worktrees, "_run_git", failing_run_git)
+
+    observation = inspect_worktree_restart_state(
+        source,
+        handle.target_display,
+        handle.branch_name,
+    )
+
+    assert observation.registered is RecoveryStatus.UNKNOWN
+    assert observation.registration_locked is RecoveryStatus.UNKNOWN
+    assert observation.registration_prunable is RecoveryStatus.UNKNOWN
+    assert observation.target_present is RecoveryStatus.UNKNOWN
+    assert observation.worktree_identity_valid is RecoveryStatus.UNKNOWN
