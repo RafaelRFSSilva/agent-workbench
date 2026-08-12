@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import signal
 import stat
 import subprocess
@@ -217,6 +217,279 @@ class WorktreeState:
 
 
 @dataclass(frozen=True, slots=True, init=False)
+class WorktreeRestartObservation:
+    """Store bounded factual restart observations for one expected worktree."""
+
+    observed_source_head: str | None
+    observed_source_branch: str | None
+
+    branch_present: RecoveryStatus
+    observed_branch_head: str | None
+
+    registered: RecoveryStatus
+    observed_registered_branch: str | None
+    observed_registered_head: str | None
+    registration_locked: RecoveryStatus
+    registration_prunable: RecoveryStatus
+
+    target_present: RecoveryStatus
+    target_is_directory: RecoveryStatus
+    worktree_identity_valid: RecoveryStatus
+
+    observed_worktree_branch: str | None
+    observed_worktree_head: str | None
+
+    index_dirty: RecoveryStatus
+    staged_paths: tuple[str, ...]
+    staged_paths_complete: RecoveryStatus
+    worktree_dirty: RecoveryStatus
+
+    def __init__(
+        self,
+        *,
+        observed_source_head: str | None,
+        observed_source_branch: str | None,
+        branch_present: RecoveryStatus,
+        observed_branch_head: str | None,
+        registered: RecoveryStatus,
+        observed_registered_branch: str | None,
+        observed_registered_head: str | None,
+        registration_locked: RecoveryStatus,
+        registration_prunable: RecoveryStatus,
+        target_present: RecoveryStatus,
+        target_is_directory: RecoveryStatus,
+        worktree_identity_valid: RecoveryStatus,
+        observed_worktree_branch: str | None,
+        observed_worktree_head: str | None,
+        index_dirty: RecoveryStatus,
+        staged_paths: tuple[str, ...],
+        staged_paths_complete: RecoveryStatus,
+        worktree_dirty: RecoveryStatus,
+    ) -> None:
+        """Validate and snapshot one restart observation."""
+
+        for name, value in (
+            ("branch present", branch_present),
+            ("registered", registered),
+            ("registration locked", registration_locked),
+            ("registration prunable", registration_prunable),
+            ("target present", target_present),
+            ("target is directory", target_is_directory),
+            ("worktree identity", worktree_identity_valid),
+            ("index dirty", index_dirty),
+            ("staged path completeness", staged_paths_complete),
+            ("worktree dirty", worktree_dirty),
+        ):
+            if not isinstance(value, RecoveryStatus):
+                raise ConfigurationError(
+                    f"worktree restart {name} state must be a RecoveryStatus."
+                )
+
+        safe_observed_source_head = _validate_optional_object_id(
+            observed_source_head,
+            field_name="observed source HEAD",
+        )
+        safe_observed_source_branch = _validate_optional_branch(
+            observed_source_branch,
+            field_name="observed source branch",
+        )
+        safe_observed_branch_head = _validate_optional_object_id(
+            observed_branch_head,
+            field_name="observed branch HEAD",
+        )
+        safe_observed_registered_branch = _validate_optional_branch(
+            observed_registered_branch,
+            field_name="observed registered branch",
+        )
+        safe_observed_registered_head = _validate_optional_object_id(
+            observed_registered_head,
+            field_name="observed registered HEAD",
+        )
+        safe_observed_worktree_branch = _validate_optional_branch(
+            observed_worktree_branch,
+            field_name="observed worktree branch",
+        )
+        safe_observed_worktree_head = _validate_optional_object_id(
+            observed_worktree_head,
+            field_name="observed worktree HEAD",
+        )
+        safe_staged_paths = _snapshot_restart_staged_paths(staged_paths)
+
+        if (
+            branch_present is not RecoveryStatus.YES
+            and safe_observed_branch_head is not None
+        ):
+            raise ConfigurationError(
+                "worktree restart branch observation is internally inconsistent."
+            )
+
+        if registered is RecoveryStatus.NO:
+            if (
+                safe_observed_registered_branch is not None
+                or safe_observed_registered_head is not None
+                or registration_locked is not RecoveryStatus.NO
+                or registration_prunable is not RecoveryStatus.NO
+            ):
+                raise ConfigurationError(
+                    "worktree restart registration observation is internally inconsistent."
+                )
+        elif registered is RecoveryStatus.UNKNOWN:
+            if (
+                safe_observed_registered_branch is not None
+                or safe_observed_registered_head is not None
+                or registration_locked is not RecoveryStatus.UNKNOWN
+                or registration_prunable is not RecoveryStatus.UNKNOWN
+            ):
+                raise ConfigurationError(
+                    "worktree restart registration observation is internally inconsistent."
+                )
+        elif (
+            registration_locked is RecoveryStatus.UNKNOWN
+            or registration_prunable is RecoveryStatus.UNKNOWN
+        ):
+            raise ConfigurationError(
+                "worktree restart registration observation is internally inconsistent."
+            )
+
+        if registered is not RecoveryStatus.YES:
+            if (
+                target_present is not RecoveryStatus.UNKNOWN
+                or target_is_directory is not RecoveryStatus.UNKNOWN
+                or worktree_identity_valid is not RecoveryStatus.UNKNOWN
+                or safe_observed_worktree_branch is not None
+                or safe_observed_worktree_head is not None
+                or index_dirty is not RecoveryStatus.UNKNOWN
+                or safe_staged_paths
+                or staged_paths_complete is not RecoveryStatus.UNKNOWN
+                or worktree_dirty is not RecoveryStatus.UNKNOWN
+            ):
+                raise ConfigurationError(
+                    "worktree restart target observation is internally inconsistent."
+                )
+
+        if target_present is RecoveryStatus.NO:
+            if (
+                target_is_directory is not RecoveryStatus.NO
+                or worktree_identity_valid is not RecoveryStatus.UNKNOWN
+                or safe_observed_worktree_branch is not None
+                or safe_observed_worktree_head is not None
+                or index_dirty is not RecoveryStatus.UNKNOWN
+                or safe_staged_paths
+                or staged_paths_complete is not RecoveryStatus.UNKNOWN
+                or worktree_dirty is not RecoveryStatus.UNKNOWN
+            ):
+                raise ConfigurationError(
+                    "worktree restart target observation is internally inconsistent."
+                )
+
+        if target_present is RecoveryStatus.UNKNOWN:
+            if (
+                target_is_directory is not RecoveryStatus.UNKNOWN
+                or worktree_identity_valid is not RecoveryStatus.UNKNOWN
+                or safe_observed_worktree_branch is not None
+                or safe_observed_worktree_head is not None
+                or index_dirty is not RecoveryStatus.UNKNOWN
+                or safe_staged_paths
+                or staged_paths_complete is not RecoveryStatus.UNKNOWN
+                or worktree_dirty is not RecoveryStatus.UNKNOWN
+            ):
+                raise ConfigurationError(
+                    "worktree restart target observation is internally inconsistent."
+                )
+
+        if target_is_directory is not RecoveryStatus.YES:
+            if (
+                worktree_identity_valid is not RecoveryStatus.UNKNOWN
+                or safe_observed_worktree_branch is not None
+                or safe_observed_worktree_head is not None
+                or index_dirty is not RecoveryStatus.UNKNOWN
+                or safe_staged_paths
+                or staged_paths_complete is not RecoveryStatus.UNKNOWN
+                or worktree_dirty is not RecoveryStatus.UNKNOWN
+            ):
+                raise ConfigurationError(
+                    "worktree restart target observation is internally inconsistent."
+                )
+
+        if worktree_identity_valid is not RecoveryStatus.YES:
+            if (
+                safe_observed_worktree_branch is not None
+                or safe_observed_worktree_head is not None
+                or index_dirty is not RecoveryStatus.UNKNOWN
+                or safe_staged_paths
+                or staged_paths_complete is not RecoveryStatus.UNKNOWN
+                or worktree_dirty is not RecoveryStatus.UNKNOWN
+            ):
+                raise ConfigurationError(
+                    "worktree restart worktree-state observation is internally inconsistent."
+                )
+
+        if staged_paths_complete is RecoveryStatus.YES:
+            if index_dirty is RecoveryStatus.UNKNOWN:
+                raise ConfigurationError(
+                    "worktree restart staged-path observation is internally inconsistent."
+                )
+            if index_dirty is RecoveryStatus.NO:
+                if safe_staged_paths:
+                    raise ConfigurationError(
+                        "worktree restart staged-path observation is internally inconsistent."
+                    )
+            elif not safe_staged_paths:
+                raise ConfigurationError(
+                    "worktree restart staged-path observation is internally inconsistent."
+                )
+        elif staged_paths_complete is RecoveryStatus.UNKNOWN:
+            if safe_staged_paths or index_dirty is RecoveryStatus.NO:
+                raise ConfigurationError(
+                    "worktree restart staged-path observation is internally inconsistent."
+                )
+        else:
+            raise ConfigurationError(
+                "worktree restart staged-path observation is internally inconsistent."
+            )
+
+        if staged_paths_complete is not RecoveryStatus.YES and safe_staged_paths:
+            raise ConfigurationError(
+                "worktree restart staged-path observation is internally inconsistent."
+            )
+
+        if (
+            index_dirty is RecoveryStatus.YES
+            and worktree_dirty is not RecoveryStatus.YES
+        ):
+            raise ConfigurationError(
+                "worktree restart worktree-dirty observation is internally inconsistent."
+            )
+        if worktree_dirty is RecoveryStatus.NO and index_dirty is not RecoveryStatus.NO:
+            raise ConfigurationError(
+                "worktree restart worktree-dirty observation is internally inconsistent."
+            )
+
+        values = {
+            "observed_source_head": safe_observed_source_head,
+            "observed_source_branch": safe_observed_source_branch,
+            "branch_present": branch_present,
+            "observed_branch_head": safe_observed_branch_head,
+            "registered": registered,
+            "observed_registered_branch": safe_observed_registered_branch,
+            "observed_registered_head": safe_observed_registered_head,
+            "registration_locked": registration_locked,
+            "registration_prunable": registration_prunable,
+            "target_present": target_present,
+            "target_is_directory": target_is_directory,
+            "worktree_identity_valid": worktree_identity_valid,
+            "observed_worktree_branch": safe_observed_worktree_branch,
+            "observed_worktree_head": safe_observed_worktree_head,
+            "index_dirty": index_dirty,
+            "staged_paths": safe_staged_paths,
+            "staged_paths_complete": staged_paths_complete,
+            "worktree_dirty": worktree_dirty,
+        }
+        for name, value in values.items():
+            object.__setattr__(self, name, value)
+
+
+@dataclass(frozen=True, slots=True, init=False)
 class WorktreeRemovalPlan:
     """Pin one verified clean worktree removal request."""
 
@@ -295,6 +568,7 @@ class _GitOutput:
 class _WorktreeRecord:
     """Store the identity and exceptional flags of one registered worktree."""
 
+    reported_path: Path = field(repr=False)
     path: Path
     head: str | None
     branch: str | None
@@ -415,6 +689,74 @@ def inspect_git_worktree(handle: WorktreeHandle) -> WorktreeState:
     if not isinstance(handle, WorktreeHandle):
         raise ConfigurationError("worktree inspection requires a WorktreeHandle.")
     return _inspect_worktree_identity(handle)
+
+
+def inspect_worktree_restart_state(
+    source_repository: Path,
+    target_display: str,
+    branch_name: str,
+) -> WorktreeRestartObservation:
+    """Observe current restart-time Git and worktree facts without mutation."""
+
+    source = _validate_source_path(source_repository)
+    safe_target_display = _validate_restart_target_display(target_display)
+    _validate_restart_branch_name(source, branch_name)
+    _validate_restart_source_repository(source)
+
+    observed_source_head = _observe_source_head(source)
+    observed_source_branch = _observe_source_branch(source)
+    branch_present, observed_branch_head = _observe_branch_ref(source, branch_name)
+    registration = _observe_registered_restart_target(source, safe_target_display)
+
+    target_present = RecoveryStatus.UNKNOWN
+    target_is_directory = RecoveryStatus.UNKNOWN
+    worktree_identity_valid = RecoveryStatus.UNKNOWN
+    observed_worktree_branch: str | None = None
+    observed_worktree_head: str | None = None
+    index_dirty = RecoveryStatus.UNKNOWN
+    staged_paths: tuple[str, ...] = ()
+    staged_paths_complete = RecoveryStatus.UNKNOWN
+    worktree_dirty = RecoveryStatus.UNKNOWN
+
+    target_path = registration.target_path
+    if registration.registered is RecoveryStatus.YES and target_path is not None:
+        target_present, target_is_directory = _observe_target_path(target_path)
+        if (
+            target_present is RecoveryStatus.YES
+            and target_is_directory is RecoveryStatus.YES
+        ):
+            worktree_identity_valid = _observe_worktree_top_level(target_path)
+            if worktree_identity_valid is RecoveryStatus.YES:
+                observed_worktree_head = _observe_worktree_head(target_path)
+                observed_worktree_branch = _observe_worktree_branch(target_path)
+                index_dirty, staged_paths, staged_paths_complete = (
+                    _observe_staged_paths(target_path)
+                )
+                worktree_dirty = _observe_worktree_dirty(
+                    target_path,
+                    index_dirty=index_dirty,
+                )
+
+    return WorktreeRestartObservation(
+        observed_source_head=observed_source_head,
+        observed_source_branch=observed_source_branch,
+        branch_present=branch_present,
+        observed_branch_head=observed_branch_head,
+        registered=registration.registered,
+        observed_registered_branch=registration.observed_registered_branch,
+        observed_registered_head=registration.observed_registered_head,
+        registration_locked=registration.registration_locked,
+        registration_prunable=registration.registration_prunable,
+        target_present=target_present,
+        target_is_directory=target_is_directory,
+        worktree_identity_valid=worktree_identity_valid,
+        observed_worktree_branch=observed_worktree_branch,
+        observed_worktree_head=observed_worktree_head,
+        index_dirty=index_dirty,
+        staged_paths=staged_paths,
+        staged_paths_complete=staged_paths_complete,
+        worktree_dirty=worktree_dirty,
+    )
 
 
 def plan_git_worktree_removal(
@@ -897,6 +1239,457 @@ def _validate_source_path(source_repository: object) -> Path:
     return source
 
 
+def _validate_restart_source_repository(source: Path) -> None:
+    """Validate the restart source as an exact primary non-bare Git worktree."""
+
+    top_level = _run_git(source, ("rev-parse", "--show-toplevel"))
+    if top_level.returncode != 0:
+        raise ConfigurationError("source repository is not a valid Git repository.")
+    try:
+        reported_top_level = Path(top_level.stdout.strip()).resolve(strict=True)
+    except (FileNotFoundError, OSError, RuntimeError):
+        raise ConfigurationError("source repository top-level is invalid.") from None
+    if reported_top_level != source:
+        raise ConfigurationError(
+            "source repository path must be the exact Git top-level."
+        )
+
+    bare = _run_git(source, ("rev-parse", "--is-bare-repository"))
+    if bare.returncode != 0 or bare.stdout.strip() != "false":
+        raise ConfigurationError(
+            "source repository must be a primary non-bare working tree."
+        )
+
+    unsafe_config = _run_git(
+        source,
+        (
+            "config",
+            "--local",
+            "--get-regexp",
+            _UNSAFE_LOCAL_CONFIG_PATTERN,
+        ),
+    )
+    if unsafe_config.returncode not in (0, 1):
+        raise ConfigurationError(
+            "unable to inspect repository-local Git configuration."
+        )
+    if unsafe_config.returncode == 0 and unsafe_config.stdout:
+        raise ConfigurationError(
+            "source repository contains unsafe local Git execution configuration."
+        )
+
+
+def _validate_restart_branch_name(source: Path, branch_name: object) -> None:
+    """Validate one exact local branch name for restart inspection."""
+
+    if not isinstance(branch_name, str):
+        raise ConfigurationError("restart branch name must be a string.")
+    if not branch_name.strip():
+        raise ConfigurationError("restart branch name must be non-blank.")
+    if branch_name.startswith("-"):
+        raise ConfigurationError("restart branch name must not be option-like.")
+    if branch_name == "HEAD":
+        raise ConfigurationError("restart branch name must be a valid local branch.")
+
+    checked = _run_git(
+        source,
+        ("check-ref-format", "--branch", branch_name),
+    )
+    if checked.returncode != 0:
+        raise ConfigurationError("restart branch name must be a valid local branch.")
+
+
+def _validate_restart_target_display(target_display: object) -> str:
+    """Validate a persisted relative worktree display for safe comparison only."""
+
+    if (
+        not isinstance(target_display, str)
+        or not target_display.strip()
+        or target_display == "."
+        or "\\" in target_display
+        or "\0" in target_display
+        or "\n" in target_display
+        or "\r" in target_display
+        or PurePosixPath(target_display).is_absolute()
+        or PureWindowsPath(target_display).is_absolute()
+    ):
+        raise ConfigurationError(
+            "restart target display must be a safe relative single-line POSIX string."
+        )
+    pure = PurePosixPath(target_display)
+    if str(pure) != target_display or any(part in ("", ".") for part in pure.parts):
+        raise ConfigurationError(
+            "restart target display must be a safe relative single-line POSIX string."
+        )
+    return target_display
+
+
+def _validate_optional_branch(value: object, *, field_name: str) -> str | None:
+    """Validate one optional observed branch name."""
+
+    if value is None:
+        return None
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or "\0" in value
+        or "\n" in value
+        or "\r" in value
+    ):
+        raise ConfigurationError(
+            f"worktree restart {field_name} must be a non-blank single-line string."
+        )
+    return value
+
+
+def _validate_optional_object_id(value: object, *, field_name: str) -> str | None:
+    """Validate one optional observed complete Git object identifier."""
+
+    if value is None:
+        return None
+    if not isinstance(value, str) or not _is_full_object_id(value):
+        raise ConfigurationError(
+            f"worktree restart {field_name} must be a complete Git object identifier."
+        )
+    return value
+
+
+def _snapshot_restart_staged_paths(paths: object) -> tuple[str, ...]:
+    """Validate and snapshot safe staged paths observed during restart inspection."""
+
+    if isinstance(paths, str):
+        raise ConfigurationError(
+            "restart staged paths must be an iterable of path strings."
+        )
+    try:
+        staged_paths = tuple(paths)
+    except TypeError as exc:
+        raise ConfigurationError("restart staged paths must be an iterable.") from exc
+
+    seen: set[str] = set()
+    for path in staged_paths:
+        if not isinstance(path, str) or not path.strip():
+            raise ConfigurationError(
+                "each restart staged path must be a non-blank string."
+            )
+        if "\\" in path or "\0" in path or "\n" in path or "\r" in path:
+            raise ConfigurationError(
+                "each restart staged path must be a canonical portable relative path."
+            )
+        pure = PurePosixPath(path)
+        if (
+            pure.is_absolute()
+            or str(pure) != path
+            or path in {".", ".."}
+            or ".." in pure.parts
+        ):
+            raise ConfigurationError(
+                "each restart staged path must be a canonical portable relative path."
+            )
+        if path in seen:
+            raise ConfigurationError(
+                "restart staged paths cannot contain duplicate entries."
+            )
+        seen.add(path)
+    return staged_paths
+
+
+def _observe_source_head(source: Path) -> str | None:
+    """Observe the current source HEAD if safely available."""
+
+    try:
+        output = _run_git(source, ("rev-parse", "--verify", "HEAD^{commit}"))
+    except ConfigurationError:
+        return None
+    head = output.stdout.strip()
+    return head if output.returncode == 0 and _is_full_object_id(head) else None
+
+
+def _observe_source_branch(source: Path) -> str | None:
+    """Observe the current attached source branch if safely available."""
+
+    try:
+        output = _run_git(source, ("symbolic-ref", "--quiet", "--short", "HEAD"))
+    except ConfigurationError:
+        return None
+    branch = output.stdout.strip()
+    return branch if output.returncode == 0 and branch else None
+
+
+def _observe_branch_ref(
+    source: Path, branch_name: str
+) -> tuple[RecoveryStatus, str | None]:
+    """Observe exact local branch presence and head without touching remotes."""
+
+    try:
+        present = _run_git(
+            source,
+            (
+                "show-ref",
+                "--verify",
+                "--quiet",
+                "--",
+                f"refs/heads/{branch_name}",
+            ),
+        )
+    except ConfigurationError:
+        return RecoveryStatus.UNKNOWN, None
+    if present.returncode == 1:
+        return RecoveryStatus.NO, None
+    if present.returncode != 0:
+        return RecoveryStatus.UNKNOWN, None
+
+    try:
+        head_output = _run_git(
+            source,
+            ("rev-parse", "--verify", f"refs/heads/{branch_name}^{{commit}}"),
+        )
+    except ConfigurationError:
+        return RecoveryStatus.YES, None
+    head = head_output.stdout.strip()
+    return (
+        RecoveryStatus.YES,
+        head if head_output.returncode == 0 and _is_full_object_id(head) else None,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _RestartRegistrationObservation:
+    """Carry derived registration observation facts for restart inspection."""
+
+    registered: RecoveryStatus
+    observed_registered_branch: str | None
+    observed_registered_head: str | None
+    registration_locked: RecoveryStatus
+    registration_prunable: RecoveryStatus
+    target_path: Path | None = field(repr=False)
+
+
+def _observe_registered_restart_target(
+    source: Path,
+    target_display: str,
+) -> _RestartRegistrationObservation:
+    """Match one registered worktree by derived display, not reconstructed path."""
+
+    try:
+        worktree_output = _run_git(source, ("worktree", "list", "--porcelain", "-z"))
+        if worktree_output.returncode != 0:
+            raise ConfigurationError
+        records = _parse_worktree_records(worktree_output.stdout)
+    except ConfigurationError:
+        return _RestartRegistrationObservation(
+            registered=RecoveryStatus.UNKNOWN,
+            observed_registered_branch=None,
+            observed_registered_head=None,
+            registration_locked=RecoveryStatus.UNKNOWN,
+            registration_prunable=RecoveryStatus.UNKNOWN,
+            target_path=None,
+        )
+
+    matches = []
+    for record in records:
+        derived_display = Path(os.path.relpath(record.reported_path, source)).as_posix()
+        if derived_display == target_display:
+            matches.append(record)
+
+    if not matches:
+        return _RestartRegistrationObservation(
+            registered=RecoveryStatus.NO,
+            observed_registered_branch=None,
+            observed_registered_head=None,
+            registration_locked=RecoveryStatus.NO,
+            registration_prunable=RecoveryStatus.NO,
+            target_path=None,
+        )
+    if len(matches) != 1:
+        return _RestartRegistrationObservation(
+            registered=RecoveryStatus.UNKNOWN,
+            observed_registered_branch=None,
+            observed_registered_head=None,
+            registration_locked=RecoveryStatus.UNKNOWN,
+            registration_prunable=RecoveryStatus.UNKNOWN,
+            target_path=None,
+        )
+
+    record = matches[0]
+    branch_prefix = "refs/heads/"
+    observed_registered_branch = None
+    if (
+        record.branch is not None
+        and record.branch.startswith(branch_prefix)
+        and record.branch != branch_prefix
+    ):
+        observed_registered_branch = record.branch.removeprefix(branch_prefix)
+
+    return _RestartRegistrationObservation(
+        registered=RecoveryStatus.YES,
+        observed_registered_branch=observed_registered_branch,
+        observed_registered_head=record.head,
+        registration_locked=RecoveryStatus.YES if record.locked else RecoveryStatus.NO,
+        registration_prunable=RecoveryStatus.YES
+        if record.prunable
+        else RecoveryStatus.NO,
+        target_path=record.reported_path,
+    )
+
+
+def _observe_target_path(target_path: Path) -> tuple[RecoveryStatus, RecoveryStatus]:
+    """Observe target presence and directory-ness without following symlinks."""
+
+    try:
+        target_status = os.lstat(target_path)
+    except FileNotFoundError:
+        return RecoveryStatus.NO, RecoveryStatus.NO
+    except OSError:
+        return RecoveryStatus.UNKNOWN, RecoveryStatus.UNKNOWN
+    if stat.S_ISDIR(target_status.st_mode):
+        return RecoveryStatus.YES, RecoveryStatus.YES
+    return RecoveryStatus.YES, RecoveryStatus.NO
+
+
+def _observe_worktree_top_level(target_path: Path) -> RecoveryStatus:
+    """Verify the target reports itself as the exact worktree top-level."""
+
+    try:
+        output = _run_git(target_path, ("rev-parse", "--show-toplevel"))
+    except ConfigurationError:
+        return RecoveryStatus.UNKNOWN
+    reported = output.stdout.strip()
+    if output.returncode != 0 or not reported:
+        return RecoveryStatus.UNKNOWN
+    if Path(os.path.abspath(reported)) == Path(os.path.abspath(target_path)):
+        return RecoveryStatus.YES
+    return RecoveryStatus.NO
+
+
+def _observe_worktree_head(target_path: Path) -> str | None:
+    """Observe the current worktree HEAD if safely available."""
+
+    try:
+        output = _run_git(target_path, ("rev-parse", "--verify", "HEAD^{commit}"))
+    except ConfigurationError:
+        return None
+    head = output.stdout.strip()
+    return head if output.returncode == 0 and _is_full_object_id(head) else None
+
+
+def _observe_worktree_branch(target_path: Path) -> str | None:
+    """Observe the current attached worktree branch if safely available."""
+
+    try:
+        output = _run_git(target_path, ("symbolic-ref", "--quiet", "--short", "HEAD"))
+    except ConfigurationError:
+        return None
+    branch = output.stdout.strip()
+    return branch if output.returncode == 0 and branch else None
+
+
+def _observe_staged_paths(
+    target_path: Path,
+) -> tuple[RecoveryStatus, tuple[str, ...], RecoveryStatus]:
+    """Observe staged paths conservatively without leaking unsafe names."""
+
+    try:
+        output = _run_git(
+            target_path,
+            (
+                "diff",
+                "--cached",
+                "--name-only",
+                "-z",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--",
+            ),
+        )
+    except ConfigurationError:
+        return RecoveryStatus.UNKNOWN, (), RecoveryStatus.UNKNOWN
+    if output.returncode != 0:
+        return RecoveryStatus.UNKNOWN, (), RecoveryStatus.UNKNOWN
+    if not output.stdout:
+        return RecoveryStatus.NO, (), RecoveryStatus.YES
+
+    observed_paths: list[str] = []
+    for raw_path in output.stdout.split("\0"):
+        if not raw_path:
+            continue
+        try:
+            observed_paths.append(_validate_restart_stage_path(raw_path))
+        except ConfigurationError:
+            return RecoveryStatus.YES, (), RecoveryStatus.UNKNOWN
+    return RecoveryStatus.YES, tuple(observed_paths), RecoveryStatus.YES
+
+
+def _validate_restart_stage_path(path: str) -> str:
+    """Validate one staged path for restart observation output."""
+
+    if (
+        not path
+        or not path.strip()
+        or "\\" in path
+        or "\0" in path
+        or "\n" in path
+        or "\r" in path
+    ):
+        raise ConfigurationError("restart staged path is unsafe.")
+    pure = PurePosixPath(path)
+    if (
+        pure.is_absolute()
+        or str(pure) != path
+        or path in {".", ".."}
+        or ".." in pure.parts
+    ):
+        raise ConfigurationError("restart staged path is unsafe.")
+    return path
+
+
+def _observe_worktree_dirty(
+    target_path: Path,
+    *,
+    index_dirty: RecoveryStatus,
+) -> RecoveryStatus:
+    """Observe whether the worktree currently contains any staged, unstaged, or untracked changes."""
+
+    if index_dirty is RecoveryStatus.YES:
+        return RecoveryStatus.YES
+
+    dirty_observations: list[RecoveryStatus] = [index_dirty]
+
+    try:
+        unstaged = _run_git(
+            target_path,
+            ("diff-files", "--quiet", "--no-ext-diff", "--no-textconv", "--"),
+        )
+    except ConfigurationError:
+        dirty_observations.append(RecoveryStatus.UNKNOWN)
+    else:
+        if unstaged.returncode == 1:
+            return RecoveryStatus.YES
+        if unstaged.returncode == 0:
+            dirty_observations.append(RecoveryStatus.NO)
+        else:
+            dirty_observations.append(RecoveryStatus.UNKNOWN)
+
+    try:
+        untracked = _run_git(
+            target_path,
+            ("ls-files", "--others", "--exclude-standard", "-z"),
+        )
+    except ConfigurationError:
+        dirty_observations.append(RecoveryStatus.UNKNOWN)
+    else:
+        if untracked.returncode == 0 and untracked.stdout:
+            return RecoveryStatus.YES
+        if untracked.returncode == 0:
+            dirty_observations.append(RecoveryStatus.NO)
+        else:
+            dirty_observations.append(RecoveryStatus.UNKNOWN)
+
+    if all(status is RecoveryStatus.NO for status in dirty_observations):
+        return RecoveryStatus.NO
+    return RecoveryStatus.UNKNOWN
+
+
 def _inspect_source_repository(
     source: Path,
 ) -> tuple[str, tuple[_WorktreeRecord, ...]]:
@@ -1148,11 +1941,11 @@ def _record_from_fields(fields: dict[str, object]) -> _WorktreeRecord:
     raw_path = fields.get("path")
     if not isinstance(raw_path, str):
         raise ConfigurationError("registered worktree state is ambiguous.")
-    path = Path(raw_path)
-    if not path.is_absolute():
+    reported_path = Path(raw_path)
+    if not reported_path.is_absolute():
         raise ConfigurationError("registered worktree state is ambiguous.")
     try:
-        canonical_path = path.resolve(strict=False)
+        canonical_path = reported_path.resolve(strict=False)
     except (OSError, RuntimeError):
         raise ConfigurationError("registered worktree state is ambiguous.") from None
 
@@ -1163,6 +1956,7 @@ def _record_from_fields(fields: dict[str, object]) -> _WorktreeRecord:
         raw_head if isinstance(raw_head, str) and _is_full_object_id(raw_head) else None
     )
     return _WorktreeRecord(
+        reported_path=reported_path,
         path=canonical_path,
         head=head,
         branch=branch,
