@@ -2159,10 +2159,10 @@ def test_repair_round_exhaustion_continues_then_repairs(
     assert "exhausted its tool-round budget" in continuation
 
 
-def test_edit_round_exhaustion_after_change_advances_to_validation(
+def test_edit_round_exhaustion_after_change_requires_continuation(
     tmp_path: Path,
 ) -> None:
-    """Accept a successful EDIT action even without a final model response."""
+    """Do not treat exhaustion after a successful EDIT change as complete."""
 
     repository = create_coding_repository(tmp_path / "project")
     original = "def add(left: int, right: int) -> int:\n    return left - right\n"
@@ -2181,6 +2181,76 @@ def test_edit_round_exhaustion_after_change_advances_to_validation(
                 expected_text="return left - right",
                 replacement_text="return left + right",
             ),
+            ChatResponse(text="Edit confirmed complete."),
+        ]
+    )
+
+    result = run_autonomous_coding_task(
+        create_session(repository, provider, max_tool_rounds=1),
+        "Correct the add implementation.",
+        tool_approval_handler=approve,
+    )
+
+    # The preserved change only reaches DONE after the bounded continuation
+    # confirms completion; it must not validate immediately on exhaustion.
+    assert result.final_phase is CodingPhase.DONE
+    assert result.completion_continuation_count == 1
+    assert result.approved_workspace_paths == ("module.py",)
+    assert result.assistant_summary == "Edit confirmed complete."
+
+    continuation = provider.requests[-1].messages[-1]["content"]
+    assert "Current phase: EDIT" in continuation
+    assert "exhausted its tool-round budget" in continuation
+    assert "preserved" in continuation
+    assert "not evidence that editing is complete" in continuation
+    assert "Acceptance criteria:" in continuation
+    assert "Correct the add implementation." in continuation
+
+
+def test_edit_round_exhaustion_continuation_applies_additional_change(
+    tmp_path: Path,
+) -> None:
+    """Preserve and combine an additional change made during the continuation."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    original = "def add(left: int, right: int) -> int:\n    return left - right\n"
+    original_test_module = (
+        "from module import add\n"
+        "\n"
+        "\n"
+        "def test_add() -> None:\n"
+        "    assert add(1, 2) == 3\n"
+    )
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            replacement_response(
+                "edit-before-exhaustion",
+                expected_content=original,
+                expected_text="return left - right",
+                replacement_text="return left + right",
+            ),
+            replacement_response(
+                "unexecuted-edit",
+                expected_content=original,
+                expected_text="return left - right",
+                replacement_text="return left + right",
+            ),
+            tool_response(
+                "second-change",
+                "apply_text_replacement",
+                {
+                    "path": "test_module.py",
+                    "expected_text": "from module import add\n",
+                    "replacement_text": (
+                        "from module import add\n# Regression coverage note.\n"
+                    ),
+                    "expected_file_sha256": hashlib.sha256(
+                        original_test_module.encode("utf-8")
+                    ).hexdigest(),
+                },
+            ),
+            ChatResponse(text="Both changes complete."),
         ]
     )
 
@@ -2191,11 +2261,431 @@ def test_edit_round_exhaustion_after_change_advances_to_validation(
     )
 
     assert result.final_phase is CodingPhase.DONE
-    assert result.completion_continuation_count == 0
-    assert result.assistant_summary == (
-        "A successful workspace change was applied before the model-facing "
-        "phase exhausted its tool-round budget."
+    assert result.completion_continuation_count == 1
+    assert set(result.approved_workspace_paths) == {"module.py", "test_module.py"}
+    assert result.validation_succeeded is True
+    assert {
+        tool_result.output.get("path")
+        for tool_name, tool_result in zip(
+            result.executed_tool_names, result.tool_results, strict=True
+        )
+        if tool_name == "run_ruff_format" and isinstance(tool_result.output, dict)
+    } == {"module.py", "test_module.py"}
+
+
+def test_repeated_edit_round_exhaustion_with_changes_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """Bound repeated tool-round exhaustion even when each call changes files."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    original = "def add(left: int, right: int) -> int:\n    return left - right\n"
+    fixed = "def add(left: int, right: int) -> int:\n    return left + right\n"
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            replacement_response(
+                "edit-1",
+                expected_content=original,
+                expected_text="return left - right",
+                replacement_text="return left + right",
+            ),
+            replacement_response(
+                "unexecuted-1",
+                expected_content=original,
+                expected_text="return left - right",
+                replacement_text="return left + right",
+            ),
+            replacement_response(
+                "edit-2",
+                expected_content=fixed,
+                expected_text="return left + right",
+                replacement_text="return left + right  # confirmed",
+            ),
+            replacement_response(
+                "unexecuted-2",
+                expected_content=fixed,
+                expected_text="return left + right",
+                replacement_text="return left + right  # confirmed",
+            ),
+        ]
     )
+
+    with pytest.raises(
+        CompletionError,
+        match=(
+            r"phase EDIT: completion continuation limit reached after the "
+            r"model-facing call exhausted its tool-round budget.*"
+            r"repair_attempts=0, completion_continuations=1"
+        ),
+    ):
+        run_autonomous_coding_task(
+            create_session(repository, provider, max_tool_rounds=1),
+            "Correct the add implementation.",
+            tool_approval_handler=approve,
+            limits=CodingWorkflowLimits(edit_completion_continuations=1),
+        )
+
+    # Both preserved changes remain on disk (never rolled back) even though
+    # the phase failed closed instead of validating incomplete work.
+    assert run_git(repository, "status", "--short").stdout == " M module.py\n"
+
+
+def test_repair_round_exhaustion_after_change_requires_continuation(
+    tmp_path: Path,
+) -> None:
+    """Do not treat exhaustion after a successful REPAIR change as complete."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    original = "def add(left: int, right: int) -> int:\n    return left - right\n"
+    multiplied = "def add(left: int, right: int) -> int:\n    return left * right\n"
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            replacement_response(
+                "bad-edit",
+                expected_content=original,
+                expected_text="return left - right",
+                replacement_text="return left * right",
+            ),
+            ChatResponse(text="Bad edit complete."),
+            replacement_response(
+                "repair-fix",
+                expected_content=multiplied,
+                expected_text="return left * right",
+                replacement_text="return left + right",
+            ),
+            replacement_response(
+                "unexecuted-repair",
+                expected_content=multiplied,
+                expected_text="return left * right",
+                replacement_text="return left + right",
+            ),
+            ChatResponse(text="Repair confirmed complete."),
+        ]
+    )
+
+    result = run_autonomous_coding_task(
+        create_session(repository, provider, max_tool_rounds=1),
+        "Correct the add implementation.",
+        tool_approval_handler=approve,
+    )
+
+    assert result.final_phase is CodingPhase.DONE
+    assert result.repair_attempt_count == 1
+    assert result.completion_continuation_count == 1
+    assert result.validation_succeeded is True
+    assert result.assistant_summary == "Repair confirmed complete."
+
+    continuation = provider.requests[-1].messages[-1]["content"]
+    assert "Current phase: REPAIR" in continuation
+    assert "exhausted its tool-round budget" in continuation
+    assert "preserved" in continuation
+    assert "not evidence that editing is complete" in continuation
+
+
+def test_edit_post_exhaustion_continuation_with_failed_action_does_not_confirm(
+    tmp_path: Path,
+) -> None:
+    """A failed mutation during the confirmation continuation must not confirm."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    original = "def add(left: int, right: int) -> int:\n    return left - right\n"
+    fixed = "def add(left: int, right: int) -> int:\n    return left + right\n"
+    original_test_module = (
+        "from module import add\n"
+        "\n"
+        "\n"
+        "def test_add() -> None:\n"
+        "    assert add(1, 2) == 3\n"
+    )
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            replacement_response(
+                "edit-before-exhaustion",
+                expected_content=original,
+                expected_text="return left - right",
+                replacement_text="return left + right",
+            ),
+            replacement_response(
+                "unexecuted-edit",
+                expected_content=original,
+                expected_text="return left - right",
+                replacement_text="return left + right",
+            ),
+            replacement_response(
+                "stale-continuation-attempt",
+                expected_content=original,
+                expected_text="return left - right",
+                replacement_text="return left + right",
+            ),
+            ChatResponse(text="I believe editing is already complete."),
+            tool_response(
+                "second-change",
+                "apply_text_replacement",
+                {
+                    "path": "test_module.py",
+                    "expected_text": "from module import add\n",
+                    "replacement_text": (
+                        "from module import add\n# Regression coverage note.\n"
+                    ),
+                    "expected_file_sha256": hashlib.sha256(
+                        original_test_module.encode("utf-8")
+                    ).hexdigest(),
+                },
+            ),
+            ChatResponse(text="Second change complete."),
+        ]
+    )
+
+    result = run_autonomous_coding_task(
+        create_session(repository, provider, max_tool_rounds=1),
+        "Correct the add implementation.",
+        tool_approval_handler=approve,
+        limits=CodingWorkflowLimits(edit_completion_continuations=2),
+    )
+
+    # The failed continuation attempt must not be mistaken for confirmation;
+    # a further continuation and a real change were still required.
+    assert result.final_phase is CodingPhase.DONE
+    assert result.completion_continuation_count == 2
+    assert set(result.approved_workspace_paths) == {"module.py", "test_module.py"}
+    assert Path(repository / "module.py").read_text(encoding="utf-8") == fixed
+
+    final_continuation = provider.requests[-1].messages[-1]["content"]
+    assert "Action failure evidence:" in final_continuation
+    assert "Acceptance criteria:" in final_continuation
+    assert "Correct the add implementation." in final_continuation
+
+
+def test_repeated_edit_post_exhaustion_failed_action_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """Bound a post-exhaustion continuation whose mutation attempt keeps failing."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    original = "def add(left: int, right: int) -> int:\n    return left - right\n"
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            replacement_response(
+                "edit-before-exhaustion",
+                expected_content=original,
+                expected_text="return left - right",
+                replacement_text="return left + right",
+            ),
+            replacement_response(
+                "unexecuted-edit",
+                expected_content=original,
+                expected_text="return left - right",
+                replacement_text="return left + right",
+            ),
+            replacement_response(
+                "stale-continuation-attempt",
+                expected_content=original,
+                expected_text="return left - right",
+                replacement_text="return left + right",
+            ),
+            ChatResponse(text="I believe editing is already complete."),
+        ]
+    )
+
+    with pytest.raises(
+        CompletionError,
+        match=(
+            r"phase EDIT: completion continuation limit reached after no "
+            r"successful new workspace change was observed.*"
+            r"repair_attempts=0, completion_continuations=1"
+        ),
+    ):
+        run_autonomous_coding_task(
+            create_session(repository, provider, max_tool_rounds=1),
+            "Correct the add implementation.",
+            tool_approval_handler=approve,
+            limits=CodingWorkflowLimits(edit_completion_continuations=1),
+        )
+
+    # The originally preserved change remains on disk even though the phase
+    # failed closed instead of validating on unconfirmed prose.
+    assert run_git(repository, "status", "--short").stdout == " M module.py\n"
+
+
+def test_repair_post_exhaustion_continuation_with_failed_action_does_not_confirm(
+    tmp_path: Path,
+) -> None:
+    """A failed REPAIR mutation after exhaustion must not be mistaken for repair."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    original = "def add(left: int, right: int) -> int:\n    return left - right\n"
+    multiplied = "def add(left: int, right: int) -> int:\n    return left * right\n"
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            replacement_response(
+                "bad-edit",
+                expected_content=original,
+                expected_text="return left - right",
+                replacement_text="return left * right",
+            ),
+            ChatResponse(text="Bad edit complete."),
+            replacement_response(
+                "repair-fix",
+                expected_content=multiplied,
+                expected_text="return left * right",
+                replacement_text="return left + right",
+            ),
+            replacement_response(
+                "unexecuted-repair",
+                expected_content=multiplied,
+                expected_text="return left * right",
+                replacement_text="return left + right",
+            ),
+            replacement_response(
+                "stale-repair-continuation-attempt",
+                expected_content=multiplied,
+                expected_text="return left * right",
+                replacement_text="return left + right",
+            ),
+            ChatResponse(text="I believe the repair is already complete."),
+        ]
+    )
+
+    with pytest.raises(
+        CompletionError,
+        match=(
+            r"phase REPAIR: repair completed without a successful new "
+            r"workspace change.*repair_attempts=1, completion_continuations=1"
+        ),
+    ):
+        run_autonomous_coding_task(
+            create_session(repository, provider, max_tool_rounds=1),
+            "Correct the add implementation.",
+            tool_approval_handler=approve,
+            limits=CodingWorkflowLimits(
+                repair_attempts=1,
+                repair_completion_continuations=1,
+            ),
+        )
+
+
+def test_edit_read_only_exhaustion_after_change_keeps_confirmation_pending(
+    tmp_path: Path,
+) -> None:
+    """A read-only-only exhaustion must not discard a pending confirmation."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    original = "def add(left: int, right: int) -> int:\n    return left - right\n"
+    fixed = "def add(left: int, right: int) -> int:\n    return left + right\n"
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            replacement_response(
+                "edit-1",
+                expected_content=original,
+                expected_text="return left - right",
+                replacement_text="return left + right",
+            ),
+            replacement_response(
+                "stale-edit-2",
+                expected_content=original,
+                expected_text="return left - right",
+                replacement_text="return left + right",
+            ),
+            tool_response(
+                "blocked-attempt",
+                "apply_text_replacement",
+                {
+                    "path": "module.py",
+                    "expected_text": "return left + right",
+                    "replacement_text": "return left + right",
+                    "expected_file_sha256": hashlib.sha256(
+                        fixed.encode("utf-8")
+                    ).hexdigest(),
+                },
+            ),
+            tool_response("bad-read-1", "read_file", {"path": "missing1.py"}),
+            tool_response("bad-read-2", "read_file", {"path": "missing2.py"}),
+            tool_response("bad-read-3", "read_file", {"path": "missing3.py"}),
+            ChatResponse(text="Confirming completion after inspection."),
+        ]
+    )
+
+    result = run_autonomous_coding_task(
+        create_session(repository, provider, max_tool_rounds=2),
+        "Correct the add implementation.",
+        tool_approval_handler=approve,
+    )
+
+    assert result.final_phase is CodingPhase.DONE
+    assert result.completion_continuation_count == 2
+    assert result.validation_succeeded is True
+    assert Path(repository / "module.py").read_text(encoding="utf-8") == fixed
+    assert result.assistant_summary == "Confirming completion after inspection."
+
+    final_continuation = provider.requests[-1].messages[-1]["content"]
+    assert "Acceptance criteria:" in final_continuation
+    assert "not evidence that editing is complete" in final_continuation
+
+
+def test_repeated_read_only_exhaustion_after_change_stops_at_continuation_limit(
+    tmp_path: Path,
+) -> None:
+    """Bound repeated read-only exhaustion even while confirmation is pending."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    original = "def add(left: int, right: int) -> int:\n    return left - right\n"
+    fixed = "def add(left: int, right: int) -> int:\n    return left + right\n"
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            replacement_response(
+                "edit-1",
+                expected_content=original,
+                expected_text="return left - right",
+                replacement_text="return left + right",
+            ),
+            replacement_response(
+                "stale-edit-2",
+                expected_content=original,
+                expected_text="return left - right",
+                replacement_text="return left + right",
+            ),
+            tool_response(
+                "blocked-attempt",
+                "apply_text_replacement",
+                {
+                    "path": "module.py",
+                    "expected_text": "return left + right",
+                    "replacement_text": "return left + right",
+                    "expected_file_sha256": hashlib.sha256(
+                        fixed.encode("utf-8")
+                    ).hexdigest(),
+                },
+            ),
+            tool_response("bad-read-1", "read_file", {"path": "missing1.py"}),
+            tool_response("bad-read-2", "read_file", {"path": "missing2.py"}),
+            tool_response("bad-read-3", "read_file", {"path": "missing3.py"}),
+        ]
+    )
+
+    with pytest.raises(
+        CompletionError,
+        match=(
+            r"phase EDIT: completion continuation limit reached after the "
+            r"model-facing call exhausted its tool-round budget while only "
+            r"performing read-only inspection.*"
+            r"repair_attempts=0, completion_continuations=1"
+        ),
+    ):
+        run_autonomous_coding_task(
+            create_session(repository, provider, max_tool_rounds=2),
+            "Correct the add implementation.",
+            tool_approval_handler=approve,
+            limits=CodingWorkflowLimits(edit_completion_continuations=1),
+        )
+
+    assert Path(repository / "module.py").read_text(encoding="utf-8") == fixed
 
 
 def test_repeated_edit_round_exhaustion_stops_at_continuation_limit(
