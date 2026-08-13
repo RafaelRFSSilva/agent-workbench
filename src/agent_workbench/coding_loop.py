@@ -696,6 +696,10 @@ def _run_model_change_phase(
     state.controlled_action_argument_validation_failures = 0
     state.last_argument_validation_tool_name = None
     local_continuations = 0
+    # True only while a previously preserved change still needs completion
+    # confirmation; a failed/denied mutation attempt always clears it, but pure
+    # read-only exhaustion never clears it on its own.
+    awaiting_post_exhaustion_confirmation = False
     outstanding = (
         "Apply at least one successful controlled workspace change.",
         "Use repository evidence already gathered instead of restarting discovery.",
@@ -743,12 +747,30 @@ def _run_model_change_phase(
                 current_call_rounds,
                 state.approved_action_ids,
             ):
+                # Preserve the change and its evidence, but exhaustion alone is
+                # never proof of completion; require a bounded continuation.
                 state.assistant_summary = _MAXIMUM_ROUNDS_CHANGE_SUMMARY
-                return True
-            incomplete_reason = (
-                "the model-facing call exhausted its tool-round budget without "
-                "completing the required workspace change"
-            )
+                awaiting_post_exhaustion_confirmation = True
+                incomplete_reason = (
+                    "the model-facing call exhausted its tool-round budget; a "
+                    "successful workspace change from that call was preserved "
+                    "but exhaustion is not evidence that editing is complete"
+                )
+            elif _rounds_contain_workspace_change_attempt(current_call_rounds):
+                # An attempted mutation failed or was denied before exhaustion;
+                # never let that stand in for the pending confirmation.
+                awaiting_post_exhaustion_confirmation = False
+                incomplete_reason = (
+                    "the model-facing call exhausted its tool-round budget without "
+                    "completing the required workspace change"
+                )
+            else:
+                # Pure read-only exhaustion never clears a confirmation already
+                # pending from an earlier preserved change.
+                incomplete_reason = (
+                    "the model-facing call exhausted its tool-round budget while "
+                    "only performing read-only inspection"
+                )
         else:
             state.assistant_summary = response.text
             current_call_rounds = state.rounds[call_start:]
@@ -757,7 +779,17 @@ def _run_model_change_phase(
                 state.approved_action_ids,
             ):
                 return True
-            incomplete_reason = "no successful new workspace change was observed"
+            if _rounds_contain_workspace_change_attempt(current_call_rounds):
+                # A mutation was attempted and failed/denied; do not let prose
+                # from this response stand in for confirmation.
+                awaiting_post_exhaustion_confirmation = False
+                incomplete_reason = "no successful new workspace change was observed"
+            elif awaiting_post_exhaustion_confirmation:
+                # The continuation confirmed completion without inventing a new
+                # mutation; the previously preserved change may proceed.
+                return True
+            else:
+                incomplete_reason = "no successful new workspace change was observed"
 
         if (
             state.controlled_action_argument_validation_failures
@@ -781,11 +813,23 @@ def _run_model_change_phase(
 
         local_continuations += 1
         state.completion_continuation_count += 1
-        outstanding = (
-            f"{phase.value} is incomplete because {incomplete_reason}.",
-            "Apply a controlled workspace change now.",
-            "Assistant prose is not evidence of a workspace change.",
-        )
+        if awaiting_post_exhaustion_confirmation:
+            outstanding = (
+                f"The previous {phase.value} call exhausted its tool-round budget.",
+                "One or more successful workspace changes from that call were "
+                "preserved; do not discard or roll them back.",
+                "Tool-round exhaustion is not evidence that editing is complete.",
+                "Review the remaining original acceptance criteria below.",
+                "If work remains, make another controlled workspace change now.",
+                "If the requested editing work is already complete, finish this "
+                "response without inventing another workspace change.",
+            )
+        else:
+            outstanding = (
+                f"{phase.value} is incomplete because {incomplete_reason}.",
+                "Apply a controlled workspace change now.",
+                "Assistant prose is not evidence of a workspace change.",
+            )
 
 
 def _run_validation_phase(
@@ -1359,6 +1403,18 @@ def _rounds_contain_successful_change(
             ):
                 return True
     return False
+
+
+def _rounds_contain_workspace_change_attempt(
+    rounds: Iterable[ToolInteractionRound],
+) -> bool:
+    """Return whether rounds requested any workspace-change tool, applied or not."""
+
+    return any(
+        invocation.tool_name in _WORKSPACE_CHANGE_TOOL_NAMES
+        for round_ in rounds
+        for invocation in round_.response.tool_invocations
+    )
 
 
 def _build_result(
