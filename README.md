@@ -43,6 +43,10 @@ Implemented capabilities:
 - End-to-end isolated autonomous coding with approved worktree creation,
   controlled actions, required Ruff and pytest validation, final Git inspection,
   an approved exact local commit, and preserved worktree and branch state.
+- Opt-in isolated commit lifecycle persistence for isolated coding using an
+  explicit operator-managed lifecycle store and session identifier.
+- Read-only restart recovery inspection and conservative classification for one
+  requested persisted isolated lifecycle session.
 - Automated tests, Ruff checks, and GitHub Actions.
 
 Arbitrary shell and network tools, RAG, MCP, asynchronous execution,
@@ -839,6 +843,30 @@ uv run agent-workbench code \
   --commit-message "fix: correct the defect"
 ```
 
+Lifecycle persistence is opt-in for isolated coding in this milestone. Supply
+an existing operator-managed lifecycle store directory and explicit session
+identifier:
+
+```bash
+mkdir -p /some/operator-managed/lifecycle-store
+
+uv run agent-workbench code \
+  --provider ollama \
+  --model gpt-oss:20b \
+  --agent developer \
+  --workspace . \
+  --enable-actions \
+  --task "Fix the defect and validate the project." \
+  --worktree-path ../agent-workbench-task \
+  --worktree-branch agent/task \
+  --commit-message "fix: correct the defect" \
+  --lifecycle-store /some/operator-managed/lifecycle-store \
+  --session-id task-001
+```
+
+The lifecycle store directory must already exist and is not created
+automatically.
+
 `--worktree-path` and `--worktree-branch` must be supplied together. Isolated
 execution also requires `--workspace`, `--enable-actions`, `--task`, and
 `--commit-message`. The former interactive worktree session is not available
@@ -872,6 +900,28 @@ staging, commit, or verification failure preserves available isolated state for
 manual recovery. There is no automatic reset, restore, clean, stash, retry,
 force removal, merge, push, or branch deletion. See the
 [self-hosting guide](docs/self-hosting.md).
+
+## Read-Only Recovery Inspection
+
+Use the operator-facing read-only recovery command to inspect one persisted
+isolated lifecycle session and print a conservative classification:
+
+```bash
+uv run agent-workbench recover \
+  --workspace . \
+  --lifecycle-store /some/operator-managed/lifecycle-store \
+  --session-id task-001
+```
+
+The recovery command is inspection/classification only. It does not stage,
+commit, reset, restore, clean, remove worktrees, delete branches, retry
+execution, or perform any recovery mutation.
+
+Candidate-commit observation is weaker than exact approved-commit verification.
+`commit_candidate_observed` indicates compatibility evidence, not proof that
+the candidate is the exact originally approved commit.
+
+Any future mutating recovery action requires fresh approval.
 
 ## Configuration Precedence
 

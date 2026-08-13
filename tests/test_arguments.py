@@ -19,6 +19,7 @@ from agent_workbench.config import (
     ProjectConfiguration,
 )
 from agent_workbench.errors import ConfigurationError
+from agent_workbench.session import SessionId
 
 
 def test_parse_cli_arguments_accepts_provider_and_model() -> None:
@@ -1510,3 +1511,190 @@ def test_parse_cli_arguments_rejects_unknown_command(capsys) -> None:
 
     assert exc_info.value.code == 2
     assert "unrecognized arguments: review" in capsys.readouterr().err
+
+
+def test_recover_command_parses_required_arguments() -> None:
+    """Parse one bounded recover command with explicit lifecycle inputs."""
+
+    arguments = parse_cli_arguments(
+        [
+            "recover",
+            "--workspace",
+            ".",
+            "--lifecycle-store",
+            "./lifecycle-store",
+            "--session-id",
+            "task-001",
+        ]
+    )
+
+    assert arguments.recover is True
+    assert arguments.workspace_root == Path(".")
+    assert arguments.lifecycle_store == Path("./lifecycle-store")
+    assert arguments.session_id == SessionId("task-001")
+    assert arguments.provider_name is None
+    assert arguments.model_name is None
+    assert arguments.task_prompt is None
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        [
+            "recover",
+            "--lifecycle-store",
+            "./lifecycle-store",
+            "--session-id",
+            "task-001",
+        ],
+        [
+            "recover",
+            "--workspace",
+            ".",
+            "--session-id",
+            "task-001",
+        ],
+        [
+            "recover",
+            "--workspace",
+            ".",
+            "--lifecycle-store",
+            "./lifecycle-store",
+        ],
+    ],
+)
+def test_recover_command_requires_workspace_store_and_session_id(
+    argv: list[str],
+) -> None:
+    """Keep recover arguments strictly required and explicit."""
+
+    with pytest.raises(SystemExit) as raised:
+        parse_cli_arguments(argv)
+
+    assert raised.value.code == 2
+
+
+def test_recover_command_rejects_blank_session_id() -> None:
+    """Reject a blank recover session identifier through SessionId validation."""
+
+    with pytest.raises(SystemExit) as raised:
+        parse_cli_arguments(
+            [
+                "recover",
+                "--workspace",
+                ".",
+                "--lifecycle-store",
+                "./lifecycle-store",
+                "--session-id",
+                "   ",
+            ]
+        )
+
+    assert raised.value.code == 2
+
+
+def test_recover_command_rejects_unrelated_provider_arguments() -> None:
+    """Keep recover scoped to its bounded operator arguments only."""
+
+    with pytest.raises(SystemExit) as raised:
+        parse_cli_arguments(
+            [
+                "recover",
+                "--workspace",
+                ".",
+                "--lifecycle-store",
+                "./lifecycle-store",
+                "--session-id",
+                "task-001",
+                "--provider",
+                "ollama",
+            ]
+        )
+
+    assert raised.value.code == 2
+
+
+def test_parse_cli_arguments_preserves_lifecycle_defaults_for_existing_flows() -> None:
+    """Keep lifecycle persistence opt-in and disabled by default."""
+
+    arguments = parse_cli_arguments(["code", "Fix the failing tests."])
+
+    assert arguments.recover is False
+    assert arguments.lifecycle_store is None
+    assert arguments.session_id is None
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["code", "--workspace", ".", "--lifecycle-store", "./store"],
+        ["code", "--workspace", ".", "--session-id", "task-001"],
+    ],
+)
+def test_code_command_requires_lifecycle_store_and_session_id_pair(
+    argv: list[str],
+) -> None:
+    """Require lifecycle persistence options to be supplied as a pair."""
+
+    with pytest.raises(SystemExit) as raised:
+        parse_cli_arguments(argv)
+
+    assert raised.value.code == 2
+
+
+def test_runtime_configuration_rejects_lifecycle_options_without_isolated_worktree() -> (
+    None
+):
+    """Reject lifecycle persistence outside isolated worktree execution."""
+
+    with pytest.raises(
+        ConfigurationError,
+        match="Lifecycle persistence options require --worktree-path and --worktree-branch",
+    ):
+        resolve_runtime_configuration(
+            CLIArguments(
+                provider_name="ollama",
+                model_name="gpt-oss:20b",
+                task_prompt="Correct the implementation.",
+                workspace_root=Path("."),
+                enable_actions=True,
+                lifecycle_store=Path("./store"),
+                session_id=SessionId("task-001"),
+            )
+        )
+
+
+def test_runtime_configuration_accepts_lifecycle_options_for_isolated_workflow() -> (
+    None
+):
+    """Allow lifecycle persistence only with complete isolated-worktree options."""
+
+    configuration = resolve_runtime_configuration(
+        CLIArguments(
+            provider_name="ollama",
+            model_name="gpt-oss:20b",
+            task_prompt="Correct the implementation.",
+            commit_message="fix: exact",
+            workspace_root=Path("."),
+            enable_actions=True,
+            worktree_path=Path("../isolated"),
+            worktree_branch="agent/task",
+            lifecycle_store=Path("./store"),
+            session_id=SessionId("task-001"),
+        )
+    )
+
+    assert configuration.worktree_path == Path("../isolated")
+    assert configuration.worktree_branch == "agent/task"
+
+
+def test_cli_arguments_new_lifecycle_fields_preserve_value_equality_defaults() -> None:
+    """Keep dataclass value semantics stable after adding lifecycle fields."""
+
+    first = CLIArguments(provider_name=None, model_name=None)
+    second = CLIArguments(provider_name=None, model_name=None)
+
+    assert first == second
+    assert first.recover is False
+    assert first.lifecycle_store is None
+    assert first.session_id is None

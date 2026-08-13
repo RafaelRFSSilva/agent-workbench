@@ -39,6 +39,11 @@ from agent_workbench.isolated_coding import (
     IsolatedAutonomousWorkflowResult,
     run_isolated_autonomous_workflow,
 )
+from agent_workbench.lifecycle_recovery import (
+    IsolatedCommitLifecycleRecoveryClassification,
+    inspect_persisted_isolated_commit_lifecycle_recovery,
+)
+from agent_workbench.lifecycle_store import IsolatedCommitLifecycleStore
 from agent_workbench.messages import ToolInteractionRound
 from agent_workbench.session import AgentSession, SessionId
 from agent_workbench.session_factory import create_agent_session
@@ -144,8 +149,12 @@ def _main(
 ) -> None:
     """Run the CLI using the resolved provider and model."""
 
-    load_environment()
     arguments = parse_cli_arguments(argv)
+    if arguments.recover:
+        _run_recovery_inspection(arguments)
+        return
+
+    load_environment()
     if arguments.init:
         _initialize_project(arguments)
         return
@@ -176,6 +185,8 @@ def _main(
             runtime_configuration,
             task_prompt=task_prompt,
             commit_message=commit_message,
+            lifecycle_store_directory=arguments.lifecycle_store,
+            lifecycle_session_id=arguments.session_id,
         )
         return
 
@@ -314,6 +325,8 @@ def _run_isolated_autonomous_task(
     *,
     task_prompt: str | None,
     commit_message: str | None,
+    lifecycle_store_directory: Path | None,
+    lifecycle_session_id: SessionId | None,
 ) -> None:
     """Run one complete approved autonomous task in an isolated worktree."""
 
@@ -340,9 +353,20 @@ def _run_isolated_autonomous_task(
         if event.kind is CodingProgressKind.TERMINAL_FAILURE:
             terminal_failure_displayed = True
 
+    lifecycle_store = None
+    session_id = SessionId("cli-session")
+
     try:
+        if lifecycle_store_directory is not None:
+            if lifecycle_session_id is None:
+                raise ConfigurationError(
+                    "--lifecycle-store and --session-id must be supplied together."
+                )
+            lifecycle_store = IsolatedCommitLifecycleStore(lifecycle_store_directory)
+            session_id = lifecycle_session_id
+
         result = run_isolated_autonomous_workflow(
-            SessionId("cli-session"),
+            session_id,
             runtime_configuration,
             branch,
             target,
@@ -351,6 +375,7 @@ def _run_isolated_autonomous_task(
             worktree_approval_handler=_prompt_for_worktree_approval,
             tool_approval_handler=_prompt_for_tool_approval,
             commit_approval_handler=_prompt_for_isolated_commit_approval,
+            lifecycle_store=lifecycle_store,
             tool_round_observer=observer,
             progress_event_observer=display_progress,
             max_tool_rounds=runtime_configuration.max_tool_rounds,
@@ -371,6 +396,100 @@ def _run_isolated_autonomous_task(
     _display_isolated_autonomous_result(
         result,
         show_assistant_summary=runtime_configuration.show_assistant_summary,
+    )
+
+
+def _run_recovery_inspection(arguments: CLIArguments) -> None:
+    """Run one read-only persisted lifecycle recovery inspection."""
+
+    source_repository = arguments.workspace_root
+    lifecycle_store_path = arguments.lifecycle_store
+    session_id = arguments.session_id
+    if source_repository is None or lifecycle_store_path is None or session_id is None:
+        print("Configuration error: Recovery command arguments are incomplete.")
+        raise SystemExit(1)
+
+    try:
+        lifecycle_store = IsolatedCommitLifecycleStore(lifecycle_store_path)
+        assessment = inspect_persisted_isolated_commit_lifecycle_recovery(
+            source_repository,
+            lifecycle_store,
+            session_id,
+        )
+    except (CompletionError, ConfigurationError) as exc:
+        print(f"Recovery inspection failed: {exc}")
+        raise SystemExit(1) from None
+
+    if assessment is None:
+        print("Recovery inspection failed: requested lifecycle record was not found.")
+        raise SystemExit(1)
+
+    print(
+        f"[RECOVERY] Persisted phase: {assessment.restart_evidence.persisted_phase.value}"
+    )
+    print(f"[RECOVERY] Classification: {assessment.classification.value}")
+    if assessment.candidate_evidence is not None:
+        print(
+            "[RECOVERY] Candidate parent matches old HEAD: "
+            f"{assessment.candidate_evidence.parent_matches_old_head.value}"
+        )
+        print(
+            "[RECOVERY] Candidate commit message matches: "
+            f"{assessment.candidate_evidence.message_fingerprint_matches.value}"
+        )
+        print(
+            "[RECOVERY] Candidate committed paths match expected: "
+            f"{assessment.candidate_evidence.paths_match_expected.value}"
+        )
+
+    guidance = _recovery_guidance_message(assessment.classification)
+    print(f"[RECOVERY] Guidance: {guidance}")
+    print("[RECOVERY] No recovery action was performed.")
+    print("[RECOVERY] Any future mutating recovery action requires fresh approval.")
+
+
+def _recovery_guidance_message(
+    classification: IsolatedCommitLifecycleRecoveryClassification,
+) -> str:
+    """Return one stable operator guidance message per classification."""
+
+    if (
+        classification
+        is IsolatedCommitLifecycleRecoveryClassification.INSUFFICIENT_EVIDENCE
+    ):
+        return "Current evidence is insufficient for a safe recovery decision."
+    if (
+        classification
+        is IsolatedCommitLifecycleRecoveryClassification.OLD_HEAD_CLEAN_INDEX
+    ):
+        return (
+            "The expected branch remains at the old HEAD with no staged "
+            "changes observed."
+        )
+    if (
+        classification
+        is IsolatedCommitLifecycleRecoveryClassification.EXPECTED_PATH_STAGING_OBSERVED
+    ):
+        return (
+            "The expected persisted path set is currently staged; this does not "
+            "prove the staged contents are the exact originally approved contents."
+        )
+    if (
+        classification
+        is IsolatedCommitLifecycleRecoveryClassification.COMMIT_CANDIDATE_OBSERVED
+    ):
+        return (
+            "A compatible candidate commit is currently observed; this does not "
+            "prove it is the exact originally approved commit."
+        )
+    if (
+        classification
+        is IsolatedCommitLifecycleRecoveryClassification.PERSISTED_VERIFIED_COMMIT_OBSERVED
+    ):
+        return "The exact persisted verified commit is currently observed on the expected branch."
+    return (
+        "Current Git state conflicts with persisted lifecycle evidence and "
+        "requires operator/manual review."
     )
 
 

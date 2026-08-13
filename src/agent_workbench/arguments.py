@@ -26,6 +26,7 @@ from agent_workbench.config import (
 from agent_workbench.context import ContextDocument, load_context_document
 from agent_workbench.errors import ConfigurationError
 from agent_workbench.generation import GenerationConfig
+from agent_workbench.session import SessionId
 
 from agent_workbench.structured_outputs import (
     JSONResponseFormat,
@@ -40,7 +41,7 @@ DEFAULT_PROJECT_TEMPERATURE = 0.2
 DEFAULT_PROJECT_TOP_P = 0.9
 DEFAULT_PROJECT_MAX_OUTPUT_TOKENS = 4096
 
-type CLICommand = Literal["run", "code", "init"]
+type CLICommand = Literal["run", "code", "init", "recover"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +72,9 @@ class CLIArguments:
     worktree_branch: str | None = None
     isolated: bool = False
     dry_run: bool = False
+    recover: bool = False
+    lifecycle_store: Path | None = None
+    session_id: SessionId | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,6 +209,15 @@ def _worktree_branch(value: str) -> str:
     return value
 
 
+def _session_id(value: str) -> SessionId:
+    """Return one validated non-blank session identifier."""
+
+    try:
+        return SessionId(value)
+    except ConfigurationError as exc:
+        raise ArgumentTypeError(str(exc)) from exc
+
+
 def _unit_interval(
     value: str,
     *,
@@ -265,7 +278,7 @@ def _normalize_cli_argv(
     normalized_argv = list(sys.argv[1:] if argv is None else argv)
     command: CLICommand = "run"
 
-    if normalized_argv and normalized_argv[0] in {"code", "init"}:
+    if normalized_argv and normalized_argv[0] in {"code", "init", "recover"}:
         command = cast(CLICommand, normalized_argv[0])
         normalized_argv = normalized_argv[1:]
 
@@ -280,6 +293,8 @@ def parse_cli_arguments(
     normalized_argv, command = _normalize_cli_argv(argv)
     if command == "init":
         return _parse_init_arguments(normalized_argv)
+    if command == "recover":
+        return _parse_recover_arguments(normalized_argv)
 
     code_command = command == "code"
     parser = ArgumentParser(
@@ -422,6 +437,21 @@ def parse_cli_arguments(
         help="New local branch for an isolated worktree; requires --worktree-path.",
     )
 
+    parser.add_argument(
+        "--lifecycle-store",
+        type=_workspace_path,
+        help=(
+            "Existing operator-managed lifecycle store directory for isolated "
+            "commit lifecycle persistence; requires --session-id."
+        ),
+    )
+
+    parser.add_argument(
+        "--session-id",
+        type=_session_id,
+        help="Non-blank lifecycle session identifier; requires --lifecycle-store.",
+    )
+
     if code_command:
         parser.add_argument(
             "positional_task",
@@ -436,6 +466,11 @@ def parse_cli_arguments(
     if positional_task is not None and parsed_arguments.task is not None:
         parser.error("positional task cannot be combined with --task.")
     task_prompt = positional_task or parsed_arguments.task
+
+    if (parsed_arguments.lifecycle_store is None) != (
+        parsed_arguments.session_id is None
+    ):
+        parser.error("--lifecycle-store and --session-id must be supplied together.")
 
     setup_conflicts = (
         parsed_arguments.provider is not None
@@ -455,6 +490,8 @@ def parse_cli_arguments(
         or parsed_arguments.show_assistant_summary
         or parsed_arguments.worktree_path is not None
         or parsed_arguments.worktree_branch is not None
+        or parsed_arguments.lifecycle_store is not None
+        or parsed_arguments.session_id is not None
         or task_prompt is not None
         or parsed_arguments.max_tool_rounds is not None
         or parsed_arguments.commit_message is not None
@@ -491,6 +528,45 @@ def parse_cli_arguments(
         task_prompt=task_prompt,
         max_tool_rounds=parsed_arguments.max_tool_rounds,
         commit_message=parsed_arguments.commit_message,
+        lifecycle_store=parsed_arguments.lifecycle_store,
+        session_id=parsed_arguments.session_id,
+    )
+
+
+def _parse_recover_arguments(argv: Sequence[str]) -> CLIArguments:
+    """Parse bounded read-only lifecycle recovery inspection options."""
+
+    parser = ArgumentParser(
+        prog="agent-workbench recover",
+        description="Inspect persisted isolated commit lifecycle restart evidence.",
+    )
+    parser.add_argument(
+        "--workspace",
+        required=True,
+        type=_workspace_path,
+        help="Source repository path for read-only restart inspection.",
+    )
+    parser.add_argument(
+        "--lifecycle-store",
+        required=True,
+        type=_workspace_path,
+        help="Existing operator-managed lifecycle store directory.",
+    )
+    parser.add_argument(
+        "--session-id",
+        required=True,
+        type=_session_id,
+        help="Session identifier of the persisted lifecycle record to inspect.",
+    )
+
+    parsed_arguments = parser.parse_args(argv)
+    return CLIArguments(
+        provider_name=None,
+        model_name=None,
+        recover=True,
+        workspace_root=parsed_arguments.workspace,
+        lifecycle_store=parsed_arguments.lifecycle_store,
+        session_id=parsed_arguments.session_id,
     )
 
 
@@ -634,6 +710,16 @@ def resolve_runtime_configuration(
     if (arguments.worktree_path is None) != (arguments.worktree_branch is None):
         raise ConfigurationError(
             "--worktree-path and --worktree-branch must be supplied together."
+        )
+
+    if (arguments.lifecycle_store is None) != (arguments.session_id is None):
+        raise ConfigurationError(
+            "--lifecycle-store and --session-id must be supplied together."
+        )
+
+    if arguments.lifecycle_store is not None and arguments.worktree_path is None:
+        raise ConfigurationError(
+            "Lifecycle persistence options require --worktree-path and --worktree-branch."
         )
 
     if arguments.worktree_path is not None and workspace_root is None:
