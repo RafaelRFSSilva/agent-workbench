@@ -1535,6 +1535,27 @@ def test_recover_command_parses_required_arguments() -> None:
     assert arguments.provider_name is None
     assert arguments.model_name is None
     assert arguments.task_prompt is None
+    assert arguments.adopt_candidate is False
+
+
+def test_recover_command_accepts_adopt_candidate_option() -> None:
+    """Accept the explicit recover-only candidate adoption flag."""
+
+    arguments = parse_cli_arguments(
+        [
+            "recover",
+            "--workspace",
+            ".",
+            "--lifecycle-store",
+            "./lifecycle-store",
+            "--session-id",
+            "task-001",
+            "--adopt-candidate",
+        ]
+    )
+
+    assert arguments.recover is True
+    assert arguments.adopt_candidate is True
 
 
 @pytest.mark.parametrize(
@@ -1610,6 +1631,23 @@ def test_recover_command_rejects_unrelated_provider_arguments() -> None:
                 "ollama",
             ]
         )
+
+    assert raised.value.code == 2
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--adopt-candidate"],
+        ["code", "--adopt-candidate", "Fix the failing tests."],
+        ["init", "--adopt-candidate"],
+    ],
+)
+def test_non_recover_commands_reject_adopt_candidate(argv: list[str]) -> None:
+    """Keep adopt-candidate scoped strictly to recover."""
+
+    with pytest.raises(SystemExit) as raised:
+        parse_cli_arguments(argv)
 
     assert raised.value.code == 2
 
@@ -1696,5 +1734,6 @@ def test_cli_arguments_new_lifecycle_fields_preserve_value_equality_defaults() -
 
     assert first == second
     assert first.recover is False
+    assert first.adopt_candidate is False
     assert first.lifecycle_store is None
     assert first.session_id is None
