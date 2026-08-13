@@ -300,6 +300,7 @@ def test_main_delegates_complete_isolated_workflow_once(
         worktree_approval_handler=_prompt_for_worktree_approval,
         tool_approval_handler=_prompt_for_tool_approval,
         commit_approval_handler=_prompt_for_isolated_commit_approval,
+        lifecycle_store=None,
         tool_round_observer=expected_observer,
         progress_event_observer=ANY,
         max_tool_rounds=AUTONOMOUS_MAX_TOOL_ROUNDS,

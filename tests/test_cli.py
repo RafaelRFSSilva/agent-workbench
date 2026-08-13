@@ -24,6 +24,7 @@ from agent_workbench.arguments import RuntimeConfiguration
 from agent_workbench.context import ContextDocument
 from agent_workbench.errors import CompletionError, ConfigurationError
 from agent_workbench.messages import ChatRequest, ChatResponse, Message
+from agent_workbench.lifecycle_store import IsolatedCommitLifecycleStore
 from agent_workbench.session import AgentSession, SessionId
 from agent_workbench.agents import get_agent_profile
 from agent_workbench.generation import GenerationConfig
@@ -3196,3 +3197,224 @@ def test_scripted_cli_unexpected_formatter_path_fails_without_done(
     assert (repository / "unexpected.txt").read_text(encoding="utf-8") == (
         "preserve me\n"
     )
+
+
+def test_recover_command_routes_before_environment_and_session_construction(
+    monkeypatch,
+) -> None:
+    """Handle recover through the read-only path before provider runtime setup."""
+
+    load_environment_mock = Mock()
+    run_recovery_mock = Mock()
+    create_session_mock = Mock()
+
+    monkeypatch.setattr("agent_workbench.cli.load_environment", load_environment_mock)
+    monkeypatch.setattr(
+        "agent_workbench.cli._run_recovery_inspection",
+        run_recovery_mock,
+    )
+    monkeypatch.setattr(
+        "agent_workbench.cli.create_agent_session",
+        create_session_mock,
+    )
+
+    main(
+        [
+            "recover",
+            "--workspace",
+            ".",
+            "--lifecycle-store",
+            "./store",
+            "--session-id",
+            "task-001",
+        ]
+    )
+
+    load_environment_mock.assert_not_called()
+    create_session_mock.assert_not_called()
+    run_recovery_mock.assert_called_once()
+
+
+def test_isolated_cli_forwards_explicit_lifecycle_store_and_session_id(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """Forward the exact lifecycle store and SessionId into isolated workflow."""
+
+    source = tmp_path / "source"
+    source.mkdir()
+    target = tmp_path / "isolated"
+    lifecycle_store_path = tmp_path / "lifecycle-store"
+    lifecycle_store_path.mkdir()
+    configuration = RuntimeConfiguration(
+        provider_name="ollama",
+        model_name="test-model",
+        workspace_root=source,
+        enable_actions=True,
+        worktree_path=target,
+        worktree_branch="agent/task",
+    )
+    runner = Mock(
+        return_value=Mock(
+            coding_result=Mock(assistant_summary="Hidden."),
+            commit_result=Mock(branch_name="agent/task", operation_count=1),
+            final_worktree_state=Mock(clean=True),
+        )
+    )
+
+    monkeypatch.setattr("agent_workbench.cli.load_environment", Mock())
+    monkeypatch.setattr(
+        "agent_workbench.cli.resolve_runtime_configuration",
+        Mock(return_value=configuration),
+    )
+    monkeypatch.setattr(
+        "agent_workbench.cli.run_isolated_autonomous_workflow",
+        runner,
+    )
+
+    main(
+        [
+            "code",
+            "--workspace",
+            str(source),
+            "--enable-actions",
+            "--task",
+            "Fix it.",
+            "--worktree-path",
+            str(target),
+            "--worktree-branch",
+            "agent/task",
+            "--commit-message",
+            "fix: exact",
+            "--lifecycle-store",
+            str(lifecycle_store_path),
+            "--session-id",
+            "task-001",
+        ]
+    )
+
+    assert runner.call_args.args[0] == SessionId("task-001")
+    assert isinstance(
+        runner.call_args.kwargs["lifecycle_store"],
+        IsolatedCommitLifecycleStore,
+    )
+    assert runner.call_args.kwargs["max_tool_rounds"] == configuration.max_tool_rounds
+
+
+def test_isolated_cli_does_not_construct_lifecycle_store_when_absent(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """Keep existing isolated behavior when lifecycle options are omitted."""
+
+    source = tmp_path / "source"
+    source.mkdir()
+    target = tmp_path / "isolated"
+    configuration = RuntimeConfiguration(
+        provider_name="ollama",
+        model_name="test-model",
+        workspace_root=source,
+        enable_actions=True,
+        worktree_path=target,
+        worktree_branch="agent/task",
+    )
+    runner = Mock(
+        return_value=Mock(
+            coding_result=Mock(assistant_summary="Hidden."),
+            commit_result=Mock(branch_name="agent/task", operation_count=1),
+            final_worktree_state=Mock(clean=True),
+        )
+    )
+    constructor_mock = Mock(side_effect=AssertionError("must not be constructed"))
+
+    monkeypatch.setattr("agent_workbench.cli.load_environment", Mock())
+    monkeypatch.setattr(
+        "agent_workbench.cli.resolve_runtime_configuration",
+        Mock(return_value=configuration),
+    )
+    monkeypatch.setattr(
+        "agent_workbench.cli.run_isolated_autonomous_workflow",
+        runner,
+    )
+    monkeypatch.setattr(
+        "agent_workbench.cli.IsolatedCommitLifecycleStore",
+        constructor_mock,
+    )
+
+    main(
+        [
+            "code",
+            "--workspace",
+            str(source),
+            "--enable-actions",
+            "--task",
+            "Fix it.",
+            "--worktree-path",
+            str(target),
+            "--worktree-branch",
+            "agent/task",
+            "--commit-message",
+            "fix: exact",
+        ]
+    )
+
+    constructor_mock.assert_not_called()
+    assert runner.call_args.args[0] == SessionId("cli-session")
+    assert runner.call_args.kwargs["lifecycle_store"] is None
+
+
+def test_isolated_cli_invalid_lifecycle_store_fails_before_workflow_starts(
+    monkeypatch,
+    tmp_path,
+    capsys,
+) -> None:
+    """Fail isolated invocation early when lifecycle-store validation fails."""
+
+    source = tmp_path / "source"
+    source.mkdir()
+    target = tmp_path / "isolated"
+    missing_store = tmp_path / "missing-store"
+    configuration = RuntimeConfiguration(
+        provider_name="ollama",
+        model_name="test-model",
+        workspace_root=source,
+        enable_actions=True,
+        worktree_path=target,
+        worktree_branch="agent/task",
+    )
+    runner = Mock()
+
+    monkeypatch.setattr("agent_workbench.cli.load_environment", Mock())
+    monkeypatch.setattr(
+        "agent_workbench.cli.resolve_runtime_configuration",
+        Mock(return_value=configuration),
+    )
+    monkeypatch.setattr(
+        "agent_workbench.cli.run_isolated_autonomous_workflow",
+        runner,
+    )
+
+    exit_code = run_main_and_capture_exit_code(
+        [
+            "code",
+            "--workspace",
+            str(source),
+            "--enable-actions",
+            "--task",
+            "Fix it.",
+            "--worktree-path",
+            str(target),
+            "--worktree-branch",
+            "agent/task",
+            "--commit-message",
+            "fix: exact",
+            "--lifecycle-store",
+            str(missing_store),
+            "--session-id",
+            "task-001",
+        ]
+    )
+
+    assert exit_code == 1
+    runner.assert_not_called()
+    assert "lifecycle store directory does not exist" in capsys.readouterr().out
