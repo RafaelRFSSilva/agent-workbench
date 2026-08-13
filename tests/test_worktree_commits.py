@@ -1,6 +1,7 @@
 """Tests for approved local commits inside verified isolated worktrees."""
 
 from dataclasses import FrozenInstanceError
+import hashlib
 import os
 from pathlib import Path
 import subprocess
@@ -25,8 +26,10 @@ from agent_workbench.worktree_commits import (
     IsolatedCommitAction,
     IsolatedCommitApprovalRequest,
     IsolatedCommitPlan,
+    IsolatedCommitRecoveryCandidateEvidence,
     IsolatedCommitResult,
     create_isolated_commit,
+    inspect_isolated_commit_recovery_candidate,
     plan_isolated_commit,
 )
 from agent_workbench.worktrees import (
@@ -1414,3 +1417,800 @@ def test_second_commit_requires_a_fresh_plan_and_approval(tmp_path: Path) -> Non
         create_isolated_commit(second_plan, None)
 
     assert run_git(worktree, "rev-parse", "HEAD").stdout.strip() == first.new_head
+
+
+def test_candidate_evidence_is_frozen_slotted_value_comparable_and_hashable() -> None:
+    """Provide immutable value semantics for candidate evidence."""
+
+    first = IsolatedCommitRecoveryCandidateEvidence(
+        candidate_head="a" * 40,
+        parent_matches_old_head=RecoveryStatus.YES,
+        message_fingerprint_matches=RecoveryStatus.UNKNOWN,
+        paths_match_expected=RecoveryStatus.NO,
+    )
+    second = IsolatedCommitRecoveryCandidateEvidence(
+        candidate_head="a" * 40,
+        parent_matches_old_head=RecoveryStatus.YES,
+        message_fingerprint_matches=RecoveryStatus.UNKNOWN,
+        paths_match_expected=RecoveryStatus.NO,
+    )
+
+    assert first == second
+    assert hash(first) == hash(second)
+    assert len({first, second}) == 1
+    assert not hasattr(first, "__dict__")
+    with pytest.raises(FrozenInstanceError):
+        first.candidate_head = "b" * 40  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    ("parent", "message", "paths", "expected"),
+    [
+        (
+            RecoveryStatus.YES,
+            RecoveryStatus.YES,
+            RecoveryStatus.YES,
+            RecoveryStatus.YES,
+        ),
+        (RecoveryStatus.NO, RecoveryStatus.YES, RecoveryStatus.YES, RecoveryStatus.NO),
+        (
+            RecoveryStatus.YES,
+            RecoveryStatus.UNKNOWN,
+            RecoveryStatus.YES,
+            RecoveryStatus.UNKNOWN,
+        ),
+    ],
+)
+def test_candidate_metadata_matches_expected_aggregation(
+    parent: RecoveryStatus,
+    message: RecoveryStatus,
+    paths: RecoveryStatus,
+    expected: RecoveryStatus,
+) -> None:
+    """Aggregate candidate metadata matches conservatively."""
+
+    evidence = IsolatedCommitRecoveryCandidateEvidence(
+        candidate_head="a" * 40,
+        parent_matches_old_head=parent,
+        message_fingerprint_matches=message,
+        paths_match_expected=paths,
+    )
+
+    assert evidence.metadata_matches_expected is expected
+
+
+def test_candidate_inspection_rejects_invalid_types_before_git_commands(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Validate caller-controlled types before candidate Git inspection."""
+
+    module = pytest.importorskip("agent_workbench.worktree_commits")
+    calls: list[tuple[str, ...]] = []
+    original_run_git = module._run_git
+
+    def recording_run_git(repository, arguments, *, input_bytes=None):
+        calls.append(tuple(arguments))
+        return original_run_git(repository, arguments, input_bytes=input_bytes)
+
+    monkeypatch.setattr(module, "_run_git", recording_run_git)
+
+    with pytest.raises(ConfigurationError, match="repository Path"):
+        inspect_isolated_commit_recovery_candidate(  # type: ignore[arg-type]
+            "not-a-path",
+            "a" * 40,
+            old_head="b" * 40,
+            expected_paths=("tracked.txt",),
+            commit_message_fingerprint="0" * 64,
+        )
+
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("candidate_head", "old_head"),
+    [
+        ("A" * 40, "b" * 40),
+        ("a" * 39, "b" * 40),
+        ("a" * 40, "B" * 40),
+        ("a" * 40, "b" * 39),
+    ],
+)
+def test_candidate_inspection_rejects_invalid_object_ids(
+    tmp_path: Path,
+    monkeypatch,
+    candidate_head: str,
+    old_head: str,
+) -> None:
+    """Require complete lowercase object IDs for candidate and old head."""
+
+    module = pytest.importorskip("agent_workbench.worktree_commits")
+    calls: list[tuple[str, ...]] = []
+    original_run_git = module._run_git
+
+    def recording_run_git(repository, arguments, *, input_bytes=None):
+        calls.append(tuple(arguments))
+        return original_run_git(repository, arguments, input_bytes=input_bytes)
+
+    monkeypatch.setattr(module, "_run_git", recording_run_git)
+
+    with pytest.raises(ConfigurationError, match="candidate"):
+        inspect_isolated_commit_recovery_candidate(
+            tmp_path,
+            candidate_head,
+            old_head=old_head,
+            expected_paths=("tracked.txt",),
+            commit_message_fingerprint="0" * 64,
+        )
+
+    assert calls == []
+
+
+@pytest.mark.parametrize("paths", [(), ("",), ("../x",), ("x", "x")])
+def test_candidate_inspection_rejects_invalid_expected_paths(
+    tmp_path: Path,
+    monkeypatch,
+    paths: tuple[str, ...],
+) -> None:
+    """Require non-empty unique safe expected path values."""
+
+    module = pytest.importorskip("agent_workbench.worktree_commits")
+    calls: list[tuple[str, ...]] = []
+    original_run_git = module._run_git
+
+    def recording_run_git(repository, arguments, *, input_bytes=None):
+        calls.append(tuple(arguments))
+        return original_run_git(repository, arguments, input_bytes=input_bytes)
+
+    monkeypatch.setattr(module, "_run_git", recording_run_git)
+
+    with pytest.raises(ConfigurationError, match="expected paths|unsafe|duplicate"):
+        inspect_isolated_commit_recovery_candidate(
+            tmp_path,
+            "a" * 40,
+            old_head="b" * 40,
+            expected_paths=paths,
+            commit_message_fingerprint="0" * 64,
+        )
+
+    assert calls == []
+
+
+@pytest.mark.parametrize("fingerprint", ["", "a" * 63, "A" * 64, "g" * 64])
+def test_candidate_inspection_rejects_invalid_commit_message_fingerprints(
+    tmp_path: Path,
+    monkeypatch,
+    fingerprint: str,
+) -> None:
+    """Require lowercase 64-hex commit message fingerprints."""
+
+    module = pytest.importorskip("agent_workbench.worktree_commits")
+    calls: list[tuple[str, ...]] = []
+    original_run_git = module._run_git
+
+    def recording_run_git(repository, arguments, *, input_bytes=None):
+        calls.append(tuple(arguments))
+        return original_run_git(repository, arguments, input_bytes=input_bytes)
+
+    monkeypatch.setattr(module, "_run_git", recording_run_git)
+
+    with pytest.raises(ConfigurationError, match="fingerprint"):
+        inspect_isolated_commit_recovery_candidate(
+            tmp_path,
+            "a" * 40,
+            old_head="b" * 40,
+            expected_paths=("tracked.txt",),
+            commit_message_fingerprint=fingerprint,
+        )
+
+    assert calls == []
+
+
+def test_candidate_inspection_requires_exact_non_bare_git_top_level(
+    tmp_path: Path,
+) -> None:
+    """Reject non-top-level, missing, and bare repositories."""
+
+    source = create_repository(tmp_path / "source")
+    nested = source / "nested"
+    nested.mkdir()
+    with pytest.raises(ConfigurationError, match="top-level"):
+        inspect_isolated_commit_recovery_candidate(
+            nested,
+            "a" * 40,
+            old_head="b" * 40,
+            expected_paths=("tracked.txt",),
+            commit_message_fingerprint="0" * 64,
+        )
+
+    bare = tmp_path / "bare.git"
+    bare.mkdir()
+    run_git(bare, "init", "--bare")
+    with pytest.raises(ConfigurationError, match="non-bare|valid Git"):
+        inspect_isolated_commit_recovery_candidate(
+            bare,
+            "a" * 40,
+            old_head="b" * 40,
+            expected_paths=("tracked.txt",),
+            commit_message_fingerprint="0" * 64,
+        )
+
+
+def test_candidate_inspection_allows_dirty_repository(tmp_path: Path) -> None:
+    """Do not require source repository cleanliness for candidate inspection."""
+
+    source, handle = create_isolated_worktree(tmp_path)
+    worktree = handle.worktree_path
+    tracked = worktree / "tracked.txt"
+    tracked.write_text("candidate\n", encoding="utf-8")
+    message = "candidate message"
+    plan = plan_isolated_commit(handle, message)
+    result = create_isolated_commit(
+        plan,
+        lambda _request: ToolApprovalDecision.APPROVE,
+    )
+    (source / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+
+    evidence = inspect_isolated_commit_recovery_candidate(
+        source,
+        result.new_head,
+        old_head=plan.old_head,
+        expected_paths=plan.paths,
+        commit_message_fingerprint=hashlib.sha256(message.encode("utf-8")).hexdigest(),
+    )
+
+    assert evidence.parent_matches_old_head is RecoveryStatus.YES
+
+
+def _make_candidate_commit(
+    tmp_path: Path,
+    *,
+    message: str,
+    modify_paths: tuple[tuple[str, str], ...],
+    as_merge: bool = False,
+) -> tuple[Path, str, str, tuple[str, ...], str]:
+    """Create one real candidate commit and return inspection inputs."""
+
+    source, handle = create_isolated_worktree(tmp_path)
+    worktree = handle.worktree_path
+    old_head = run_git(worktree, "rev-parse", "HEAD").stdout.strip()
+    for path, content in modify_paths:
+        target = worktree / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+    run_git(worktree, "add", "--", *[path for path, _ in modify_paths])
+    run_git(worktree, "commit", "-m", message)
+    candidate = run_git(worktree, "rev-parse", "HEAD").stdout.strip()
+    if as_merge:
+        run_git(worktree, "branch", "agent/side", old_head)
+        run_git(worktree, "switch", "agent/side")
+        (worktree / "side.txt").write_text("side\n", encoding="utf-8")
+        run_git(worktree, "add", "side.txt")
+        run_git(worktree, "commit", "-m", "side")
+        run_git(worktree, "switch", "agent/task")
+        run_git(worktree, "merge", "--no-ff", "agent/side", "-m", "merge")
+        candidate = run_git(worktree, "rev-parse", "HEAD").stdout.strip()
+
+    return (
+        source,
+        old_head,
+        candidate,
+        tuple(sorted(path for path, _ in modify_paths)),
+        hashlib.sha256(message.encode("utf-8")).hexdigest(),
+    )
+
+
+def test_candidate_parent_yes_for_single_old_head_parent(tmp_path: Path) -> None:
+    """Report YES when candidate has exactly one parent equal to old_head."""
+
+    source, old_head, candidate, paths, fingerprint = _make_candidate_commit(
+        tmp_path,
+        message="candidate",
+        modify_paths=(("tracked.txt", "candidate\n"),),
+    )
+
+    evidence = inspect_isolated_commit_recovery_candidate(
+        source,
+        candidate,
+        old_head=old_head,
+        expected_paths=paths,
+        commit_message_fingerprint=fingerprint,
+    )
+
+    assert evidence.parent_matches_old_head is RecoveryStatus.YES
+
+
+def test_candidate_parent_no_for_root_or_wrong_parent(tmp_path: Path) -> None:
+    """Report NO for root commits and non-matching single parent commits."""
+
+    repo = tmp_path / "root-repo"
+    repo.mkdir()
+    run_git(repo, "init", "-b", "main")
+    run_git(repo, "config", "user.name", "Root User")
+    run_git(repo, "config", "user.email", "root@example.invalid")
+    (repo / "x.txt").write_text("x\n", encoding="utf-8")
+    run_git(repo, "add", "x.txt")
+    run_git(repo, "commit", "-m", "root")
+    root_head = run_git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    root_evidence = inspect_isolated_commit_recovery_candidate(
+        repo,
+        root_head,
+        old_head="a" * 40,
+        expected_paths=("x.txt",),
+        commit_message_fingerprint=hashlib.sha256(b"root\n").hexdigest(),
+    )
+    assert root_evidence.parent_matches_old_head is RecoveryStatus.NO
+
+    wrong_parent_root = tmp_path / "wrong-parent"
+    wrong_parent_root.mkdir()
+    source, old_head, candidate, paths, fingerprint = _make_candidate_commit(
+        wrong_parent_root,
+        message="candidate",
+        modify_paths=(("tracked.txt", "candidate\n"),),
+    )
+    wrong_parent = "f" * 40 if old_head != "f" * 40 else "e" * 40
+    wrong_evidence = inspect_isolated_commit_recovery_candidate(
+        source,
+        candidate,
+        old_head=wrong_parent,
+        expected_paths=paths,
+        commit_message_fingerprint=fingerprint,
+    )
+    assert wrong_evidence.parent_matches_old_head is RecoveryStatus.NO
+
+
+def test_candidate_parent_no_for_merge_commit(tmp_path: Path) -> None:
+    """Report NO when candidate has multiple parents."""
+
+    source, old_head, candidate, _paths, _fingerprint = _make_candidate_commit(
+        tmp_path,
+        message="candidate",
+        modify_paths=(("tracked.txt", "candidate\n"),),
+        as_merge=True,
+    )
+
+    evidence = inspect_isolated_commit_recovery_candidate(
+        source,
+        candidate,
+        old_head=old_head,
+        expected_paths=("tracked.txt", "side.txt"),
+        commit_message_fingerprint=hashlib.sha256(b"merge\n").hexdigest(),
+    )
+    assert evidence.parent_matches_old_head is RecoveryStatus.NO
+
+
+def test_candidate_parent_unknown_on_failed_or_malformed_parent_output(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Report UNKNOWN when parent relation cannot be safely interpreted."""
+
+    source, old_head, candidate, paths, fingerprint = _make_candidate_commit(
+        tmp_path,
+        message="candidate",
+        modify_paths=(("tracked.txt", "candidate\n"),),
+    )
+    module = pytest.importorskip("agent_workbench.worktree_commits")
+    original = module._run_git
+
+    def malformed(repository, arguments, *, input_bytes=None):
+        args = tuple(arguments)
+        if args[:3] == ("rev-list", "--parents", "-n"):
+            return module._GitOutput(0, b"bad-parent-output\n", b"")
+        return original(repository, arguments, input_bytes=input_bytes)
+
+    monkeypatch.setattr(module, "_run_git", malformed)
+    evidence = inspect_isolated_commit_recovery_candidate(
+        source,
+        candidate,
+        old_head=old_head,
+        expected_paths=paths,
+        commit_message_fingerprint=fingerprint,
+    )
+    assert evidence.parent_matches_old_head is RecoveryStatus.UNKNOWN
+
+    def malformed_multiline(repository, arguments, *, input_bytes=None):
+        args = tuple(arguments)
+        if args[:3] == ("rev-list", "--parents", "-n"):
+            payload = (
+                candidate.encode("ascii") + b"\n" + old_head.encode("ascii") + b"\n"
+            )
+            return module._GitOutput(0, payload, b"")
+        return original(repository, arguments, input_bytes=input_bytes)
+
+    monkeypatch.setattr(module, "_run_git", malformed_multiline)
+    multiline = inspect_isolated_commit_recovery_candidate(
+        source,
+        candidate,
+        old_head=old_head,
+        expected_paths=paths,
+        commit_message_fingerprint=fingerprint,
+    )
+    assert multiline.parent_matches_old_head is RecoveryStatus.UNKNOWN
+
+
+def test_candidate_message_fingerprint_yes_for_exact_or_one_lf_trimmed(
+    tmp_path: Path,
+) -> None:
+    """Match stored commit-message bytes with optional single trailing LF."""
+
+    source, old_head, candidate, paths, _ = _make_candidate_commit(
+        tmp_path,
+        message="exact-message",
+        modify_paths=(("tracked.txt", "candidate\n"),),
+    )
+    exact_fp = hashlib.sha256(b"exact-message\n").hexdigest()
+    trimmed_fp = hashlib.sha256(b"exact-message").hexdigest()
+
+    exact = inspect_isolated_commit_recovery_candidate(
+        source,
+        candidate,
+        old_head=old_head,
+        expected_paths=paths,
+        commit_message_fingerprint=exact_fp,
+    )
+    trimmed = inspect_isolated_commit_recovery_candidate(
+        source,
+        candidate,
+        old_head=old_head,
+        expected_paths=paths,
+        commit_message_fingerprint=trimmed_fp,
+    )
+
+    assert exact.message_fingerprint_matches is RecoveryStatus.YES
+    assert trimmed.message_fingerprint_matches is RecoveryStatus.YES
+
+
+def test_candidate_message_fingerprint_no_for_different_message(tmp_path: Path) -> None:
+    """Report NO when commit body is readable but digest does not match."""
+
+    source, old_head, candidate, paths, _ = _make_candidate_commit(
+        tmp_path,
+        message="candidate",
+        modify_paths=(("tracked.txt", "candidate\n"),),
+    )
+
+    evidence = inspect_isolated_commit_recovery_candidate(
+        source,
+        candidate,
+        old_head=old_head,
+        expected_paths=paths,
+        commit_message_fingerprint=hashlib.sha256(b"different").hexdigest(),
+    )
+    assert evidence.message_fingerprint_matches is RecoveryStatus.NO
+
+
+def test_candidate_message_fingerprint_unknown_when_commit_body_unavailable(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Report UNKNOWN when commit object cannot be safely parsed."""
+
+    source, old_head, candidate, paths, fingerprint = _make_candidate_commit(
+        tmp_path,
+        message="candidate",
+        modify_paths=(("tracked.txt", "candidate\n"),),
+    )
+    module = pytest.importorskip("agent_workbench.worktree_commits")
+    original = module._run_git
+
+    def malformed(repository, arguments, *, input_bytes=None):
+        args = tuple(arguments)
+        if args[:2] == ("cat-file", "commit"):
+            return module._GitOutput(0, b"tree abc\nparent def\n", b"")
+        return original(repository, arguments, input_bytes=input_bytes)
+
+    monkeypatch.setattr(module, "_run_git", malformed)
+    evidence = inspect_isolated_commit_recovery_candidate(
+        source,
+        candidate,
+        old_head=old_head,
+        expected_paths=paths,
+        commit_message_fingerprint=fingerprint,
+    )
+    assert evidence.message_fingerprint_matches is RecoveryStatus.UNKNOWN
+
+
+def test_candidate_paths_yes_for_exact_complete_set(tmp_path: Path) -> None:
+    """Report YES only when complete committed A/M path set equals expected set."""
+
+    source, old_head, candidate, paths, fingerprint = _make_candidate_commit(
+        tmp_path,
+        message="candidate",
+        modify_paths=(("tracked.txt", "candidate\n"),),
+    )
+
+    evidence = inspect_isolated_commit_recovery_candidate(
+        source,
+        candidate,
+        old_head=old_head,
+        expected_paths=paths,
+        commit_message_fingerprint=fingerprint,
+    )
+    assert evidence.paths_match_expected is RecoveryStatus.YES
+
+
+def test_candidate_paths_no_for_missing_additional_or_unsupported_status(
+    tmp_path: Path,
+) -> None:
+    """Report NO for missing, extra, or unsupported committed path statuses."""
+
+    source, old_head, candidate, _paths, fingerprint = _make_candidate_commit(
+        tmp_path,
+        message="candidate",
+        modify_paths=(("tracked.txt", "candidate\n"),),
+    )
+
+    missing = inspect_isolated_commit_recovery_candidate(
+        source,
+        candidate,
+        old_head=old_head,
+        expected_paths=("tracked.txt", "missing.txt"),
+        commit_message_fingerprint=fingerprint,
+    )
+    assert missing.paths_match_expected is RecoveryStatus.NO
+
+    extra_root = tmp_path / "extra"
+    extra_root.mkdir()
+    source_extra, old_head_extra, candidate_extra, _paths_extra, fp_extra = (
+        _make_candidate_commit(
+            extra_root,
+            message="candidate-extra",
+            modify_paths=(("tracked.txt", "candidate\n"), ("extra.txt", "x\n")),
+        )
+    )
+    additional = inspect_isolated_commit_recovery_candidate(
+        source_extra,
+        candidate_extra,
+        old_head=old_head_extra,
+        expected_paths=("tracked.txt",),
+        commit_message_fingerprint=fp_extra,
+    )
+    assert additional.paths_match_expected is RecoveryStatus.NO
+
+    delete_root = tmp_path / "delete"
+    delete_root.mkdir()
+    source2, handle2 = create_isolated_worktree(delete_root)
+    worktree2 = handle2.worktree_path
+    old_head2 = run_git(worktree2, "rev-parse", "HEAD").stdout.strip()
+    run_git(worktree2, "rm", "tracked.txt")
+    run_git(worktree2, "commit", "-m", "delete tracked")
+    candidate2 = run_git(worktree2, "rev-parse", "HEAD").stdout.strip()
+
+    deleted = inspect_isolated_commit_recovery_candidate(
+        source2,
+        candidate2,
+        old_head=old_head2,
+        expected_paths=("tracked.txt",),
+        commit_message_fingerprint=hashlib.sha256(b"delete tracked\n").hexdigest(),
+    )
+    assert deleted.paths_match_expected is RecoveryStatus.NO
+
+
+def test_candidate_paths_no_for_unsafe_or_unrepresentable_names_and_unknown_on_failure(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Keep unsafe names hidden and classify command failure as UNKNOWN."""
+
+    source, old_head, candidate, paths, fingerprint = _make_candidate_commit(
+        tmp_path,
+        message="candidate",
+        modify_paths=(("tracked.txt", "candidate\n"),),
+    )
+    module = pytest.importorskip("agent_workbench.worktree_commits")
+    original = module._run_git
+
+    def unsafe_name(repository, arguments, *, input_bytes=None):
+        args = tuple(arguments)
+        if args[:2] == ("diff-tree", "--no-commit-id"):
+            return module._GitOutput(0, b"A\0bad\\name.txt\0", b"")
+        return original(repository, arguments, input_bytes=input_bytes)
+
+    monkeypatch.setattr(module, "_run_git", unsafe_name)
+    unsafe = inspect_isolated_commit_recovery_candidate(
+        source,
+        candidate,
+        old_head=old_head,
+        expected_paths=paths,
+        commit_message_fingerprint=fingerprint,
+    )
+    assert unsafe.paths_match_expected is RecoveryStatus.NO
+    assert "bad\\name.txt" not in repr(unsafe)
+
+    def failed_paths(repository, arguments, *, input_bytes=None):
+        args = tuple(arguments)
+        if args[:2] == ("diff-tree", "--no-commit-id"):
+            return module._GitOutput(1, b"", b"failed")
+        return original(repository, arguments, input_bytes=input_bytes)
+
+    monkeypatch.setattr(module, "_run_git", failed_paths)
+    unknown = inspect_isolated_commit_recovery_candidate(
+        source,
+        candidate,
+        old_head=old_head,
+        expected_paths=paths,
+        commit_message_fingerprint=fingerprint,
+    )
+    assert unknown.paths_match_expected is RecoveryStatus.UNKNOWN
+
+
+def test_candidate_paths_whitespace_only_path_consistency(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Treat non-empty whitespace-only paths consistently with expected-path validation."""
+
+    source, old_head, candidate, _paths, fingerprint = _make_candidate_commit(
+        tmp_path,
+        message="candidate",
+        modify_paths=(("tracked.txt", "candidate\n"),),
+    )
+    module = pytest.importorskip("agent_workbench.worktree_commits")
+    original = module._run_git
+
+    def whitespace_path(repository, arguments, *, input_bytes=None):
+        args = tuple(arguments)
+        if args[:2] == ("diff-tree", "--no-commit-id"):
+            return module._GitOutput(0, b"A\0   \0", b"")
+        return original(repository, arguments, input_bytes=input_bytes)
+
+    monkeypatch.setattr(module, "_run_git", whitespace_path)
+    evidence = inspect_isolated_commit_recovery_candidate(
+        source,
+        candidate,
+        old_head=old_head,
+        expected_paths=("   ",),
+        commit_message_fingerprint=fingerprint,
+    )
+
+    assert evidence.paths_match_expected is RecoveryStatus.YES
+
+
+def test_candidate_evidence_repr_hides_paths_message_author_and_contents(
+    tmp_path: Path,
+) -> None:
+    """Candidate evidence repr must not expose sensitive context details."""
+
+    source, old_head, candidate, paths, fingerprint = _make_candidate_commit(
+        tmp_path,
+        message="sensitive-message",
+        modify_paths=(("tracked.txt", "candidate\n"),),
+    )
+    evidence = inspect_isolated_commit_recovery_candidate(
+        source,
+        candidate,
+        old_head=old_head,
+        expected_paths=paths,
+        commit_message_fingerprint=fingerprint,
+    )
+
+    text = repr(evidence)
+    assert str(source.resolve()) not in text
+    assert "sensitive-message" not in text
+    assert "Commit Test User" not in text
+    assert "commit-test@example.invalid" not in text
+    assert "tracked.txt" not in text
+
+
+def test_candidate_inspection_never_reads_author_identity_or_diff_fingerprint(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Candidate inspection must not query author identity or diff fingerprints."""
+
+    source, old_head, candidate, paths, fingerprint = _make_candidate_commit(
+        tmp_path,
+        message="candidate",
+        modify_paths=(("tracked.txt", "candidate\n"),),
+    )
+    module = pytest.importorskip("agent_workbench.worktree_commits")
+    original = module._run_git
+    commands: list[tuple[str, ...]] = []
+
+    def recording(repository, arguments, *, input_bytes=None):
+        args = tuple(arguments)
+        commands.append(args)
+        return original(repository, arguments, input_bytes=input_bytes)
+
+    monkeypatch.setattr(module, "_run_git", recording)
+    inspect_isolated_commit_recovery_candidate(
+        source,
+        candidate,
+        old_head=old_head,
+        expected_paths=paths,
+        commit_message_fingerprint=fingerprint,
+    )
+
+    assert not any(
+        args[:2] == ("config", "--local") and "user.name" in args for args in commands
+    )
+    assert not any(
+        args[:2] == ("config", "--local") and "user.email" in args for args in commands
+    )
+    assert not any("diff_fingerprint" in " ".join(args) for args in commands)
+
+
+def test_candidate_inspection_executes_no_mutating_git_commands(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Candidate inspection must run read-only Git commands only."""
+
+    source, old_head, candidate, paths, fingerprint = _make_candidate_commit(
+        tmp_path,
+        message="candidate",
+        modify_paths=(("tracked.txt", "candidate\n"),),
+    )
+    module = pytest.importorskip("agent_workbench.worktree_commits")
+    original = module._run_git
+    commands: list[tuple[str, ...]] = []
+
+    def recording(repository, arguments, *, input_bytes=None):
+        args = tuple(arguments)
+        commands.append(args)
+        return original(repository, arguments, input_bytes=input_bytes)
+
+    monkeypatch.setattr(module, "_run_git", recording)
+    inspect_isolated_commit_recovery_candidate(
+        source,
+        candidate,
+        old_head=old_head,
+        expected_paths=paths,
+        commit_message_fingerprint=fingerprint,
+    )
+
+    forbidden = {
+        ("add",),
+        ("commit",),
+        ("reset",),
+        ("restore",),
+        ("clean",),
+        ("stash",),
+        ("checkout",),
+        ("switch",),
+        ("merge",),
+        ("rebase",),
+        ("fetch",),
+        ("pull",),
+        ("push",),
+    }
+    flattened = [" ".join(args) for args in commands]
+    assert not any(
+        any(token == args[0] for (token,) in forbidden) for args in commands if args
+    )
+    assert not any("worktree add" in entry for entry in flattened)
+    assert not any("worktree remove" in entry for entry in flattened)
+    assert not any("branch -d" in entry or "branch -D" in entry for entry in flattened)
+
+
+def test_candidate_metadata_can_match_with_different_file_content_than_original_plan(
+    tmp_path: Path,
+) -> None:
+    """Document candidate semantics as weaker than exact in-process diff verification."""
+
+    source, handle = create_isolated_worktree(tmp_path)
+    worktree = handle.worktree_path
+    planned_message = "planned message"
+    (worktree / "tracked.txt").write_text("planned-content\n", encoding="utf-8")
+    plan = plan_isolated_commit(handle, planned_message)
+    old_head = plan.old_head
+
+    run_git(worktree, "reset", "--hard", "HEAD")
+    (worktree / "tracked.txt").write_text("different-content\n", encoding="utf-8")
+    run_git(worktree, "add", "--", "tracked.txt")
+    run_git(worktree, "commit", "-m", planned_message)
+    candidate = run_git(worktree, "rev-parse", "HEAD").stdout.strip()
+
+    evidence = inspect_isolated_commit_recovery_candidate(
+        source,
+        candidate,
+        old_head=old_head,
+        expected_paths=plan.paths,
+        commit_message_fingerprint=hashlib.sha256(
+            planned_message.encode("utf-8")
+        ).hexdigest(),
+    )
+
+    assert evidence.metadata_matches_expected is RecoveryStatus.YES

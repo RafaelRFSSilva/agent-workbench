@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
+import re
 import shlex
 import signal
 import stat
@@ -76,6 +77,12 @@ _IN_PROGRESS_GIT_PATHS = (
     "index.lock",
 )
 _ZERO_OBJECT_IDS = {"0" * 40, "0" * 64}
+_LOWER_OBJECT_ID_PATTERN = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+_LOWER_SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+_UNSAFE_LOCAL_CONFIG_PATTERN = (
+    r"^(filter\..*\.(clean|smudge|process)|diff\.external|"
+    r"diff\..*\.(command|textconv))$"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -264,6 +271,117 @@ class IsolatedCommitResult:
     operation_count: int
     added_count: int
     modified_count: int
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class IsolatedCommitRecoveryCandidateEvidence:
+    """Store bounded immutable facts for one observed candidate commit."""
+
+    candidate_head: str
+    parent_matches_old_head: RecoveryStatus
+    message_fingerprint_matches: RecoveryStatus
+    paths_match_expected: RecoveryStatus
+
+    def __init__(
+        self,
+        *,
+        candidate_head: str,
+        parent_matches_old_head: RecoveryStatus,
+        message_fingerprint_matches: RecoveryStatus,
+        paths_match_expected: RecoveryStatus,
+    ) -> None:
+        """Validate and snapshot one conservative candidate observation."""
+
+        safe_candidate_head = _validate_lower_object_id(
+            candidate_head,
+            field_name="candidate_head",
+        )
+        for field_name, value in (
+            ("parent match", parent_matches_old_head),
+            ("message fingerprint match", message_fingerprint_matches),
+            ("paths match", paths_match_expected),
+        ):
+            if not isinstance(value, RecoveryStatus):
+                raise ConfigurationError(
+                    f"isolated commit candidate {field_name} must be a RecoveryStatus."
+                )
+
+        object.__setattr__(self, "candidate_head", safe_candidate_head)
+        object.__setattr__(self, "parent_matches_old_head", parent_matches_old_head)
+        object.__setattr__(
+            self,
+            "message_fingerprint_matches",
+            message_fingerprint_matches,
+        )
+        object.__setattr__(self, "paths_match_expected", paths_match_expected)
+
+    @property
+    def metadata_matches_expected(self) -> RecoveryStatus:
+        """Aggregate candidate metadata-match facts conservatively."""
+
+        values = (
+            self.parent_matches_old_head,
+            self.message_fingerprint_matches,
+            self.paths_match_expected,
+        )
+        if any(value is RecoveryStatus.NO for value in values):
+            return RecoveryStatus.NO
+        if all(value is RecoveryStatus.YES for value in values):
+            return RecoveryStatus.YES
+        return RecoveryStatus.UNKNOWN
+
+
+def inspect_isolated_commit_recovery_candidate(
+    repository: Path,
+    candidate_head: str,
+    *,
+    old_head: str,
+    expected_paths: Iterable[str],
+    commit_message_fingerprint: str,
+) -> IsolatedCommitRecoveryCandidateEvidence:
+    """Inspect one current candidate commit using read-only bounded Git facts."""
+
+    if not isinstance(repository, Path):
+        raise ConfigurationError(
+            "isolated commit candidate inspection requires a repository Path."
+        )
+    safe_candidate_head = _validate_lower_object_id(
+        candidate_head,
+        field_name="candidate_head",
+    )
+    safe_old_head = _validate_lower_object_id(old_head, field_name="old_head")
+    safe_expected_paths = _snapshot_expected_paths(expected_paths)
+    if safe_expected_paths is None or not safe_expected_paths:
+        raise ConfigurationError(
+            "isolated commit candidate expected paths must be non-empty."
+        )
+    safe_message_fingerprint = _validate_lower_sha256(
+        commit_message_fingerprint,
+        field_name="commit_message_fingerprint",
+    )
+
+    safe_repository = _validate_candidate_repository(repository)
+    parent_match = _inspect_candidate_parent(
+        safe_repository,
+        candidate_head=safe_candidate_head,
+        old_head=safe_old_head,
+    )
+    message_match = _inspect_candidate_message_fingerprint(
+        safe_repository,
+        candidate_head=safe_candidate_head,
+        commit_message_fingerprint=safe_message_fingerprint,
+    )
+    paths_match = _inspect_candidate_paths(
+        safe_repository,
+        candidate_head=safe_candidate_head,
+        expected_paths=safe_expected_paths,
+    )
+    return IsolatedCommitRecoveryCandidateEvidence(
+        candidate_head=safe_candidate_head,
+        parent_matches_old_head=parent_match,
+        message_fingerprint_matches=message_match,
+        paths_match_expected=paths_match,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -516,6 +634,245 @@ def _require_commit_approval(
         raise CompletionError("Isolated commit approval was denied.")
     if decision is not ToolApprovalDecision.APPROVE:
         raise CompletionError("Isolated commit approval decision is invalid.")
+
+
+def _validate_lower_object_id(value: object, *, field_name: str) -> str:
+    """Require one complete lowercase SHA-1 or SHA-256 Git object id."""
+
+    if not isinstance(value, str) or _LOWER_OBJECT_ID_PATTERN.fullmatch(value) is None:
+        raise ConfigurationError(
+            f"isolated commit candidate {field_name} must be a complete lowercase Git object identifier."
+        )
+    return value
+
+
+def _validate_lower_sha256(value: object, *, field_name: str) -> str:
+    """Require one lowercase 64-hex SHA-256 digest."""
+
+    if not isinstance(value, str) or _LOWER_SHA256_PATTERN.fullmatch(value) is None:
+        raise ConfigurationError(
+            f"isolated commit candidate {field_name} must be a lowercase SHA-256 digest."
+        )
+    return value
+
+
+def _validate_candidate_repository(repository: Path) -> Path:
+    """Require one exact primary non-bare Git top-level for candidate checks."""
+
+    try:
+        canonical = repository.expanduser().resolve(strict=True)
+    except (FileNotFoundError, OSError, RuntimeError):
+        raise ConfigurationError(
+            "isolated commit candidate repository is unavailable."
+        ) from None
+    if not canonical.is_dir():
+        raise ConfigurationError("isolated commit candidate repository is invalid.")
+
+    top_level = _run_git(canonical, ("rev-parse", "--show-toplevel"))
+    if top_level.returncode != 0:
+        raise ConfigurationError(
+            "isolated commit candidate repository is not a valid Git repository."
+        )
+    try:
+        reported = Path(_decode_line(top_level.stdout, "Git top-level")).resolve(
+            strict=True
+        )
+    except (ConfigurationError, FileNotFoundError, OSError, RuntimeError):
+        raise ConfigurationError(
+            "isolated commit candidate repository top-level is invalid."
+        ) from None
+    if reported != canonical:
+        raise ConfigurationError(
+            "isolated commit candidate repository must be the exact Git top-level."
+        )
+
+    bare = _run_git(canonical, ("rev-parse", "--is-bare-repository"))
+    if bare.returncode != 0 or _decode_line(bare.stdout, "Git bare state") != "false":
+        raise ConfigurationError(
+            "isolated commit candidate repository must be a primary non-bare working tree."
+        )
+
+    unsafe_config = _run_git(
+        canonical,
+        (
+            "config",
+            "--local",
+            "--get-regexp",
+            _UNSAFE_LOCAL_CONFIG_PATTERN,
+        ),
+    )
+    if unsafe_config.returncode not in (0, 1):
+        raise ConfigurationError(
+            "unable to inspect repository-local Git configuration."
+        )
+    if unsafe_config.returncode == 0 and unsafe_config.stdout:
+        raise ConfigurationError(
+            "source repository contains unsafe local Git execution configuration."
+        )
+    return canonical
+
+
+def _inspect_candidate_parent(
+    repository: Path,
+    *,
+    candidate_head: str,
+    old_head: str,
+) -> RecoveryStatus:
+    """Observe candidate parent relation conservatively."""
+
+    try:
+        output = _run_git(
+            repository,
+            ("rev-list", "--parents", "-n", "1", candidate_head),
+        )
+    except ConfigurationError:
+        return RecoveryStatus.UNKNOWN
+    if output.returncode != 0:
+        return RecoveryStatus.UNKNOWN
+
+    fields = _parse_candidate_parent_fields(output.stdout)
+    if fields is None:
+        return RecoveryStatus.UNKNOWN
+    if fields[0] != candidate_head:
+        return RecoveryStatus.UNKNOWN
+
+    if len(fields) == 1:
+        return RecoveryStatus.NO
+    if len(fields) == 2:
+        return RecoveryStatus.YES if fields[1] == old_head else RecoveryStatus.NO
+    return RecoveryStatus.NO
+
+
+def _parse_candidate_parent_fields(output: bytes) -> tuple[str, ...] | None:
+    """Parse strict one-line candidate-parent output conservatively."""
+
+    try:
+        decoded = output.decode("ascii")
+    except UnicodeDecodeError:
+        return None
+
+    if decoded.endswith("\n"):
+        decoded = decoded[:-1]
+    if not decoded or "\n" in decoded or "\r" in decoded or "\0" in decoded:
+        return None
+
+    fields = tuple(decoded.split(" "))
+    if not fields or any(not field for field in fields):
+        return None
+    if any(_LOWER_OBJECT_ID_PATTERN.fullmatch(field) is None for field in fields):
+        return None
+    return fields
+
+
+def _inspect_candidate_message_fingerprint(
+    repository: Path,
+    *,
+    candidate_head: str,
+    commit_message_fingerprint: str,
+) -> RecoveryStatus:
+    """Observe whether the candidate message bytes match persisted fingerprint."""
+
+    try:
+        output = _run_git(repository, ("cat-file", "commit", candidate_head))
+    except ConfigurationError:
+        return RecoveryStatus.UNKNOWN
+    if output.returncode != 0:
+        return RecoveryStatus.UNKNOWN
+
+    separator = output.stdout.find(b"\n\n")
+    if separator < 0:
+        return RecoveryStatus.UNKNOWN
+    body = output.stdout[separator + 2 :]
+
+    digests = {hashlib.sha256(body).hexdigest()}
+    if body.endswith(b"\n"):
+        digests.add(hashlib.sha256(body[:-1]).hexdigest())
+    if commit_message_fingerprint in digests:
+        return RecoveryStatus.YES
+    return RecoveryStatus.NO
+
+
+def _inspect_candidate_paths(
+    repository: Path,
+    *,
+    candidate_head: str,
+    expected_paths: tuple[str, ...],
+) -> RecoveryStatus:
+    """Observe whether the candidate committed path set equals expected paths."""
+
+    try:
+        output = _run_git(
+            repository,
+            (
+                "diff-tree",
+                "--no-commit-id",
+                "--name-status",
+                "--no-renames",
+                "--no-ext-diff",
+                "-r",
+                "-z",
+                candidate_head,
+            ),
+        )
+    except ConfigurationError:
+        return RecoveryStatus.UNKNOWN
+    if output.returncode != 0:
+        return RecoveryStatus.UNKNOWN
+
+    fields = [field for field in output.stdout.split(b"\0") if field]
+    observed_paths: set[str] = set()
+    index = 0
+    while index < len(fields):
+        field = fields[index]
+        index += 1
+        if b"\t" in field:
+            status_bytes, path_bytes = field.split(b"\t", 1)
+        else:
+            if index >= len(fields):
+                return RecoveryStatus.UNKNOWN
+            status_bytes = field
+            path_bytes = fields[index]
+            index += 1
+        try:
+            status = status_bytes.decode("ascii")
+            path = path_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            return RecoveryStatus.NO
+        if status not in ("A", "M"):
+            return RecoveryStatus.NO
+        try:
+            safe_path = _validate_recovery_candidate_path(path)
+        except ConfigurationError:
+            return RecoveryStatus.NO
+        if safe_path in observed_paths:
+            return RecoveryStatus.NO
+        observed_paths.add(safe_path)
+
+    if observed_paths == set(expected_paths):
+        return RecoveryStatus.YES
+    return RecoveryStatus.NO
+
+
+def _validate_recovery_candidate_path(path: str) -> str:
+    """Validate one candidate committed path without retaining sensitive details."""
+
+    if (
+        not path
+        or "\\" in path
+        or "\0" in path
+        or any(ord(character) < 32 or ord(character) == 127 for character in path)
+    ):
+        raise ConfigurationError("isolated commit candidate path is unsafe.")
+    pure = PurePosixPath(path)
+    if (
+        pure.is_absolute()
+        or str(pure) != path
+        or path in {".", ".."}
+        or any(part in ("", ".", "..") for part in pure.parts)
+        or ".git" in pure.parts
+    ):
+        raise ConfigurationError("isolated commit candidate path is unsafe.")
+    return path
 
 
 def _run_pre_mutation_handler(
