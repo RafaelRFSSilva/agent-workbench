@@ -43,6 +43,11 @@ from agent_workbench.lifecycle_recovery import (
     IsolatedCommitLifecycleRecoveryClassification,
     inspect_persisted_isolated_commit_lifecycle_recovery,
 )
+from agent_workbench.lifecycle_recovery_actions import (
+    IsolatedCommitLifecycleRecoveryActionResult,
+    IsolatedCommitLifecycleRecoveryActionStatus,
+    adopt_isolated_commit_recovery_candidate,
+)
 from agent_workbench.lifecycle_store import IsolatedCommitLifecycleStore
 from agent_workbench.messages import ToolInteractionRound
 from agent_workbench.session import AgentSession, SessionId
@@ -400,7 +405,7 @@ def _run_isolated_autonomous_task(
 
 
 def _run_recovery_inspection(arguments: CLIArguments) -> None:
-    """Run one read-only persisted lifecycle recovery inspection."""
+    """Run recover inspection and optional explicit candidate adoption action."""
 
     source_repository = arguments.workspace_root
     lifecycle_store_path = arguments.lifecycle_store
@@ -424,6 +429,42 @@ def _run_recovery_inspection(arguments: CLIArguments) -> None:
         print("Recovery inspection failed: requested lifecycle record was not found.")
         raise SystemExit(1)
 
+    _print_recovery_assessment(assessment)
+    guidance = _recovery_guidance_message(assessment.classification)
+    print(f"[RECOVERY] Guidance: {guidance}")
+
+    if not arguments.adopt_candidate:
+        print("[RECOVERY] No recovery action was performed.")
+        print("[RECOVERY] Any future mutating recovery action requires fresh approval.")
+        return
+
+    if (
+        assessment.classification
+        is not IsolatedCommitLifecycleRecoveryClassification.COMMIT_CANDIDATE_OBSERVED
+    ):
+        print(
+            "Recovery adoption failed: --adopt-candidate requires "
+            "classification commit_candidate_observed."
+        )
+        raise SystemExit(1)
+
+    try:
+        action_result = adopt_isolated_commit_recovery_candidate(
+            source_repository,
+            lifecycle_store,
+            session_id,
+            _prompt_for_candidate_recovery_approval,
+        )
+    except (CompletionError, ConfigurationError) as exc:
+        print(f"Recovery adoption failed: {exc}")
+        raise SystemExit(1) from None
+
+    _display_candidate_adoption_result(action_result)
+
+
+def _print_recovery_assessment(assessment) -> None:
+    """Print one bounded conservative recovery assessment."""
+
     print(
         f"[RECOVERY] Persisted phase: {assessment.restart_evidence.persisted_phase.value}"
     )
@@ -442,10 +483,96 @@ def _run_recovery_inspection(arguments: CLIArguments) -> None:
             f"{assessment.candidate_evidence.paths_match_expected.value}"
         )
 
-    guidance = _recovery_guidance_message(assessment.classification)
-    print(f"[RECOVERY] Guidance: {guidance}")
-    print("[RECOVERY] No recovery action was performed.")
-    print("[RECOVERY] Any future mutating recovery action requires fresh approval.")
+
+def _display_candidate_adoption_result(
+    result: IsolatedCommitLifecycleRecoveryActionResult,
+) -> None:
+    """Display one bounded candidate-adoption outcome."""
+
+    if result.status is IsolatedCommitLifecycleRecoveryActionStatus.DENIED:
+        print("[RECOVERY] Candidate adoption denied.")
+        print("[RECOVERY] No lifecycle mutation was performed.")
+        raise SystemExit(1)
+
+    print("[RECOVERY] Candidate adoption completed.")
+    print(f"[RECOVERY] Persisted phase: {result.persisted_record.phase.value}")
+    print(f"[RECOVERY] Classification: {result.assessment.classification.value}")
+    print("[RECOVERY] Git was not modified.")
+    print(
+        "[RECOVERY] The approved candidate is now the exact persisted verified commit."
+    )
+
+
+def _prompt_for_candidate_recovery_approval(request) -> ToolApprovalDecision:
+    """Render one complete exact candidate preview and ask for fresh approval."""
+
+    preview = request.preview
+    if not isinstance(preview, dict):
+        return ToolApprovalDecision.DENY
+
+    print("\nCandidate recovery approval required")
+    print("  This candidate was not proven to be the exact originally approved commit.")
+    print("  The complete candidate shown below is what is being freshly approved now.")
+    print("  Git will not be modified by this recovery action.")
+    print(
+        "  Successful approval will only replace the persisted lifecycle "
+        "checkpoint with VERIFIED for the exact displayed candidate commit."
+    )
+    print(f"  Recovery action: {preview.get('action', '[unavailable]')}")
+    print(f"  Expected branch: {preview.get('branch', '[unavailable]')}")
+    print(f"  Candidate commit: {preview.get('candidate_head', '[unavailable]')}")
+    print(f"  Parent / old HEAD: {preview.get('old_head', '[unavailable]')}")
+    print("  Commit message:")
+    message, _ = _render_terminal_safe_text(
+        preview.get("commit_message"),
+        allow_newlines=True,
+        allow_tabs=True,
+    )
+    print(message)
+    print(f"  Operations: {preview.get('operation_count', '[unavailable]')}")
+    print(f"  Added: {preview.get('added_count', '[unavailable]')}")
+    print(f"  Modified: {preview.get('modified_count', '[unavailable]')}")
+    print(f"  Changed lines: {preview.get('total_changed_lines', '[unavailable]')}")
+    print("  Changed paths:")
+    paths = preview.get("paths")
+    if isinstance(paths, list) and all(isinstance(path, str) for path in paths):
+        for path in paths:
+            safe_path, _ = _render_terminal_safe_text(
+                path,
+                allow_newlines=False,
+                allow_tabs=False,
+            )
+            print(f"    - {safe_path}")
+    else:
+        print("    [unavailable]")
+
+    print("  Complete current candidate diff:")
+    changes = preview.get("changes")
+    if isinstance(changes, list):
+        for change in changes:
+            if not isinstance(change, dict):
+                continue
+            path, _ = _render_terminal_safe_text(
+                change.get("path"),
+                allow_newlines=False,
+                allow_tabs=False,
+            )
+            diff, _ = _render_terminal_safe_text(
+                change.get("diff"),
+                allow_newlines=True,
+                allow_tabs=True,
+            )
+            print(f"    {path}:")
+            print(diff, end="" if diff.endswith("\n") else "\n")
+
+    try:
+        answer = input("Approve candidate adoption? [y/N]: ").strip().lower()
+    except EOFError:
+        print()
+        return ToolApprovalDecision.DENY
+    if answer in {"y", "yes"}:
+        return ToolApprovalDecision.APPROVE
+    return ToolApprovalDecision.DENY
 
 
 def _recovery_guidance_message(

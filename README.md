@@ -921,7 +921,47 @@ Candidate-commit observation is weaker than exact approved-commit verification.
 `commit_candidate_observed` indicates compatibility evidence, not proof that
 the candidate is the exact originally approved commit.
 
-Any future mutating recovery action requires fresh approval.
+## Explicit Candidate Adoption Recovery Action
+
+Use this explicit flag only when recover classification reports
+`commit_candidate_observed` and you want to adopt the currently observed
+compatible candidate commit as the persisted verified lifecycle commit:
+
+```bash
+uv run agent-workbench recover \
+  --workspace . \
+  --lifecycle-store /some/operator-managed/lifecycle-store \
+  --session-id task-001 \
+  --adopt-candidate
+```
+
+This is currently the only supported mutating recovery action.
+
+Without `--adopt-candidate`, `recover` remains inspection-only.
+
+With `--adopt-candidate`, Agent Workbench:
+
+- requires classification `commit_candidate_observed` and fails closed for all
+  other classifications;
+- shows the complete exact current candidate preview for fresh default-deny
+  approval, including commit identity, parent, message, changed paths, and full
+  current A/M diffs;
+- rejects unsupported candidate file semantics before approval, including
+  symlinks/submodules/unsupported modes, executable-bit changes, and mode-only
+  modifications;
+- does not persist or reuse any approval token;
+- revalidates persisted lifecycle and current Git evidence after approval and
+  fails closed if any fact changed;
+- does not modify Git;
+- performs exactly one lifecycle mutation when checks pass: persisted
+  `execution_started` to persisted `verified` with `new_head` set to the exact
+  freshly approved candidate commit;
+- keeps historical lifecycle intent fields unchanged, including
+  `diff_fingerprint` as original-plan historical evidence;
+- verifies post-write equality and requires
+  `persisted_verified_commit_observed` afterward.
+
+There is no automatic candidate adoption.
 
 ## Configuration Precedence
 

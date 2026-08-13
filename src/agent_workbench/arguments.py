@@ -73,6 +73,7 @@ class CLIArguments:
     isolated: bool = False
     dry_run: bool = False
     recover: bool = False
+    adopt_candidate: bool = False
     lifecycle_store: Path | None = None
     session_id: SessionId | None = None
 
@@ -558,12 +559,21 @@ def _parse_recover_arguments(argv: Sequence[str]) -> CLIArguments:
         type=_session_id,
         help="Session identifier of the persisted lifecycle record to inspect.",
     )
+    parser.add_argument(
+        "--adopt-candidate",
+        action="store_true",
+        help=(
+            "Request fresh operator approval to adopt the currently observed "
+            "compatible commit candidate as persisted VERIFIED state."
+        ),
+    )
 
     parsed_arguments = parser.parse_args(argv)
     return CLIArguments(
         provider_name=None,
         model_name=None,
         recover=True,
+        adopt_candidate=parsed_arguments.adopt_candidate,
         workspace_root=parsed_arguments.workspace,
         lifecycle_store=parsed_arguments.lifecycle_store,
         session_id=parsed_arguments.session_id,

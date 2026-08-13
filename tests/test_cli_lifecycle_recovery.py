@@ -10,6 +10,7 @@ from unittest.mock import Mock
 
 import pytest
 
+import agent_workbench.worktree_commits as worktree_commits
 from agent_workbench.cli import CANCELLATION_MESSAGE, main
 from agent_workbench.coding_loop import (
     AutonomousCodingResult,
@@ -21,6 +22,10 @@ from agent_workbench.isolated_coding import run_isolated_autonomous_workflow
 from agent_workbench.lifecycle import (
     IsolatedCommitLifecyclePhase,
     IsolatedCommitLifecycleRecord,
+)
+from agent_workbench.lifecycle_recovery import (
+    IsolatedCommitLifecycleRecoveryClassification,
+    inspect_persisted_isolated_commit_lifecycle_recovery,
 )
 from agent_workbench.lifecycle_store import IsolatedCommitLifecycleStore
 from agent_workbench.arguments import RuntimeConfiguration
@@ -254,6 +259,29 @@ def run_main_and_capture_exit_code(argv: list[str]) -> int:
     return 0
 
 
+def run_recover_with_store(
+    source: Path,
+    store: IsolatedCommitLifecycleStore,
+    session_id: SessionId,
+    *,
+    adopt_candidate: bool = False,
+) -> int:
+    """Run one recover command invocation against one explicit store/session."""
+
+    argv = [
+        "recover",
+        "--workspace",
+        str(source),
+        "--lifecycle-store",
+        str(store._directory),  # type: ignore[attr-defined]
+        "--session-id",
+        session_id.value,
+    ]
+    if adopt_candidate:
+        argv.append("--adopt-candidate")
+    return run_main_and_capture_exit_code(argv)
+
+
 def persist_record(
     store: IsolatedCommitLifecycleStore,
     *,
@@ -339,6 +367,72 @@ def create_isolated_worktree(source: Path, branch_name: str) -> Path:
         text=True,
     )
     return target
+
+
+def create_crash_window_candidate_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    session_value: str,
+    commit_message: str,
+    branch_name: str,
+    replacement_text: str,
+) -> tuple[Path, Path, RecordingLifecycleStore, SessionId]:
+    """Create one real crash-window state with persisted EXECUTION_STARTED."""
+
+    source = create_repository(tmp_path / "source")
+    target = tmp_path / "isolated"
+    session_id = SessionId(session_value)
+    store = create_lifecycle_store(
+        tmp_path,
+        fail_on_call=3,
+        failure=CompletionError("injected verified failure"),
+    )
+    captured = {}
+
+    def create_isolated(_session_id, _runtime, worktree, *, max_tool_rounds):
+        assert max_tool_rounds == 16
+        captured["worktree"] = worktree
+        return SimpleNamespace(worktree=worktree, session=object())
+
+    def run_coding(_session, _prompt, **_kwargs):
+        worktree = captured["worktree"]
+        worktree_path = worktree.worktree_path
+        (worktree_path / "module.py").write_text(
+            replacement_text,
+            encoding="utf-8",
+        )
+        return coding_result()
+
+    monkeypatch.setattr(
+        "agent_workbench.isolated_coding.create_isolated_agent_session",
+        create_isolated,
+    )
+    monkeypatch.setattr(
+        "agent_workbench.isolated_coding.run_autonomous_coding_task",
+        run_coding,
+    )
+
+    with pytest.raises(
+        CompletionError, match="VERIFIED lifecycle checkpoint persistence"
+    ):
+        run_isolated_autonomous_workflow(
+            session_id,
+            configuration(source),
+            branch_name,
+            target,
+            "Correct the add implementation.",
+            commit_message,
+            worktree_approval_handler=approve,
+            tool_approval_handler=approve,
+            commit_approval_handler=approve,
+            lifecycle_store=store,
+        )
+
+    persisted = store.read(session_id)
+    assert persisted is not None
+    assert persisted.phase is IsolatedCommitLifecyclePhase.EXECUTION_STARTED
+    return source, target, store, session_id
 
 
 def test_recover_planned_old_head_clean_index(tmp_path: Path, capsys) -> None:
@@ -560,6 +654,680 @@ def test_recover_commit_candidate_observed(tmp_path: Path, monkeypatch, capsys) 
     assert "[RECOVERY] Candidate commit message matches: yes" in output
     assert "[RECOVERY] Candidate committed paths match expected: yes" in output
     assert "does not prove it is the exact originally approved commit" in output
+
+
+@pytest.mark.parametrize(
+    ("session_value", "phase", "prepare", "branch_name"),
+    [
+        (
+            "task-adopt-insufficient",
+            IsolatedCommitLifecyclePhase.PLANNED,
+            "branch-only",
+            "agent/recover-adopt-insufficient",
+        ),
+        (
+            "task-adopt-old-head",
+            IsolatedCommitLifecyclePhase.EXECUTION_STARTED,
+            "isolated-clean",
+            "agent/recover-adopt-old-head",
+        ),
+        (
+            "task-adopt-expected-staging",
+            IsolatedCommitLifecyclePhase.EXECUTION_STARTED,
+            "isolated-staged",
+            "agent/recover-adopt-staged",
+        ),
+    ],
+)
+def test_recover_adopt_candidate_rejects_non_candidate_without_prompt_or_write(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+    session_value: str,
+    phase: IsolatedCommitLifecyclePhase,
+    prepare: str,
+    branch_name: str,
+) -> None:
+    """Fail closed on non-candidate classifications without prompting or writing."""
+
+    source = create_repository(tmp_path / "source")
+    source_head = run_git(source, "rev-parse", "HEAD").stdout.strip()
+    if prepare == "branch-only":
+        run_git(source, "branch", branch_name, source_head)
+    else:
+        target = create_isolated_worktree(source, branch_name)
+        if prepare == "isolated-staged":
+            (target / "module.py").write_text(
+                "def add(left: int, right: int) -> int:\n    return left + right\n",
+                encoding="utf-8",
+            )
+            run_git(target, "add", "module.py")
+
+    store = create_store(tmp_path)
+    session_id = SessionId(session_value)
+    persist_record(
+        store,
+        session_id=session_id,
+        phase=phase,
+        source_head=source_head,
+        branch_name=branch_name,
+        old_head=source_head,
+        paths=("module.py",),
+        commit_message="fix: reject adopt",
+        new_head=None,
+    )
+    persisted_before = store.read(session_id)
+    assert persisted_before is not None
+    prompt_mock = Mock(side_effect=AssertionError("approval prompt must not run"))
+    monkeypatch.setattr("builtins.input", prompt_mock)
+
+    before = snapshot_repo_state(source, branch_name)
+    exit_code = run_recover_with_store(
+        source,
+        store,
+        session_id,
+        adopt_candidate=True,
+    )
+    persisted_after = store.read(session_id)
+    after = snapshot_repo_state(source, branch_name)
+
+    assert exit_code == 1
+    prompt_mock.assert_not_called()
+    assert persisted_after == persisted_before
+    assert before == after
+    assert (
+        "--adopt-candidate requires classification commit_candidate_observed"
+        in capsys.readouterr().out
+    )
+
+
+def test_recover_adopt_candidate_rejects_verified_and_diverged_without_prompt(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    """Reject non-execution candidate classifications without approval prompt."""
+
+    source = create_repository(tmp_path / "source")
+    old_head = run_git(source, "rev-parse", "HEAD").stdout.strip()
+    branch_verified = "agent/recover-adopt-verified"
+    run_git(source, "checkout", "-b", branch_verified)
+    (source / "module.py").write_text(
+        "def add(left: int, right: int) -> int:\n    return left + right\n",
+        encoding="utf-8",
+    )
+    run_git(source, "add", "module.py")
+    run_git(source, "commit", "-m", "fix: verified")
+    new_head = run_git(source, "rev-parse", "HEAD").stdout.strip()
+
+    store = create_store(tmp_path)
+    verified_id = SessionId("task-adopt-verified")
+    persist_record(
+        store,
+        session_id=verified_id,
+        phase=IsolatedCommitLifecyclePhase.VERIFIED,
+        source_head=old_head,
+        branch_name=branch_verified,
+        old_head=old_head,
+        paths=("module.py",),
+        commit_message="fix: verified",
+        new_head=new_head,
+    )
+
+    diverged_id = SessionId("task-adopt-diverged")
+    persist_record(
+        store,
+        session_id=diverged_id,
+        phase=IsolatedCommitLifecyclePhase.PLANNED,
+        source_head=old_head,
+        branch_name="agent/recover-adopt-diverged",
+        old_head=old_head,
+        paths=("module.py",),
+        commit_message="fix: diverged",
+        new_head=None,
+    )
+
+    prompt_mock = Mock(side_effect=AssertionError("approval prompt must not run"))
+    monkeypatch.setattr("builtins.input", prompt_mock)
+
+    verified_exit = run_recover_with_store(
+        source,
+        store,
+        verified_id,
+        adopt_candidate=True,
+    )
+    diverged_exit = run_recover_with_store(
+        source,
+        store,
+        diverged_id,
+        adopt_candidate=True,
+    )
+
+    assert verified_exit == 1
+    assert diverged_exit == 1
+    prompt_mock.assert_not_called()
+    output = capsys.readouterr().out
+    assert "persisted_verified_commit_observed" in output
+    assert "diverged_or_inconsistent" in output
+
+
+def test_recover_adopt_candidate_denial_preserves_lifecycle_and_git(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    """A denied fresh approval must not mutate lifecycle or Git state."""
+
+    source, target, store, session_id = create_crash_window_candidate_state(
+        tmp_path,
+        monkeypatch,
+        session_value="task-adopt-deny",
+        commit_message="fix: candidate deny",
+        branch_name="agent/recover-adopt-deny",
+        replacement_text="def add(left: int, right: int) -> int:\n    return left + right\n",
+    )
+    persisted_before = store.read(session_id)
+    assert persisted_before is not None
+    branch_name = persisted_before.branch_name
+    monkeypatch.setattr("builtins.input", Mock(return_value="n"))
+
+    before = snapshot_source_and_worktree_state(source, target, branch_name)
+    exit_code = run_recover_with_store(
+        source,
+        store,
+        session_id,
+        adopt_candidate=True,
+    )
+    persisted_after = store.read(session_id)
+    after = snapshot_source_and_worktree_state(source, target, branch_name)
+
+    assert exit_code == 1
+    assert persisted_after == persisted_before
+    assert before == after
+    output = capsys.readouterr().out
+    assert "Candidate recovery approval required" in output
+    assert "Complete current candidate diff" in output
+    assert "[RECOVERY] Candidate adoption denied." in output
+
+
+def test_recover_adopt_candidate_eof_defaults_to_deny(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """EOF while prompting must deny and preserve current recovery state."""
+
+    source, target, store, session_id = create_crash_window_candidate_state(
+        tmp_path,
+        monkeypatch,
+        session_value="task-adopt-eof",
+        commit_message="fix: candidate eof",
+        branch_name="agent/recover-adopt-eof",
+        replacement_text="def add(left: int, right: int) -> int:\n    return left + right\n",
+    )
+    persisted_before = store.read(session_id)
+    assert persisted_before is not None
+    branch_name = persisted_before.branch_name
+    monkeypatch.setattr("builtins.input", Mock(side_effect=EOFError))
+
+    before = snapshot_source_and_worktree_state(source, target, branch_name)
+    exit_code = run_recover_with_store(
+        source,
+        store,
+        session_id,
+        adopt_candidate=True,
+    )
+    persisted_after = store.read(session_id)
+    after = snapshot_source_and_worktree_state(source, target, branch_name)
+
+    assert exit_code == 1
+    assert persisted_after == persisted_before
+    assert before == after
+
+
+def test_recover_adopt_candidate_keyboard_interrupt_propagates(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    """KeyboardInterrupt during approval must propagate to outer status 130."""
+
+    source, target, store, session_id = create_crash_window_candidate_state(
+        tmp_path,
+        monkeypatch,
+        session_value="task-adopt-interrupt",
+        commit_message="fix: candidate interrupt",
+        branch_name="agent/recover-adopt-interrupt",
+        replacement_text="def add(left: int, right: int) -> int:\n    return left + right\n",
+    )
+    persisted_before = store.read(session_id)
+    assert persisted_before is not None
+    branch_name = persisted_before.branch_name
+    monkeypatch.setattr("builtins.input", Mock(side_effect=KeyboardInterrupt))
+
+    before = snapshot_source_and_worktree_state(source, target, branch_name)
+    with pytest.raises(SystemExit) as raised:
+        main(
+            [
+                "recover",
+                "--workspace",
+                str(source),
+                "--lifecycle-store",
+                str(store._directory),  # type: ignore[attr-defined]
+                "--session-id",
+                session_id.value,
+                "--adopt-candidate",
+            ]
+        )
+    persisted_after = store.read(session_id)
+    after = snapshot_source_and_worktree_state(source, target, branch_name)
+
+    assert raised.value.code == 130
+    assert persisted_after == persisted_before
+    assert before == after
+    captured = capsys.readouterr()
+    assert captured.out.endswith(f"{CANCELLATION_MESSAGE}\n")
+
+
+def test_recover_adopt_candidate_real_crash_window_succeeds(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    """Adopt one real crash-window candidate and verify persisted VERIFIED state."""
+
+    source, target, store, session_id = create_crash_window_candidate_state(
+        tmp_path,
+        monkeypatch,
+        session_value="task-adopt-success",
+        commit_message="fix: candidate success",
+        branch_name="agent/recover-adopt-success",
+        replacement_text="def add(left: int, right: int) -> int:\n    return left + right\n",
+    )
+    persisted_before = store.read(session_id)
+    assert persisted_before is not None
+    assert persisted_before.phase is IsolatedCommitLifecyclePhase.EXECUTION_STARTED
+    branch_name = persisted_before.branch_name
+    candidate_head = run_git(target, "rev-parse", "HEAD").stdout.strip()
+
+    prompt_calls = {"count": 0}
+
+    def approve_once(_prompt: str) -> str:
+        prompt_calls["count"] += 1
+        return "yes"
+
+    monkeypatch.setattr("builtins.input", approve_once)
+
+    before = snapshot_source_and_worktree_state(source, target, branch_name)
+    exit_code = run_recover_with_store(
+        source,
+        store,
+        session_id,
+        adopt_candidate=True,
+    )
+    after = snapshot_source_and_worktree_state(source, target, branch_name)
+    persisted_after = store.read(session_id)
+    assert persisted_after is not None
+
+    assert exit_code == 0
+    assert prompt_calls["count"] == 1
+    assert before == after
+    assert persisted_after.phase is IsolatedCommitLifecyclePhase.VERIFIED
+    assert persisted_after.new_head == candidate_head
+    assert persisted_after.session_id == persisted_before.session_id
+    assert persisted_after.target_display == persisted_before.target_display
+    assert persisted_after.source_head == persisted_before.source_head
+    assert persisted_after.source_branch == persisted_before.source_branch
+    assert persisted_after.branch_name == persisted_before.branch_name
+    assert persisted_after.old_head == persisted_before.old_head
+    assert persisted_after.paths == persisted_before.paths
+    assert persisted_after.diff_fingerprint == persisted_before.diff_fingerprint
+    assert (
+        persisted_after.commit_message_fingerprint
+        == persisted_before.commit_message_fingerprint
+    )
+
+    assessment_after = inspect_persisted_isolated_commit_lifecycle_recovery(
+        source,
+        store,
+        session_id,
+    )
+    assert assessment_after is not None
+    assert (
+        assessment_after.classification
+        is IsolatedCommitLifecycleRecoveryClassification.PERSISTED_VERIFIED_COMMIT_OBSERVED
+    )
+    assert assessment_after.restart_evidence.persisted_new_head == candidate_head
+
+    output = capsys.readouterr().out
+    assert "Candidate recovery approval required" in output
+    assert "Complete current candidate diff" in output
+    assert "[RECOVERY] Candidate adoption completed." in output
+    assert "[RECOVERY] Persisted phase: verified" in output
+    assert "[RECOVERY] Classification: persisted_verified_commit_observed" in output
+    assert "[RECOVERY] Git was not modified." in output
+
+
+def test_recover_adopt_candidate_preview_shows_actual_candidate_content(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    """Display actual candidate content even when original plan evidence differs."""
+
+    source, _target, store, session_id = create_crash_window_candidate_state(
+        tmp_path,
+        monkeypatch,
+        session_value="task-adopt-content-diff",
+        commit_message="fix: same-message-different-content",
+        branch_name="agent/recover-adopt-content-diff",
+        replacement_text="def add(left: int, right: int) -> int:\n    return left + right + 10\n",
+    )
+    monkeypatch.setattr("builtins.input", Mock(return_value="n"))
+
+    exit_code = run_recover_with_store(
+        source,
+        store,
+        session_id,
+        adopt_candidate=True,
+    )
+
+    assert exit_code == 1
+    output = capsys.readouterr().out
+    assert "+    return left + right + 10" in output
+
+
+def test_recover_adopt_candidate_fails_closed_when_git_changes_after_approval(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    """Abort if candidate head moves after approval and before write."""
+
+    source, target, store, session_id = create_crash_window_candidate_state(
+        tmp_path,
+        monkeypatch,
+        session_value="task-adopt-stale-git",
+        commit_message="fix: candidate stale",
+        branch_name="agent/recover-adopt-stale-git",
+        replacement_text="def add(left: int, right: int) -> int:\n    return left + right\n",
+    )
+    persisted_before = store.read(session_id)
+    assert persisted_before is not None
+    before = snapshot_source_and_worktree_state(
+        source, target, persisted_before.branch_name
+    )
+
+    def approve_and_mutate(_request) -> ToolApprovalDecision:
+        (target / "module.py").write_text(
+            "def add(left: int, right: int) -> int:\n    return left + right + 2\n",
+            encoding="utf-8",
+        )
+        run_git(target, "add", "module.py")
+        run_git(target, "commit", "-m", "fix: moved after approval")
+        return ToolApprovalDecision.APPROVE
+
+    monkeypatch.setattr(
+        "agent_workbench.cli._prompt_for_candidate_recovery_approval",
+        approve_and_mutate,
+    )
+
+    exit_code = run_recover_with_store(
+        source,
+        store,
+        session_id,
+        adopt_candidate=True,
+    )
+    persisted_after = store.read(session_id)
+    after = snapshot_source_and_worktree_state(
+        source, target, persisted_before.branch_name
+    )
+
+    assert exit_code == 1
+    assert persisted_after == persisted_before
+    assert before != after
+    assert (
+        "requires classification commit_candidate_observed" in capsys.readouterr().out
+    )
+
+
+def test_recover_adopt_candidate_fails_closed_when_record_changes_after_approval(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    """Abort if persisted lifecycle record changes after fresh approval."""
+
+    source, target, store, session_id = create_crash_window_candidate_state(
+        tmp_path,
+        monkeypatch,
+        session_value="task-adopt-stale-record",
+        commit_message="fix: candidate stale record",
+        branch_name="agent/recover-adopt-stale-record",
+        replacement_text="def add(left: int, right: int) -> int:\n    return left + right\n",
+    )
+    _ = target
+    persisted_before = store.read(session_id)
+    assert persisted_before is not None
+
+    def approve_and_change_record(_request) -> ToolApprovalDecision:
+        changed = IsolatedCommitLifecycleRecord(
+            session_id=persisted_before.session_id,
+            phase=IsolatedCommitLifecyclePhase.PLANNED,
+            target_display=persisted_before.target_display,
+            source_head=persisted_before.source_head,
+            source_branch=persisted_before.source_branch,
+            branch_name=persisted_before.branch_name,
+            old_head=persisted_before.old_head,
+            paths=persisted_before.paths,
+            diff_fingerprint=persisted_before.diff_fingerprint,
+            commit_message_fingerprint=persisted_before.commit_message_fingerprint,
+            new_head=None,
+        )
+        store.write(changed)
+        return ToolApprovalDecision.APPROVE
+
+    monkeypatch.setattr(
+        "agent_workbench.cli._prompt_for_candidate_recovery_approval",
+        approve_and_change_record,
+    )
+
+    exit_code = run_recover_with_store(
+        source,
+        store,
+        session_id,
+        adopt_candidate=True,
+    )
+    persisted_after = store.read(session_id)
+
+    assert exit_code == 1
+    assert persisted_after is not None
+    assert persisted_after.phase is IsolatedCommitLifecyclePhase.PLANNED
+    assert "record changed after approval" in capsys.readouterr().out
+
+
+def test_recover_adopt_candidate_preview_construction_failure_no_prompt(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    """Fail closed before prompting if complete candidate preview is unavailable."""
+
+    source, target, store, session_id = create_crash_window_candidate_state(
+        tmp_path,
+        monkeypatch,
+        session_value="task-adopt-preview-failure",
+        commit_message="fix: candidate preview failure",
+        branch_name="agent/recover-adopt-preview-failure",
+        replacement_text="def add(left: int, right: int) -> int:\n    return left + right\n",
+    )
+    _ = target
+    persisted_before = store.read(session_id)
+    assert persisted_before is not None
+    prompt_mock = Mock(side_effect=AssertionError("approval prompt must not run"))
+    monkeypatch.setattr("builtins.input", prompt_mock)
+    monkeypatch.setattr(
+        "agent_workbench.lifecycle_recovery_actions.build_isolated_commit_recovery_candidate_preview",
+        Mock(side_effect=ConfigurationError("unsafe preview payload")),
+    )
+
+    exit_code = run_recover_with_store(
+        source,
+        store,
+        session_id,
+        adopt_candidate=True,
+    )
+    persisted_after = store.read(session_id)
+
+    assert exit_code == 1
+    prompt_mock.assert_not_called()
+    assert persisted_after == persisted_before
+    assert (
+        "candidate preview could not be constructed safely" in capsys.readouterr().out
+    )
+
+
+def test_recover_adopt_candidate_store_write_failure_preserves_git(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    """Report bounded failure when VERIFIED write fails without retry/rollback."""
+
+    source, target, store, session_id = create_crash_window_candidate_state(
+        tmp_path,
+        monkeypatch,
+        session_value="task-adopt-write-failure",
+        commit_message="fix: candidate write failure",
+        branch_name="agent/recover-adopt-write-failure",
+        replacement_text="def add(left: int, right: int) -> int:\n    return left + right\n",
+    )
+    persisted_before = store.read(session_id)
+    assert persisted_before is not None
+    monkeypatch.setattr("builtins.input", Mock(return_value="yes"))
+
+    original_write = IsolatedCommitLifecycleStore.write
+
+    def fail_verified_write(self, record):
+        if record.phase is IsolatedCommitLifecyclePhase.VERIFIED:
+            raise CompletionError("injected lifecycle write failure")
+        return original_write(self, record)
+
+    monkeypatch.setattr(
+        "agent_workbench.lifecycle_store.IsolatedCommitLifecycleStore.write",
+        fail_verified_write,
+    )
+
+    before = snapshot_source_and_worktree_state(
+        source, target, persisted_before.branch_name
+    )
+    exit_code = run_recover_with_store(
+        source,
+        store,
+        session_id,
+        adopt_candidate=True,
+    )
+    persisted_after = store.read(session_id)
+    after = snapshot_source_and_worktree_state(
+        source, target, persisted_before.branch_name
+    )
+
+    assert exit_code == 1
+    assert persisted_after == persisted_before
+    assert before == after
+    output = capsys.readouterr().out
+    assert "persisted lifecycle write failed" in output
+
+
+def test_recover_adopt_candidate_no_approval_reuse_calls_prompt_once(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Always request exactly one fresh candidate adoption approval."""
+
+    source, _target, store, session_id = create_crash_window_candidate_state(
+        tmp_path,
+        monkeypatch,
+        session_value="task-adopt-prompt-once",
+        commit_message="fix: candidate prompt once",
+        branch_name="agent/recover-adopt-prompt-once",
+        replacement_text="def add(left: int, right: int) -> int:\n    return left + right\n",
+    )
+
+    calls = {"count": 0}
+
+    def count_prompt(_prompt: str) -> str:
+        calls["count"] += 1
+        return "yes"
+
+    monkeypatch.setattr("builtins.input", count_prompt)
+
+    exit_code = run_recover_with_store(
+        source,
+        store,
+        session_id,
+        adopt_candidate=True,
+    )
+
+    assert exit_code == 0
+    assert calls["count"] == 1
+
+
+def test_recover_adopt_candidate_uses_read_only_git_commands_only(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Adoption path must not execute mutating Git subcommands."""
+
+    source, _target, store, session_id = create_crash_window_candidate_state(
+        tmp_path,
+        monkeypatch,
+        session_value="task-adopt-read-only-git",
+        commit_message="fix: candidate read only git",
+        branch_name="agent/recover-adopt-read-only-git",
+        replacement_text="def add(left: int, right: int) -> int:\n    return left + right\n",
+    )
+    monkeypatch.setattr("builtins.input", Mock(return_value="yes"))
+
+    observed_git_args: list[tuple[str, ...]] = []
+    original_run_git = worktree_commits._run_git
+
+    def record_git(repository: Path, arguments, *, input_bytes=None):
+        observed_git_args.append(tuple(arguments))
+        return original_run_git(repository, arguments, input_bytes=input_bytes)
+
+    monkeypatch.setattr(worktree_commits, "_run_git", record_git)
+
+    exit_code = run_recover_with_store(
+        source,
+        store,
+        session_id,
+        adopt_candidate=True,
+    )
+
+    assert exit_code == 0
+    assert observed_git_args
+    forbidden = {
+        "add",
+        "commit",
+        "reset",
+        "restore",
+        "clean",
+        "stash",
+        "checkout",
+        "switch",
+        "merge",
+        "rebase",
+        "fetch",
+        "pull",
+        "push",
+    }
+    for args in observed_git_args:
+        if not args:
+            continue
+        assert args[0] not in forbidden
+        assert not (len(args) >= 2 and args[0] == "worktree" and args[1] == "add")
+        assert not (len(args) >= 2 and args[0] == "worktree" and args[1] == "remove")
+        assert not (len(args) >= 3 and args[0] == "branch" and args[1] in {"-d", "-D"})
 
 
 def test_recover_verified_observed(tmp_path: Path, capsys) -> None:

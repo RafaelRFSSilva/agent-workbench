@@ -27,6 +27,7 @@ from agent_workbench.worktree_commits import (
     IsolatedCommitApprovalRequest,
     IsolatedCommitPlan,
     IsolatedCommitRecoveryCandidateEvidence,
+    build_isolated_commit_recovery_candidate_preview,
     IsolatedCommitResult,
     create_isolated_commit,
     inspect_isolated_commit_recovery_candidate,
@@ -2214,3 +2215,139 @@ def test_candidate_metadata_can_match_with_different_file_content_than_original_
     )
 
     assert evidence.metadata_matches_expected is RecoveryStatus.YES
+
+
+def test_candidate_preview_supports_regular_file_content_modify_unchanged_mode(
+    tmp_path: Path,
+) -> None:
+    """Allow candidate preview when one regular tracked file changes content only."""
+
+    source, old_head, candidate, _paths, _fingerprint = _make_candidate_commit(
+        tmp_path,
+        message="candidate preview",
+        modify_paths=(("tracked.txt", "candidate\n"),),
+    )
+
+    preview = build_isolated_commit_recovery_candidate_preview(
+        source,
+        expected_branch="agent/task",
+        candidate_head=candidate,
+        old_head=old_head,
+    )
+
+    assert preview.operation_count == 1
+    assert preview.added_count == 0
+    assert preview.modified_count == 1
+    assert preview.paths == ("tracked.txt",)
+    assert "+candidate" in str(preview.preview["changes"][0]["diff"])
+
+
+def test_candidate_preview_rejects_modify_with_executable_bit_change(
+    tmp_path: Path,
+) -> None:
+    """Reject content modifications that also change tracked mode 100644->100755."""
+
+    source, handle = create_isolated_worktree(tmp_path)
+    worktree = handle.worktree_path
+    old_head = run_git(worktree, "rev-parse", "HEAD").stdout.strip()
+
+    tracked = worktree / "tracked.txt"
+    tracked.write_text("candidate with exec\n", encoding="utf-8")
+    tracked.chmod(0o755)
+    run_git(worktree, "add", "tracked.txt")
+    run_git(worktree, "commit", "-m", "candidate with mode change")
+    candidate = run_git(worktree, "rev-parse", "HEAD").stdout.strip()
+
+    evidence = inspect_isolated_commit_recovery_candidate(
+        source,
+        candidate,
+        old_head=old_head,
+        expected_paths=("tracked.txt",),
+        commit_message_fingerprint=hashlib.sha256(
+            b"candidate with mode change\n"
+        ).hexdigest(),
+    )
+    assert evidence.metadata_matches_expected is RecoveryStatus.YES
+
+    with pytest.raises(
+        ConfigurationError,
+        match="unsupported mode or executable-bit change",
+    ):
+        build_isolated_commit_recovery_candidate_preview(
+            source,
+            expected_branch="agent/task",
+            candidate_head=candidate,
+            old_head=old_head,
+        )
+
+
+def test_candidate_preview_rejects_mode_only_executable_bit_change(
+    tmp_path: Path,
+) -> None:
+    """Reject mode-only tracked changes in candidate preview reconstruction."""
+
+    source, handle = create_isolated_worktree(tmp_path)
+    worktree = handle.worktree_path
+    old_head = run_git(worktree, "rev-parse", "HEAD").stdout.strip()
+
+    tracked = worktree / "tracked.txt"
+    tracked.chmod(0o755)
+    run_git(worktree, "add", "tracked.txt")
+    run_git(worktree, "commit", "-m", "candidate mode only")
+    candidate = run_git(worktree, "rev-parse", "HEAD").stdout.strip()
+
+    evidence = inspect_isolated_commit_recovery_candidate(
+        source,
+        candidate,
+        old_head=old_head,
+        expected_paths=("tracked.txt",),
+        commit_message_fingerprint=hashlib.sha256(b"candidate mode only\n").hexdigest(),
+    )
+    assert evidence.metadata_matches_expected is RecoveryStatus.YES
+
+    with pytest.raises(
+        ConfigurationError,
+        match="unsupported mode or executable-bit change",
+    ):
+        build_isolated_commit_recovery_candidate_preview(
+            source,
+            expected_branch="agent/task",
+            candidate_head=candidate,
+            old_head=old_head,
+        )
+
+
+def test_candidate_preview_rejects_added_symlink_path(
+    tmp_path: Path,
+) -> None:
+    """Reject added symlink candidates even when metadata compatibility is YES."""
+
+    source, handle = create_isolated_worktree(tmp_path)
+    worktree = handle.worktree_path
+    old_head = run_git(worktree, "rev-parse", "HEAD").stdout.strip()
+
+    symlink_path = worktree / "link.txt"
+    symlink_path.symlink_to("tracked.txt")
+    run_git(worktree, "add", "link.txt")
+    run_git(worktree, "commit", "-m", "candidate symlink")
+    candidate = run_git(worktree, "rev-parse", "HEAD").stdout.strip()
+
+    evidence = inspect_isolated_commit_recovery_candidate(
+        source,
+        candidate,
+        old_head=old_head,
+        expected_paths=("link.txt",),
+        commit_message_fingerprint=hashlib.sha256(b"candidate symlink\n").hexdigest(),
+    )
+    assert evidence.metadata_matches_expected is RecoveryStatus.YES
+
+    with pytest.raises(
+        ConfigurationError,
+        match="unsupported tracked file type",
+    ):
+        build_isolated_commit_recovery_candidate_preview(
+            source,
+            expected_branch="agent/task",
+            candidate_head=candidate,
+            old_head=old_head,
+        )

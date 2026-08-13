@@ -331,6 +331,69 @@ class IsolatedCommitRecoveryCandidateEvidence:
         return RecoveryStatus.UNKNOWN
 
 
+@dataclass(frozen=True, slots=True, init=False)
+class IsolatedCommitRecoveryCandidatePreview:
+    """Store one immutable complete exact preview for candidate adoption approval."""
+
+    expected_branch: str
+    candidate_head: str
+    old_head: str
+    commit_message: str = field(repr=False)
+    operation_count: int
+    added_count: int
+    modified_count: int
+    total_changed_lines: int
+    paths: tuple[str, ...]
+    preview_fingerprint: str
+    _preview_json: str = field(repr=False)
+
+    def __init__(self) -> None:
+        """Require factory construction from validated Git evidence."""
+
+        raise ConfigurationError(
+            "candidate preview must be created by "
+            "build_isolated_commit_recovery_candidate_preview."
+        )
+
+    @classmethod
+    def _validated(
+        cls,
+        *,
+        expected_branch: str,
+        candidate_head: str,
+        old_head: str,
+        commit_message: str,
+        changes: tuple[_CommitChange, ...],
+        preview_fingerprint: str,
+        preview_json: str,
+    ) -> "IsolatedCommitRecoveryCandidatePreview":
+        """Construct one immutable candidate preview from validated values."""
+
+        instance = object.__new__(cls)
+        values = {
+            "expected_branch": expected_branch,
+            "candidate_head": candidate_head,
+            "old_head": old_head,
+            "commit_message": commit_message,
+            "operation_count": len(changes),
+            "added_count": sum(change.operation == "add" for change in changes),
+            "modified_count": sum(change.operation == "modify" for change in changes),
+            "total_changed_lines": sum(change.changed_lines for change in changes),
+            "paths": tuple(change.path for change in changes),
+            "preview_fingerprint": preview_fingerprint,
+            "_preview_json": preview_json,
+        }
+        for name, value in values.items():
+            object.__setattr__(instance, name, value)
+        return instance
+
+    @property
+    def preview(self) -> JSONObject:
+        """Return one independent copy of the complete exact preview JSON."""
+
+        return cast(JSONObject, json.loads(self._preview_json))
+
+
 def inspect_isolated_commit_recovery_candidate(
     repository: Path,
     candidate_head: str,
@@ -381,6 +444,280 @@ def inspect_isolated_commit_recovery_candidate(
         parent_matches_old_head=parent_match,
         message_fingerprint_matches=message_match,
         paths_match_expected=paths_match,
+    )
+
+
+def build_isolated_commit_recovery_candidate_preview(
+    repository: Path,
+    *,
+    expected_branch: str,
+    candidate_head: str,
+    old_head: str,
+) -> IsolatedCommitRecoveryCandidatePreview:
+    """Build one complete bounded immutable preview for candidate adoption."""
+
+    if not isinstance(repository, Path):
+        raise ConfigurationError(
+            "candidate preview construction requires a repository Path."
+        )
+    if (
+        not isinstance(expected_branch, str)
+        or not expected_branch
+        or "\0" in expected_branch
+        or "\n" in expected_branch
+        or "\r" in expected_branch
+    ):
+        raise ConfigurationError("candidate preview expected branch is invalid.")
+
+    safe_candidate_head = _validate_lower_object_id(
+        candidate_head,
+        field_name="candidate_head",
+    )
+    safe_old_head = _validate_lower_object_id(old_head, field_name="old_head")
+    safe_repository = _validate_candidate_repository(repository)
+
+    parent_output = _run_git(
+        safe_repository,
+        ("rev-list", "--parents", "-n", "1", safe_candidate_head),
+    )
+    if parent_output.returncode != 0:
+        raise ConfigurationError("unable to inspect candidate commit parent identity.")
+    parent_fields = _parse_candidate_parent_fields(parent_output.stdout)
+    if (
+        parent_fields is None
+        or len(parent_fields) != 2
+        or parent_fields[0] != safe_candidate_head
+        or parent_fields[1] != safe_old_head
+    ):
+        raise ConfigurationError("candidate commit parent identity is invalid.")
+
+    commit_output = _run_git(
+        safe_repository,
+        ("cat-file", "commit", safe_candidate_head),
+    )
+    if commit_output.returncode != 0:
+        raise ConfigurationError("unable to inspect candidate commit message.")
+    separator = commit_output.stdout.find(b"\n\n")
+    if separator < 0:
+        raise ConfigurationError("candidate commit object payload is invalid.")
+    commit_message_bytes = commit_output.stdout[separator + 2 :]
+    if commit_message_bytes.endswith(b"\n"):
+        commit_message_bytes = commit_message_bytes[:-1]
+    if len(commit_message_bytes) > MAX_COMMIT_MESSAGE_BYTES:
+        raise ConfigurationError(
+            "candidate commit message exceeds the "
+            f"{MAX_COMMIT_MESSAGE_BYTES}-byte limit."
+        )
+    commit_message = _decode_file_content(commit_message_bytes)
+
+    status_output = _run_git(
+        safe_repository,
+        (
+            "diff-tree",
+            "--no-commit-id",
+            "--name-status",
+            "--no-renames",
+            "--no-ext-diff",
+            "-r",
+            "-z",
+            safe_candidate_head,
+        ),
+    )
+    if status_output.returncode != 0:
+        raise ConfigurationError("unable to inspect candidate committed paths.")
+
+    fields = [field for field in status_output.stdout.split(b"\0") if field]
+    parsed_paths: list[tuple[str, str]] = []
+    observed_paths: set[str] = set()
+    index = 0
+    while index < len(fields):
+        field = fields[index]
+        index += 1
+        if b"\t" in field:
+            status_bytes, path_bytes = field.split(b"\t", 1)
+        else:
+            if index >= len(fields):
+                raise ConfigurationError("candidate path status payload is invalid.")
+            status_bytes = field
+            path_bytes = fields[index]
+            index += 1
+
+        try:
+            status_code = status_bytes.decode("ascii")
+            path_text = path_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            raise ConfigurationError(
+                "candidate path status payload is invalid."
+            ) from None
+
+        if status_code not in ("A", "M"):
+            raise ConfigurationError(
+                "candidate preview supports only A/M path statuses."
+            )
+
+        safe_path = _validate_recovery_candidate_path(path_text)
+        if safe_path in observed_paths:
+            raise ConfigurationError("candidate preview path set is ambiguous.")
+        observed_paths.add(safe_path)
+        parsed_paths.append((status_code, safe_path))
+
+    if not parsed_paths:
+        raise ConfigurationError(
+            "candidate preview requires at least one changed path."
+        )
+
+    changes: list[_CommitChange] = []
+    for status_code, safe_path in sorted(parsed_paths, key=lambda item: item[1]):
+        if status_code == "A":
+            mode, object_id = _read_tree_entry(
+                safe_repository,
+                safe_candidate_head,
+                safe_path,
+            )
+            if mode not in (0o100644, 0o100755):
+                raise ConfigurationError(
+                    "candidate preview contains an unsupported tracked file type."
+                )
+            current_blob = _run_git(safe_repository, ("cat-file", "blob", object_id))
+            if current_blob.returncode != 0:
+                raise ConfigurationError("unable to read candidate committed file.")
+            old_content = b""
+            current_content = current_blob.stdout
+            operation = "add"
+            old_mode = None
+        else:
+            old_mode, old_object_id = _read_tree_entry(
+                safe_repository,
+                safe_old_head,
+                safe_path,
+            )
+            current_mode, current_object_id = _read_tree_entry(
+                safe_repository,
+                safe_candidate_head,
+                safe_path,
+            )
+            if old_mode not in (0o100644, 0o100755):
+                raise ConfigurationError(
+                    "candidate preview contains an unsupported tracked file type."
+                )
+            if current_mode not in (0o100644, 0o100755):
+                raise ConfigurationError(
+                    "candidate preview contains an unsupported tracked file type."
+                )
+            if current_mode != old_mode:
+                raise ConfigurationError(
+                    "candidate preview contains an unsupported mode or executable-bit change."
+                )
+            old_blob = _run_git(safe_repository, ("cat-file", "blob", old_object_id))
+            current_blob = _run_git(
+                safe_repository,
+                ("cat-file", "blob", current_object_id),
+            )
+            if old_blob.returncode != 0 or current_blob.returncode != 0:
+                raise ConfigurationError("unable to read candidate committed file.")
+            old_content = old_blob.stdout
+            current_content = current_blob.stdout
+            operation = "modify"
+            mode = current_mode
+
+        old_text = _decode_file_content(old_content)
+        current_text = _decode_file_content(current_content)
+        if operation == "modify" and old_content == current_content:
+            raise ConfigurationError(
+                "candidate preview contains an unsupported mode-only change."
+            )
+        changed_lines = count_changed_lines(old_text, current_text)
+        _validate_file_limits(
+            old_content=old_content,
+            current_content=current_content,
+            changed_lines=changed_lines,
+        )
+        changes.append(
+            _CommitChange(
+                path=safe_path,
+                operation=operation,
+                old_content=old_content,
+                current_content=current_content,
+                old_mode=old_mode,
+                current_mode=mode,
+                changed_lines=changed_lines,
+                diff=_create_unified_diff(
+                    safe_path,
+                    old_text,
+                    current_text,
+                    operation=operation,
+                ),
+            )
+        )
+
+    ordered_changes = tuple(changes)
+    _validate_complete_limits(ordered_changes)
+
+    fingerprint_payload = {
+        "expected_branch": expected_branch,
+        "candidate_head": safe_candidate_head,
+        "old_head": safe_old_head,
+        "commit_message": commit_message,
+        "changes": [
+            {
+                "path": change.path,
+                "operation": change.operation,
+                "old_sha256": hashlib.sha256(change.old_content).hexdigest(),
+                "current_sha256": hashlib.sha256(change.current_content).hexdigest(),
+                "old_mode": change.old_mode,
+                "current_mode": change.current_mode,
+                "changed_lines": change.changed_lines,
+                "diff": change.diff,
+            }
+            for change in ordered_changes
+        ],
+    }
+    preview_fingerprint = hashlib.sha256(
+        json.dumps(
+            fingerprint_payload,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+
+    preview = {
+        "action": "adopt_candidate",
+        "branch": expected_branch,
+        "candidate_head": safe_candidate_head,
+        "old_head": safe_old_head,
+        "commit_message": commit_message,
+        "operation_count": len(ordered_changes),
+        "added_count": sum(change.operation == "add" for change in ordered_changes),
+        "modified_count": sum(
+            change.operation == "modify" for change in ordered_changes
+        ),
+        "total_old_size_bytes": sum(
+            change.old_size_bytes for change in ordered_changes
+        ),
+        "total_new_size_bytes": sum(
+            change.new_size_bytes for change in ordered_changes
+        ),
+        "total_changed_lines": sum(change.changed_lines for change in ordered_changes),
+        "paths": [change.path for change in ordered_changes],
+        "changes": [change.preview() for change in ordered_changes],
+        "preview_fingerprint": preview_fingerprint,
+        "guarantees": [
+            "git repository content is read-only during approval",
+            "candidate metadata is compatibility evidence only",
+            "successful adoption updates lifecycle checkpoint only",
+        ],
+    }
+    preview_json = _serialize_preview(preview)
+    return IsolatedCommitRecoveryCandidatePreview._validated(
+        expected_branch=expected_branch,
+        candidate_head=safe_candidate_head,
+        old_head=safe_old_head,
+        commit_message=commit_message,
+        changes=ordered_changes,
+        preview_fingerprint=preview_fingerprint,
+        preview_json=preview_json,
     )
 
 
