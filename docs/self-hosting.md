@@ -206,11 +206,18 @@ git -C "/path/to/project" config --local user.email "you@example.com"
 6. Use `apply_text_replacement` when the exact current fragment is known and
    reasonably small. After inspecting the current file, use
    `apply_line_range_replacement` for a known one-based inclusive range,
-   particularly in a large file, with the exact current `read_file` SHA-256.
-   Never guess a hash or uninspected line numbers. Use `apply_file_rewrite`
-   only for a true whole-file change after a complete read, never to avoid an
-   exact-content mismatch. Use one `apply_workspace_changes` transaction when
-   several file changes must succeed together or when creation is required.
+   particularly in a large file, with an exact current SHA-256 from an
+   appropriate `read_file` or a successful prior action when its resulting
+   content is known. Never guess a hash or uninspected line numbers. Use
+   `apply_file_rewrite` only when complete current file content is known for a
+   true whole-file change; normally get it from a complete read, or retain it
+   after a successful action when the exact full resulting content is known.
+   Never use it to avoid an exact-content mismatch. Use one
+   `apply_workspace_changes` transaction when several file changes must succeed
+   together or when creation is required.
+   After a successful action, chained edits to the same known resulting content
+   can reuse its `resulting_file_sha256` instead of spending another inspection
+   round solely to reacquire the SHA.
 7. Review every complete action preview and diff.
 8. Approve each controller-invoked Ruff format target separately, then approve
    project-wide Ruff check and pytest. Formatter targets are sorted existing
@@ -423,11 +430,15 @@ Use the existing test conventions:
 3. Use apply_text_replacement when the exact current fragment is known and
    reasonably small. After inspecting the current file, use
    apply_line_range_replacement for a known one-based inclusive range,
-   particularly in a large file, with the exact current read_file SHA-256.
-   Never guess a hash or uninspected line numbers. Use apply_file_rewrite only
-   for a true whole-file change after a complete read, never to avoid an
-   exact-content mismatch. Use one apply_workspace_changes transaction when
-   several changes must succeed together.
+   particularly in a large file, with an exact current SHA-256 from an
+   appropriate read_file or a successful prior action when its resulting
+   content is known. Never guess a hash or uninspected line numbers. Use
+   apply_file_rewrite only when complete current file content is known for a
+   true whole-file change; normally get it from a complete read, or retain it
+   after a successful action when the exact full resulting content is known.
+   Never use it to avoid an exact-content mismatch. Use one
+   apply_workspace_changes transaction when several changes must succeed
+   together.
 4. Wait for operator approval before every write action.
 5. Implement only the smallest correct change.
 6. Do not restart broad discovery during EDIT or REPAIR.

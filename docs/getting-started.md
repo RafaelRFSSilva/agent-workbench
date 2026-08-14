@@ -664,6 +664,15 @@ reading that file. Its closed input shape is:
 }
 ```
 
+For every SHA-guarded action, `expected_file_sha256` may come from either the
+`sha256` in an appropriate current `read_file` result, or the
+`resulting_file_sha256` returned by a successful immediately preceding
+controlled action on the same file when the resulting content is already
+known. A successful controlled action returns that lowercase SHA-256 digest for
+the exact UTF-8 bytes it wrote. Reread the file when its current content is
+unknown, or after an action fails, is stale, denied, rejected, or otherwise
+does not apply.
+
 `expected_text` must be non-empty. `expected_occurrences` must match the
 current number of non-overlapping literal occurrences exactly. The file's
 complete current SHA-256 must match `expected_file_sha256`, including when the

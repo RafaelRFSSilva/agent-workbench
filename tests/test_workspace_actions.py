@@ -307,7 +307,8 @@ def test_registration_preserves_existing_tools_and_exact_definition(
     assert APPLY_FILE_PATCH_DEFINITION.name == "apply_file_patch"
     assert APPLY_FILE_PATCH_DEFINITION.description == (
         "Apply one approved optimistic UTF-8 file patch inside the authorized "
-        "workspace when complete exact current content is known or creating a file."
+        "workspace when complete exact current content is known or creating a file. "
+        "Successful results include resulting_file_sha256 for chained edits."
     )
     assert APPLY_FILE_PATCH_DEFINITION.input_schema == {
         "type": "object",
@@ -383,7 +384,9 @@ def test_registration_preserves_existing_tools_and_exact_definition(
     assert APPLY_TEXT_REPLACEMENT_DEFINITION.name == "apply_text_replacement"
     assert APPLY_TEXT_REPLACEMENT_DEFINITION.description == (
         "Replace a reasonably small exact current literal fragment in one "
-        "existing UTF-8 file using the exact SHA-256 from read_file."
+        "existing UTF-8 file using an exact current SHA-256 from read_file or a "
+        "successful prior action result when its content is known; successful "
+        "results include resulting_file_sha256."
     )
     assert APPLY_TEXT_REPLACEMENT_DEFINITION.input_schema == {
         "type": "object",
@@ -699,6 +702,7 @@ def test_existing_file_preview_is_complete_deterministic_and_non_mutating(
         }
     )
     assert str(root) not in first["diff"]
+    assert "resulting_file_sha256" not in first
     assert target.read_text(encoding="utf-8") == "value = 1\n"
 
 
@@ -735,6 +739,7 @@ def test_file_rewrite_preview_and_apply_use_sha_without_expected_content(
         "old_size_bytes": 10,
         "new_size_bytes": 10,
         "changed_lines": 2,
+        "resulting_file_sha256": hashlib.sha256(b"value = 2\n").hexdigest(),
     }
     assert target.read_text(encoding="utf-8") == "value = 2\n"
 
@@ -1010,6 +1015,7 @@ def test_approved_update_and_creation_return_bounded_metadata(
         "old_size_bytes": 10,
         "new_size_bytes": 10,
         "changed_lines": 2,
+        "resulting_file_sha256": hashlib.sha256(b"value = 2\n").hexdigest(),
     }
     assert creation.output == {
         "path": "created.py",
@@ -1017,6 +1023,7 @@ def test_approved_update_and_creation_return_bounded_metadata(
         "old_size_bytes": 0,
         "new_size_bytes": 0,
         "changed_lines": 0,
+        "resulting_file_sha256": hashlib.sha256(b"").hexdigest(),
     }
     assert target.read_text(encoding="utf-8") == "value = 2\n"
     assert (root / "created.py").is_file()
@@ -1439,6 +1446,7 @@ def test_text_replacement_applies_exact_multiple_occurrences_and_preserves_mode(
         "new_size_bytes": 13,
         "changed_lines": 4,
         "occurrences_replaced": 2,
+        "resulting_file_sha256": hashlib.sha256(b"new\nnew\nkeep\n").hexdigest(),
     }
     assert target.read_text(encoding="utf-8") == "new\nnew\nkeep\n"
     assert stat.S_IMODE(target.stat().st_mode) == 0o640
@@ -2181,6 +2189,54 @@ def test_line_range_replacement_successful_approval_mutates_once(
     assert target.read_text(encoding="utf-8") == "before\nnew\nafter\n"
 
 
+def test_line_range_replacement_returns_exact_resulting_sha_without_final_newline(
+    tmp_path: Path,
+) -> None:
+    """Hash the exact UTF-8 bytes produced by a successful range replacement."""
+
+    root, workspace = create_workspace(tmp_path)
+    target = root / "module.py"
+    target.write_bytes("before\nold".encode("utf-8"))
+    result = apply_line_range_replacement(
+        workspace,
+        line_range_replacement_arguments(
+            start_line=2,
+            end_line=2,
+            replacement="é",
+            file_content="before\nold",
+        ),
+    )
+
+    actual_bytes = target.read_bytes()
+    assert actual_bytes == "before\né".encode("utf-8")
+    assert result["resulting_file_sha256"] == hashlib.sha256(actual_bytes).hexdigest()
+
+
+def test_stale_result_has_no_successful_hash_evidence(tmp_path: Path) -> None:
+    """Reject stale execution without manufacturing resulting-file evidence."""
+
+    root, workspace = create_workspace(tmp_path)
+    target = root / "module.py"
+    target.write_text("old\n", encoding="utf-8")
+    result = ToolRegistry()
+    register_workspace_action_tools(result, workspace)
+    tool_result = result.execute(
+        ToolInvocation(
+            id="stale",
+            tool_name="apply_file_rewrite",
+            arguments=file_rewrite_arguments(
+                file_content="old\n",
+                expected_sha256="0" * 64,
+            ),
+        )
+    )
+
+    assert tool_result.status == "error"
+    assert not isinstance(tool_result.output, dict) or (
+        "resulting_file_sha256" not in tool_result.output
+    )
+
+
 def test_line_range_replacement_approved_action_rechecks_stale_file(
     tmp_path: Path,
 ) -> None:
@@ -2358,7 +2414,7 @@ def test_transaction_registration_uses_exact_closed_nested_schema(
         "Apply one approved transactional set of UTF-8 file creations and "
         "updates inside the authorized workspace. Each changes array element "
         "must contain path, expected_content, replacement_content, and optional "
-        "create_if_missing."
+        "create_if_missing. Successful changes include resulting_file_sha256."
     )
     assert APPLY_WORKSPACE_CHANGES_DEFINITION.input_schema == {
         "type": "object",
@@ -2572,6 +2628,7 @@ def test_transaction_applies_mixed_changes_and_returns_bounded_metadata(
                 "old_size_bytes": 0,
                 "new_size_bytes": 8,
                 "changed_lines": 1,
+                "resulting_file_sha256": hashlib.sha256(b"created\n").hexdigest(),
             },
             {
                 "path": "z.py",
@@ -2579,6 +2636,7 @@ def test_transaction_applies_mixed_changes_and_returns_bounded_metadata(
                 "old_size_bytes": 4,
                 "new_size_bytes": 8,
                 "changed_lines": 2,
+                "resulting_file_sha256": hashlib.sha256(b"updated\n").hexdigest(),
             },
         ],
     }

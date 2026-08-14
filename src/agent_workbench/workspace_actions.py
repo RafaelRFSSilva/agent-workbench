@@ -51,7 +51,8 @@ APPLY_FILE_PATCH_DEFINITION = ToolDefinition(
     name="apply_file_patch",
     description=(
         "Apply one approved optimistic UTF-8 file patch inside the authorized "
-        "workspace when complete exact current content is known or creating a file."
+        "workspace when complete exact current content is known or creating a file. "
+        "Successful results include resulting_file_sha256 for chained edits."
     ),
     input_schema={
         "type": "object",
@@ -69,8 +70,10 @@ APPLY_FILE_PATCH_DEFINITION = ToolDefinition(
 APPLY_FILE_REWRITE_DEFINITION = ToolDefinition(
     name="apply_file_rewrite",
     description=(
-        "Rewrite one complete existing UTF-8 file using the SHA-256 from a "
-        "complete read_file; do not use it to bypass an exact-content mismatch."
+        "Rewrite one complete existing UTF-8 file when current content is known, "
+        "using an exact SHA-256 from read_file or a successful prior action result; "
+        "do not bypass an exact-content mismatch. Successful results include "
+        "resulting_file_sha256."
     ),
     input_schema={
         "type": "object",
@@ -95,7 +98,9 @@ APPLY_TEXT_REPLACEMENT_DEFINITION = ToolDefinition(
     name="apply_text_replacement",
     description=(
         "Replace a reasonably small exact current literal fragment in one "
-        "existing UTF-8 file using the exact SHA-256 from read_file."
+        "existing UTF-8 file using an exact current SHA-256 from read_file or a "
+        "successful prior action result when its content is known; successful "
+        "results include resulting_file_sha256."
     ),
     input_schema={
         "type": "object",
@@ -127,9 +132,10 @@ APPLY_TEXT_REPLACEMENT_DEFINITION = ToolDefinition(
 APPLY_LINE_RANGE_REPLACEMENT_DEFINITION = ToolDefinition(
     name="apply_line_range_replacement",
     description=(
-        "After read_file inspection, replace one exact one-based inclusive line "
-        "range in an existing UTF-8 file, particularly a large file, using the "
-        "exact current file SHA-256."
+        "Replace one exact one-based inclusive line range in an existing UTF-8 "
+        "file using an exact current SHA-256 from read_file or a successful prior "
+        "action result when its content is known; successful results include "
+        "resulting_file_sha256."
     ),
     input_schema={
         "type": "object",
@@ -172,7 +178,7 @@ APPLY_WORKSPACE_CHANGES_DEFINITION = ToolDefinition(
         "Apply one approved transactional set of UTF-8 file creations and "
         "updates inside the authorized workspace. Each changes array element "
         "must contain path, expected_content, replacement_content, and optional "
-        "create_if_missing."
+        "create_if_missing. Successful changes include resulting_file_sha256."
     ),
     input_schema={
         "type": "object",
@@ -215,6 +221,7 @@ class _PreparedPatch:
     replacement_content: str
     old_size_bytes: int
     new_size_bytes: int
+    replacement_bytes: bytes
     changed_lines: int
     diff: str
     existing_mode: int | None
@@ -229,6 +236,14 @@ class _PreparedPatch:
             "old_size_bytes": self.old_size_bytes,
             "new_size_bytes": self.new_size_bytes,
             "changed_lines": self.changed_lines,
+        }
+
+    def result_metadata(self) -> JSONObject:
+        """Return successful metadata with exact replacement-byte evidence."""
+
+        return {
+            **self.metadata(),
+            "resulting_file_sha256": hashlib.sha256(self.replacement_bytes).hexdigest(),
         }
 
 
@@ -250,6 +265,14 @@ class _PreparedTextReplacement:
             metadata["diff"] = self.patch.diff
         return metadata
 
+    def result_metadata(self) -> JSONObject:
+        """Return successful literal-replacement metadata."""
+
+        return {
+            **self.patch.result_metadata(),
+            "occurrences_replaced": self.occurrences_replaced,
+        }
+
 
 @dataclass(frozen=True, slots=True)
 class _PreparedLineRangeReplacement:
@@ -270,6 +293,15 @@ class _PreparedLineRangeReplacement:
         if include_diff:
             metadata["diff"] = self.patch.diff
         return metadata
+
+    def result_metadata(self) -> JSONObject:
+        """Return successful line-range metadata."""
+
+        return {
+            **self.patch.result_metadata(),
+            "start_line": self.start_line,
+            "end_line": self.end_line,
+        }
 
 
 @dataclass(slots=True)
@@ -301,7 +333,7 @@ class _LineRangeReplacementRegistration:
         self.prepared_arguments = None
         self.prepared = None
         _replace_file_atomically(self.workspace, prepared.patch)
-        return prepared.metadata(include_diff=False)
+        return prepared.result_metadata()
 
 
 @dataclass(frozen=True, slots=True)
@@ -316,7 +348,7 @@ class _WorkspaceChangePlan:
     total_changed_lines: int
 
     def metadata(self, *, include_diffs: bool) -> JSONObject:
-        """Return deterministic safe preview or result metadata."""
+        """Return deterministic preview metadata without execution evidence."""
 
         changes = []
         for patch in self.patches:
@@ -332,6 +364,19 @@ class _WorkspaceChangePlan:
             "total_new_size_bytes": self.total_new_size_bytes,
             "total_changed_lines": self.total_changed_lines,
             "changes": changes,
+        }
+
+    def result_metadata(self) -> JSONObject:
+        """Return successful transaction metadata with one SHA per file."""
+
+        return {
+            "operation_count": len(self.patches),
+            "created_count": self.created_count,
+            "updated_count": self.updated_count,
+            "total_old_size_bytes": self.total_old_size_bytes,
+            "total_new_size_bytes": self.total_new_size_bytes,
+            "total_changed_lines": self.total_changed_lines,
+            "changes": [patch.result_metadata() for patch in self.patches],
         }
 
 
@@ -430,7 +475,7 @@ def apply_file_patch(
     else:
         _replace_file_atomically(workspace, patch)
 
-    return patch.metadata()
+    return patch.result_metadata()
 
 
 def preview_file_rewrite(
@@ -454,7 +499,7 @@ def apply_file_rewrite(
 
     patch = _prepare_file_rewrite(workspace, arguments)
     _replace_file_atomically(workspace, patch)
-    return patch.metadata()
+    return patch.result_metadata()
 
 
 def preview_text_replacement(
@@ -476,7 +521,7 @@ def apply_text_replacement(
 
     prepared = _prepare_text_replacement(workspace, arguments)
     _replace_file_atomically(workspace, prepared.patch)
-    return prepared.metadata(include_diff=False)
+    return prepared.result_metadata()
 
 
 def preview_line_range_replacement(
@@ -498,7 +543,7 @@ def apply_line_range_replacement(
 
     prepared = _prepare_line_range_replacement(workspace, arguments)
     _replace_file_atomically(workspace, prepared.patch)
-    return prepared.metadata(include_diff=False)
+    return prepared.result_metadata()
 
 
 def preview_workspace_changes(
@@ -567,7 +612,7 @@ def apply_workspace_changes(
     finally:
         _cleanup_prepared_changes(prepared)
 
-    return plan.metadata(include_diffs=False)
+    return plan.result_metadata()
 
 
 def _prepare_patch(
@@ -642,6 +687,7 @@ def _prepare_patch(
         replacement_content=replacement_content,
         old_size_bytes=len(old_bytes),
         new_size_bytes=len(replacement_bytes),
+        replacement_bytes=replacement_bytes,
         changed_lines=changed_lines,
         diff=diff,
         existing_mode=existing_mode,
@@ -731,6 +777,7 @@ def _prepare_text_replacement(
             replacement_content=replacement_content,
             old_size_bytes=len(old_bytes),
             new_size_bytes=len(replacement_bytes),
+            replacement_bytes=replacement_bytes,
             changed_lines=changed_lines,
             diff=diff,
             existing_mode=snapshot.mode,
@@ -822,6 +869,7 @@ def _prepare_line_range_replacement(
             replacement_content=replacement_file_content,
             old_size_bytes=len(old_bytes),
             new_size_bytes=len(replacement_bytes),
+            replacement_bytes=replacement_bytes,
             changed_lines=changed_lines,
             diff=diff,
             existing_mode=snapshot.mode,
@@ -892,6 +940,7 @@ def _prepare_file_rewrite(
         replacement_content=replacement_content,
         old_size_bytes=len(old_bytes),
         new_size_bytes=len(replacement_bytes),
+        replacement_bytes=replacement_bytes,
         changed_lines=changed_lines,
         diff=diff,
         existing_mode=snapshot.mode,

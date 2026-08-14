@@ -23,6 +23,7 @@ from agent_workbench.coding_loop import (
     CodingProgressKind,
     CodingPhase,
     CodingWorkflowLimits,
+    _CONTROLLED_EDIT_SELECTION_GUIDANCE,
     _bounded_validation_failure_evidence,
     _format_validation_failure_evidence,
     _sanitize_prompt_text,
@@ -251,6 +252,20 @@ def approve(_request) -> ToolApprovalDecision:
     """Approve one action inside a disposable test repository."""
 
     return ToolApprovalDecision.APPROVE
+
+
+def test_controlled_edit_guidance_reuses_successful_result_sha_and_rereads_failures() -> (
+    None
+):
+    """Tell the model when resulting SHA evidence is reusable or invalid."""
+
+    assert "resulting_file_sha256" in _CONTROLLED_EDIT_SELECTION_GUIDANCE
+    assert "instead of rereading solely to obtain a SHA" in (
+        _CONTROLLED_EDIT_SELECTION_GUIDANCE
+    )
+    assert "If an action fails, is stale, or does not apply, reread the target" in (
+        _CONTROLLED_EDIT_SELECTION_GUIDANCE
+    )
 
 
 def test_controller_runs_discover_edit_validate_verify_and_done(
@@ -4250,7 +4265,9 @@ def test_phase_prompts_include_explicit_evidence_and_attempt_counters(
     assert "exact current fragment is known and reasonably small" in edit_prompt
     assert "apply_line_range_replacement" in edit_prompt
     assert "one-based and inclusive" in edit_prompt
-    assert "exact current file SHA-256" in edit_prompt
+    assert "exact current range content must be known" in edit_prompt
+    assert "appropriate current read_file" in edit_prompt
+    assert "successful prior action result" in edit_prompt
     assert "Never guess a hash or uninspected line numbers" in edit_prompt
     assert "Never use a whole-file rewrite to avoid an exact-content mismatch" in (
         edit_prompt

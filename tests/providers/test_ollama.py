@@ -592,7 +592,7 @@ def test_atomic_workspace_schema_is_delivered_to_ollama_unchanged(
         "Apply one approved transactional set of UTF-8 file creations and "
         "updates inside the authorized workspace. Each changes array element "
         "must contain path, expected_content, replacement_content, and optional "
-        "create_if_missing."
+        "create_if_missing. Successful changes include resulting_file_sha256."
     )
     assert function["parameters"] == APPLY_WORKSPACE_CHANGES_DEFINITION.input_schema
     assert function["parameters"]["required"] == ["changes"]
