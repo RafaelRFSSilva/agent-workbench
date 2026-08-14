@@ -183,7 +183,7 @@ def _main(
             )
     except ConfigurationError as exc:
         print(f"Configuration error: {exc}")
-        return
+        raise SystemExit(1) from None
 
     if runtime_configuration.worktree_path is not None:
         _run_isolated_autonomous_task(
@@ -209,7 +209,7 @@ def _main(
             )
     except ConfigurationError as exc:
         print(f"Configuration error: {exc}")
-        return
+        raise SystemExit(1) from None
 
     _run_configured_cli(
         session,
@@ -347,7 +347,7 @@ def _run_isolated_autonomous_task(
             "Configuration error: Isolated autonomous workflow "
             "configuration is incomplete."
         )
-        return
+        raise SystemExit(1)
 
     observer = _display_tool_round if runtime_configuration.show_tool_traces else None
     terminal_failure_displayed = False
