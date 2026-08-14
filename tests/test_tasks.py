@@ -104,6 +104,118 @@ def test_is_frozen_and_slotted() -> None:
     assert not hasattr(spec, "__dict__")
 
 
+# Tests for TaskSpec dependencies feature
+
+
+def test_default_empty_dependencies() -> None:
+    spec = TaskSpec(objective="obj", acceptance_criteria=["c1"])
+    assert spec.dependencies == ()
+
+
+def test_explicit_tuple_dependencies() -> None:
+    dep1 = TaskId("dep1")
+    dep2 = TaskId("dep2")
+    spec = TaskSpec(
+        objective="obj", acceptance_criteria=["c1"], dependencies=(dep1, dep2)
+    )
+    assert spec.dependencies == (dep1, dep2)
+
+
+def test_list_dependencies_snapshotted_to_tuple() -> None:
+    dep1 = TaskId("dep1")
+    dep2 = TaskId("dep2")
+    original_deps = [dep1, dep2]
+    spec = TaskSpec(
+        objective="obj", acceptance_criteria=["c1"], dependencies=original_deps
+    )
+    assert isinstance(spec.dependencies, tuple)
+    assert spec.dependencies == (dep1, dep2)
+
+
+def test_original_list_mutation_does_not_alter_taskspec() -> None:
+    dep1 = TaskId("dep1")
+    original_deps = [dep1]
+    spec = TaskSpec(
+        objective="obj", acceptance_criteria=["c1"], dependencies=original_deps
+    )
+    original_deps.append(TaskId("dep2"))
+    assert len(spec.dependencies) == 1
+    assert spec.dependencies[0] == dep1
+
+
+def test_dependency_order_preserved() -> None:
+    dep1 = TaskId("first")
+    dep2 = TaskId("second")
+    dep3 = TaskId("third")
+    spec = TaskSpec(
+        objective="obj", acceptance_criteria=["c1"], dependencies=[dep1, dep2, dep3]
+    )
+    assert list(spec.dependencies) == [dep1, dep2, dep3]
+
+
+def test_duplicate_dependencies_preserved() -> None:
+    dep = TaskId("dup")
+    spec = TaskSpec(
+        objective="obj", acceptance_criteria=["c1"], dependencies=[dep, dep]
+    )
+    assert list(spec.dependencies) == [dep, dep]
+
+
+def test_invalid_non_taskid_dependency_raises_error() -> None:
+    for invalid in [123, "not-a-task-id", None]:
+        with pytest.raises(ConfigurationError):
+            TaskSpec(
+                objective="obj", acceptance_criteria=["c1"], dependencies=[invalid]
+            )  # type: ignore[list-item]
+
+
+def test_equality_with_equivalent_dependencies() -> None:
+    dep1 = TaskId("dep1")
+    dep2 = TaskId("dep2")
+    spec_a = TaskSpec(
+        objective="obj", acceptance_criteria=["c1"], dependencies=(dep1, dep2)
+    )
+    spec_b = TaskSpec(
+        objective="obj", acceptance_criteria=["c1"], dependencies=(dep1, dep2)
+    )
+    assert spec_a == spec_b
+
+
+def test_inequality_when_dependencies_differ() -> None:
+    dep1 = TaskId("dep1")
+    dep2 = TaskId("dep2")
+    dep3 = TaskId("dep3")
+    spec_a = TaskSpec(
+        objective="obj", acceptance_criteria=["c1"], dependencies=(dep1, dep2)
+    )
+    spec_b = TaskSpec(
+        objective="obj", acceptance_criteria=["c1"], dependencies=(dep1, dep3)
+    )
+    assert spec_a != spec_b
+
+
+def test_hashing_consistent_with_equality() -> None:
+    dep1 = TaskId("dep1")
+    dep2 = TaskId("dep2")
+    spec_a = TaskSpec(
+        objective="obj", acceptance_criteria=["c1"], dependencies=(dep1, dep2)
+    )
+    spec_b = TaskSpec(
+        objective="obj", acceptance_criteria=["c1"], dependencies=(dep1, dep2)
+    )
+    assert hash(spec_a) == hash(spec_b)
+    s = {spec_a, spec_b}
+    assert len(s) == 1
+
+
+def test_existing_taskspec_construction_still_supported() -> None:
+    # Ensure backwards compatibility - no dependencies parameter
+    spec = TaskSpec(objective="obj", acceptance_criteria=["c1"])
+    assert spec.objective == "obj"
+    assert spec.acceptance_criteria == ("c1",)
+    assert spec.dependencies == ()
+
+
 # Value equality and hashability for equivalent inputs.
 def test_value_equality_and_hashability() -> None:
     list_input = ["c1", "c2"]

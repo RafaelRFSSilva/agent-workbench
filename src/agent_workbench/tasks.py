@@ -17,6 +17,7 @@ class TaskId:
 class TaskSpec:
     objective: str
     acceptance_criteria: tuple[str, ...]
+    dependencies: tuple["TaskId", ...]
     task_id: "TaskId | None"
 
     def __init__(
@@ -24,6 +25,7 @@ class TaskSpec:
         objective: str,
         acceptance_criteria: Iterable[str],
         *,
+        dependencies: Iterable["TaskId"] = (),
         task_id: "TaskId | None" = None,
     ) -> None:
         if not isinstance(objective, str) or not objective.strip():
@@ -32,6 +34,7 @@ class TaskSpec:
             raise ConfigurationError(
                 "acceptance criteria must be an iterable of strings"
             )
+
         try:
             criteria = tuple(acceptance_criteria)
         except TypeError as exc:
@@ -42,9 +45,20 @@ class TaskSpec:
             if not isinstance(c, str) or not c.strip():
                 raise ConfigurationError(f"criterion '{c}' must be a non-empty string")
 
+        try:
+            deps = tuple(dependencies)
+        except TypeError as exc:
+            raise ConfigurationError(
+                "dependencies must be an iterable of TaskId"
+            ) from exc
+        for dep in deps:
+            if not isinstance(dep, TaskId):
+                raise ConfigurationError(f"dependency '{dep}' must be a TaskId")
+
         if task_id is not None and not isinstance(task_id, TaskId):
             raise ConfigurationError("task id must be a TaskId or None.")
 
         object.__setattr__(self, "objective", objective)
         object.__setattr__(self, "acceptance_criteria", criteria)
+        object.__setattr__(self, "dependencies", deps)
         object.__setattr__(self, "task_id", task_id)
