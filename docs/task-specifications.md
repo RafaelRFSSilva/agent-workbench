@@ -16,11 +16,13 @@ OpenAI, Anthropic, provider request formats, workspace tools, or the CLI.
 TaskSpec
 ├─ objective
 ├─ acceptance_criteria
+├─ dependencies
 └─ task_id
 ```
 
 - `objective` is the exact non-blank string supplied by the caller.
 - `acceptance_criteria` is an ordered immutable tuple of non-blank strings.
+- `dependencies` is an ordered immutable tuple of `TaskId` instances. It defaults to an empty tuple and preserves both order and duplicates exactly.
 - `task_id` is an optional `TaskId` instance or `None`. It preserves the
   original string value and enforces that it is a non-blank string.
 
@@ -46,6 +48,7 @@ A valid task specification requires:
 - At least one acceptance criterion.
 - A `task_id` that is either `None` or an instance of `TaskId`. If provided,
   the underlying value must be a non-blank string.
+- Dependencies that are an iterable of `TaskId` instances. Each element must be a valid `TaskId`; strings and other types are rejected.
 
 A bare string is rejected as the acceptance-criteria collection because it
 would otherwise be interpreted as an iterable of individual characters.
@@ -69,6 +72,9 @@ Agent Workbench does not:
 The acceptance-criteria iterable is converted to a tuple during construction,
 and the optional `task_id` is stored as an immutable object. Later mutation of
 an original list therefore cannot change the stored task.
+
+Similarly, the dependencies iterable is snapshotted into an immutable tuple,
+preserving order and duplicates exactly.
 
 ## AgentSession Integration
 
@@ -130,6 +136,8 @@ This keeps task identity independent from the model selected for a session.
 
 Task metadata is currently descriptive only.
 
+`dependencies` records dependency metadata only. Agent Workbench does not yet execute dependency graphs, schedule dependent tasks, resolve dependencies, or detect dependency cycles.
+
 Attaching a `TaskSpec` to an `AgentSession` does not automatically:
 
 - Insert the objective into the system prompt.
@@ -182,7 +190,6 @@ implementation.
 Possible future additions include:
 
 - Task lifecycle states.
-- Dependencies.
 - Manual task assignment.
 - Planner-proposed tasks.
 - Agent handoffs.
