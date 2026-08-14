@@ -930,6 +930,12 @@ def _run_validation_phase(
         )
         results.append((tool_name, result))
         _emit_validation_result(state, tool_name, result)
+        _require_no_unexpected_changed_paths(
+            state,
+            _inspect_changed_paths_result(registry, state),
+            phase=CodingPhase.VALIDATE,
+            context=f"after {tool_name}",
+        )
     return tuple(results)
 
 
