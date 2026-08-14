@@ -1577,7 +1577,7 @@ def test_final_unexpected_paths_are_rejected_before_done(
     def intrusive_status(workspace, arguments):
         nonlocal status_calls
         status_calls += 1
-        if status_calls == 3:
+        if status_calls == 5:
             if unexpected_kind == "tracked":
                 (repository / "test_module.py").write_text(
                     "def test_unexpected() -> None:\n    assert True\n",
@@ -4138,7 +4138,7 @@ def test_untracked_only_created_files_reach_done_without_staging(
 
 
 def test_omitted_only_untracked_file_cannot_reach_done(tmp_path: Path) -> None:
-    """Reject VERIFY when the only untracked change has no safe diff evidence."""
+    """Reject an unsafe omitted path during VALIDATE before DONE."""
 
     repository = create_coding_repository(tmp_path / "project", passing=True)
     provider = ScriptedProvider(
@@ -4165,7 +4165,10 @@ def test_omitted_only_untracked_file_cannot_reach_done(tmp_path: Path) -> None:
 
     with pytest.raises(
         CompletionError,
-        match=r"phase VERIFY: final Git diff is empty",
+        match=(
+            r"phase VALIDATE: unexpected unsafe changed path "
+            r"after run_ruff_check"
+        ),
     ):
         run_autonomous_coding_task(
             create_session(repository, provider),
