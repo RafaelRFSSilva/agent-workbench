@@ -2949,11 +2949,20 @@ def test_scripted_cli_progress_orders_failure_repair_success_verify_and_done(
             ChatResponse(
                 text="Provider completion after first edit with private prose."
             ),
+            ChatResponse(
+                text="Provider completion after first edit with private prose."
+            ),
             coding_replacement_response(
                 "repair",
                 expected_content=multiplied,
                 expected_text="return left * right",
                 replacement_text="return left + right",
+            ),
+            ChatResponse(
+                text=(
+                    "Provider long completion must remain hidden. "
+                    "replacement_content and tool-call JSON stay private."
+                )
             ),
             ChatResponse(
                 text=(
@@ -3059,6 +3068,7 @@ def test_scripted_cli_separates_successful_patch_from_later_stale_repeat(
             repeated_patch,
             repeated_patch,
             ChatResponse(text="Edit complete."),
+            ChatResponse(text="Edit complete."),
         ]
     )
     session = create_cli_coding_session(repository, provider)
@@ -3137,6 +3147,7 @@ def test_scripted_cli_unexpected_formatter_path_fails_without_done(
                 expected_text="return left - right",
                 replacement_text="return left + right",
             ),
+            ChatResponse(text="Hidden provider completion."),
             ChatResponse(text="Hidden provider completion."),
         ]
     )

@@ -271,6 +271,7 @@ def test_controller_runs_discover_edit_validate_verify_and_done(
                 replacement_text="return left + right",
             ),
             ChatResponse(text="Corrected the add implementation."),
+            ChatResponse(text="Corrected the add implementation."),
         ]
     )
     progress = []
@@ -285,7 +286,7 @@ def test_controller_runs_discover_edit_validate_verify_and_done(
     assert result.final_phase is CodingPhase.DONE
     assert result.workspace_change_applied is True
     assert result.repair_attempt_count == 0
-    assert result.completion_continuation_count == 0
+    assert result.completion_continuation_count == 1
     assert result.tool_round_count == 7
     assert result.executed_tool_names == (
         "read_file",
@@ -394,6 +395,7 @@ def test_line_range_action_is_compatible_with_final_workspace_verification(
                 replacement_content="    return left + right\n",
             ),
             ChatResponse(text="Corrected the add implementation."),
+            ChatResponse(text="Corrected the add implementation."),
         ]
     )
 
@@ -445,6 +447,7 @@ def test_large_file_line_range_regression_changes_only_inspected_middle_range(
                 end_line=604,
                 replacement_content="    return left + right\n",
             ),
+            ChatResponse(text="Changed only the inspected range."),
             ChatResponse(text="Changed only the inspected range."),
         ]
     )
@@ -535,6 +538,7 @@ def test_invalid_patch_arguments_are_corrected_before_one_approved_edit(
                     "replacement_content": corrected,
                 },
             ),
+            ChatResponse(text="Edit complete."),
             ChatResponse(text="Edit complete."),
         ]
     )
@@ -794,6 +798,7 @@ def test_multi_file_edit_recovers_after_successful_controlled_action(
                 },
             ),
             ChatResponse(text="Edit complete."),
+            ChatResponse(text="Edit complete."),
         ]
     )
     progress: list[CodingProgressEvent] = []
@@ -857,6 +862,7 @@ def test_edit_uses_derived_inspection_budget_before_approved_change(
                 expected_text="return left - right",
                 replacement_text="return left + right",
             ),
+            ChatResponse(text="Edit complete."),
             ChatResponse(text="Edit complete."),
         ]
     )
@@ -983,6 +989,7 @@ def test_edit_executes_repeated_safe_read_then_applies_approved_change(
                 replacement_text="return left + right",
             ),
             ChatResponse(text="Edit complete."),
+            ChatResponse(text="Edit complete."),
         ]
     )
     approval_names: list[str] = []
@@ -1047,6 +1054,7 @@ def test_edit_rejects_ordinary_duplicate_then_allows_alternative_inspection(
                 expected_text="return left - right",
                 replacement_text="return left + right",
             ),
+            ChatResponse(text="Edit complete."),
             ChatResponse(text="Edit complete."),
         ]
     )
@@ -1162,6 +1170,7 @@ def test_formats_only_successful_approved_python_path_and_preserves_baseline_dir
                 replacement_text="return  left+right",
             ),
             ChatResponse(text="Edit complete."),
+            ChatResponse(text="Edit complete."),
         ]
     )
 
@@ -1217,6 +1226,7 @@ def test_formats_multiple_successful_approved_python_paths_in_sorted_order(
                 },
             ),
             ChatResponse(text="Edit complete."),
+            ChatResponse(text="Edit complete."),
         ]
     )
     observed = []
@@ -1263,6 +1273,7 @@ def test_non_python_change_skips_formatter_but_runs_project_checks(
                     "replacement_content": "after\n",
                 },
             ),
+            ChatResponse(text="Edit complete."),
             ChatResponse(text="Edit complete."),
         ]
     )
@@ -1369,6 +1380,7 @@ def test_stale_repeated_patch_after_success_is_rejected_as_a_later_action(
             tool_response("ollama-tool-call-1", "apply_file_patch", arguments),
             tool_response("ollama-tool-call-1", "apply_file_patch", arguments),
             ChatResponse(text="Edit complete."),
+            ChatResponse(text="Edit complete."),
         ]
     )
     replacements: list[str] = []
@@ -1454,12 +1466,14 @@ def test_validation_failure_emits_repair_attempt_and_safe_pytest_summary(
                 replacement_text="return left * right",
             ),
             ChatResponse(text="Edit complete."),
+            ChatResponse(text="Edit complete."),
             replacement_response(
                 "repair",
                 expected_content=multiplied,
                 expected_text="return left * right",
                 replacement_text="return left + right",
             ),
+            ChatResponse(text="Repair complete."),
             ChatResponse(text="Repair complete."),
         ]
     )
@@ -1511,6 +1525,7 @@ def test_formatter_created_unexpected_path_fails_before_done(
                 expected_text="return left - right",
                 replacement_text="return left + right",
             ),
+            ChatResponse(text="Edit complete."),
             ChatResponse(text="Edit complete."),
         ]
     )
@@ -1574,6 +1589,7 @@ def test_final_unexpected_paths_are_rejected_before_done(
                 replacement_text="return left + right",
             ),
             ChatResponse(text="Edit complete."),
+            ChatResponse(text="Edit complete."),
         ]
     )
     expected_path = (
@@ -1619,6 +1635,7 @@ def test_discovery_round_limit_advances_to_edit(tmp_path: Path) -> None:
                 expected_text="return left - right",
                 replacement_text="return left + right",
             ),
+            ChatResponse(text="Edit complete."),
             ChatResponse(text="Edit complete."),
         ]
     )
@@ -1697,6 +1714,7 @@ def test_discovery_evidence_and_summary_are_bounded_and_sanitized(
                 replacement_text="return left + right",
             ),
             ChatResponse(text="Edit complete."),
+            ChatResponse(text="Edit complete."),
         ]
     )
 
@@ -1736,6 +1754,7 @@ def test_edit_completion_continuation_then_successful_change(
                 replacement_text="return left + right",
             ),
             ChatResponse(text="Now the implementation is corrected."),
+            ChatResponse(text="Now the implementation is corrected."),
         ]
     )
 
@@ -1746,11 +1765,239 @@ def test_edit_completion_continuation_then_successful_change(
     )
 
     assert result.final_phase is CodingPhase.DONE
-    assert result.completion_continuation_count == 1
+    assert result.completion_continuation_count == 2
     continuation = provider.requests[2].messages[-1]["content"]
     assert "Current phase: EDIT" in continuation
     assert "no successful new workspace change was observed" in continuation
     assert "Assistant prose is not evidence" in continuation
+
+
+def test_normal_edit_successful_change_requires_completion_confirmation(
+    tmp_path: Path,
+) -> None:
+    """A normal (non-exhausted) successful EDIT change must not validate yet."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    original = "def add(left: int, right: int) -> int:\n    return left - right\n"
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            replacement_response(
+                "normal-edit",
+                expected_content=original,
+                expected_text="return left - right",
+                replacement_text="return left + right",
+            ),
+            ChatResponse(text="Edit applied."),
+            ChatResponse(text="Confirming no further changes are needed."),
+        ]
+    )
+
+    result = run_autonomous_coding_task(
+        create_session(repository, provider),
+        "Correct the add implementation.",
+        tool_approval_handler=approve,
+    )
+
+    # Exactly one bounded continuation is required after the successful
+    # mutation, and only the mutation-free continuation confirms completion;
+    # validation runs only after that confirmation.
+    assert result.final_phase is CodingPhase.DONE
+    assert result.completion_continuation_count == 1
+    assert result.workspace_change_applied is True
+    assert result.approved_workspace_paths == ("module.py",)
+    assert result.validation_succeeded is True
+    assert result.assistant_summary == "Confirming no further changes are needed."
+    assert len(provider.requests) == 4
+
+
+def test_normal_edit_completion_confirmation_prompt_preserves_task_context(
+    tmp_path: Path,
+) -> None:
+    """The normal post-change confirmation must repeat objective and criteria."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    original = "def add(left: int, right: int) -> int:\n    return left - right\n"
+    criteria = (
+        "Preserve the public function signature.",
+        "Correct the arithmetic behavior.",
+    )
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            replacement_response(
+                "normal-edit",
+                expected_content=original,
+                expected_text="return left - right",
+                replacement_text="return left + right",
+            ),
+            ChatResponse(text="Edit applied."),
+            ChatResponse(text="Confirming no further changes are needed."),
+        ]
+    )
+
+    run_autonomous_coding_task(
+        create_session(repository, provider),
+        "Correct the add implementation.",
+        acceptance_criteria=criteria,
+        tool_approval_handler=approve,
+    )
+
+    confirmation_prompt = provider.requests[-1].messages[-1]["content"]
+    assert "Original objective:\nCorrect the add implementation." in confirmation_prompt
+    assert "Preserve the public function signature." in confirmation_prompt
+    assert "Correct the arithmetic behavior." in confirmation_prompt
+    assert "already applied" in confirmation_prompt
+    assert "not evidence that editing is complete" in confirmation_prompt
+    assert "make another controlled workspace change now" in confirmation_prompt
+    assert (
+        "finish this response without inventing another workspace change"
+        in confirmation_prompt
+    )
+    # This is the normal-completion path, not tool-round exhaustion.
+    assert "exhausted its tool-round budget" not in confirmation_prompt
+
+
+def test_failed_mutation_during_normal_post_change_confirmation_does_not_confirm(
+    tmp_path: Path,
+) -> None:
+    """A failed action during the normal confirmation must not confirm completion."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    original = "def add(left: int, right: int) -> int:\n    return left - right\n"
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            replacement_response(
+                "normal-edit",
+                expected_content=original,
+                expected_text="return left - right",
+                replacement_text="return left + right",
+            ),
+            ChatResponse(text="Edit applied."),
+            replacement_response(
+                "stale-confirmation-attempt",
+                expected_content="stale content that will never match\n",
+                expected_text="return left - right",
+                replacement_text="return left + right",
+            ),
+            ChatResponse(text="I believe editing is already complete."),
+        ]
+    )
+
+    with pytest.raises(
+        CompletionError,
+        match=(
+            r"phase EDIT: completion continuation limit reached after no "
+            r"successful new workspace change was observed.*"
+            r"repair_attempts=0, completion_continuations=1"
+        ),
+    ):
+        run_autonomous_coding_task(
+            create_session(repository, provider),
+            "Correct the add implementation.",
+            tool_approval_handler=approve,
+            limits=CodingWorkflowLimits(edit_completion_continuations=1),
+        )
+
+    # The earlier preserved successful change is never rolled back, even
+    # though the later stale attempt failed to confirm completion.
+    assert run_git(repository, "status", "--short").stdout == " M module.py\n"
+
+
+def test_repeated_normal_post_change_completion_remains_bounded(
+    tmp_path: Path,
+) -> None:
+    """Repeated unconfirmed normal successful changes must fail closed, not loop."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    original = "def add(left: int, right: int) -> int:\n    return left - right\n"
+    fixed = "def add(left: int, right: int) -> int:\n    return left + right\n"
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            replacement_response(
+                "edit-1",
+                expected_content=original,
+                expected_text="return left - right",
+                replacement_text="return left + right",
+            ),
+            ChatResponse(text="First edit applied."),
+            replacement_response(
+                "edit-2",
+                expected_content=fixed,
+                expected_text="return left + right",
+                replacement_text="return left + right  # confirmed",
+            ),
+            ChatResponse(text="Second edit applied."),
+        ]
+    )
+
+    with pytest.raises(
+        CompletionError,
+        match=(
+            r"phase EDIT: completion continuation limit reached after a "
+            r"successful workspace change was applied but has not yet been "
+            r"confirmed complete.*repair_attempts=0, completion_continuations=1"
+        ),
+    ):
+        run_autonomous_coding_task(
+            create_session(repository, provider),
+            "Correct the add implementation.",
+            tool_approval_handler=approve,
+            limits=CodingWorkflowLimits(edit_completion_continuations=1),
+        )
+
+    # Both preserved changes remain on disk; the phase failed closed instead
+    # of looping forever or validating unconfirmed work.
+    assert run_git(repository, "status", "--short").stdout == " M module.py\n"
+
+
+def test_normal_repair_successful_change_requires_completion_confirmation(
+    tmp_path: Path,
+) -> None:
+    """A normal (non-exhausted) successful REPAIR change must not revalidate yet."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    original = "def add(left: int, right: int) -> int:\n    return left - right\n"
+    multiplied = "def add(left: int, right: int) -> int:\n    return left * right\n"
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            replacement_response(
+                "bad-edit",
+                expected_content=original,
+                expected_text="return left - right",
+                replacement_text="return left * right",
+            ),
+            ChatResponse(text="Edit applied."),
+            ChatResponse(text="Edit confirmed complete."),
+            replacement_response(
+                "normal-repair",
+                expected_content=multiplied,
+                expected_text="return left * right",
+                replacement_text="return left + right",
+            ),
+            ChatResponse(text="Repair applied."),
+            ChatResponse(text="Repair confirmed complete."),
+        ]
+    )
+
+    result = run_autonomous_coding_task(
+        create_session(repository, provider),
+        "Correct the add implementation.",
+        tool_approval_handler=approve,
+    )
+
+    # Revalidation only happens once, after the repair's own bounded
+    # confirmation; the successful repair mutation alone does not trigger it.
+    pytest_runs = [
+        run.exit_code for run in result.validation_runs if run.tool_name == "run_pytest"
+    ]
+    assert pytest_runs == [1, 0]
+    assert result.repair_attempt_count == 1
+    assert result.completion_continuation_count == 2
+    assert result.final_phase is CodingPhase.DONE
 
 
 def test_stale_patch_failure_reaches_next_edit_prompt_and_clears_after_rewrite(
@@ -1785,11 +2032,13 @@ def test_stale_patch_failure_reaches_next_edit_prompt_and_clears_after_rewrite(
                 replacement_content=multiplied,
             ),
             ChatResponse(text="Rewrite applied."),
+            ChatResponse(text="Rewrite applied."),
             rewrite_response(
                 "repair",
                 expected_content=multiplied,
                 replacement_content=corrected,
             ),
+            ChatResponse(text="Repair applied."),
             ChatResponse(text="Repair applied."),
         ]
     )
@@ -1853,6 +2102,7 @@ def test_failed_text_replacement_reaches_next_repair_prompt(
                 replacement_content=multiplied,
             ),
             ChatResponse(text="Initial edit applied."),
+            ChatResponse(text="Initial edit applied."),
             replacement_response(
                 "failed-replacement",
                 expected_content=multiplied,
@@ -1865,6 +2115,7 @@ def test_failed_text_replacement_reaches_next_repair_prompt(
                 expected_content=multiplied,
                 replacement_content=corrected,
             ),
+            ChatResponse(text="Repair applied."),
             ChatResponse(text="Repair applied."),
         ]
     )
@@ -1936,6 +2187,7 @@ def test_action_failure_evidence_uses_conservative_generic_sanitizer(
                 replacement_content=corrected,
             ),
             ChatResponse(text="Rewrite applied."),
+            ChatResponse(text="Rewrite applied."),
         ]
     )
 
@@ -1994,6 +2246,7 @@ def test_repeated_action_failures_are_sanitized_and_bounded(
                 replacement_content=corrected,
             ),
             ChatResponse(text="Rewrite applied."),
+            ChatResponse(text="Rewrite applied."),
         ]
     )
 
@@ -2003,7 +2256,7 @@ def test_repeated_action_failures_are_sanitized_and_bounded(
         tool_approval_handler=approve,
     )
 
-    continuation = provider.requests[-2].messages[-1]["content"]
+    continuation = provider.requests[-3].messages[-1]["content"]
     evidence_block = continuation.split("Action failure evidence:\n", 1)[1].split(
         "\n\n", 1
     )[0]
@@ -2043,6 +2296,7 @@ def test_unrelated_tool_error_is_not_action_failure_evidence(tmp_path: Path) -> 
                 expected_content=original,
                 replacement_content=corrected,
             ),
+            ChatResponse(text="Rewrite applied."),
             ChatResponse(text="Rewrite applied."),
         ]
     )
@@ -2088,6 +2342,7 @@ def test_edit_round_exhaustion_continues_then_changes_file(
                 replacement_text="return left + right",
             ),
             ChatResponse(text="Edit complete."),
+            ChatResponse(text="Edit complete."),
         ]
     )
 
@@ -2098,7 +2353,7 @@ def test_edit_round_exhaustion_continues_then_changes_file(
     )
 
     assert result.final_phase is CodingPhase.DONE
-    assert result.completion_continuation_count == 1
+    assert result.completion_continuation_count == 2
     continuation = provider.requests[3].messages[-1]["content"]
     assert "Current phase: EDIT" in continuation
     assert "exhausted its tool-round budget" in continuation
@@ -2123,6 +2378,7 @@ def test_repair_round_exhaustion_continues_then_repairs(
                 replacement_text="return left * right",
             ),
             ChatResponse(text="Bad edit complete."),
+            ChatResponse(text="Bad edit complete."),
             replacement_response(
                 "invalid-repair",
                 expected_content="stale content\n",
@@ -2142,6 +2398,7 @@ def test_repair_round_exhaustion_continues_then_repairs(
                 replacement_text="return left + right",
             ),
             ChatResponse(text="Repair complete."),
+            ChatResponse(text="Repair complete."),
         ]
     )
 
@@ -2153,8 +2410,8 @@ def test_repair_round_exhaustion_continues_then_repairs(
 
     assert result.final_phase is CodingPhase.DONE
     assert result.repair_attempt_count == 1
-    assert result.completion_continuation_count == 1
-    continuation = provider.requests[5].messages[-1]["content"]
+    assert result.completion_continuation_count == 3
+    continuation = provider.requests[6].messages[-1]["content"]
     assert "Current phase: REPAIR" in continuation
     assert "exhausted its tool-round budget" in continuation
 
@@ -2251,6 +2508,7 @@ def test_edit_round_exhaustion_continuation_applies_additional_change(
                 },
             ),
             ChatResponse(text="Both changes complete."),
+            ChatResponse(text="Both changes complete."),
         ]
     )
 
@@ -2261,7 +2519,7 @@ def test_edit_round_exhaustion_continuation_applies_additional_change(
     )
 
     assert result.final_phase is CodingPhase.DONE
-    assert result.completion_continuation_count == 1
+    assert result.completion_continuation_count == 2
     assert set(result.approved_workspace_paths) == {"module.py", "test_module.py"}
     assert result.validation_succeeded is True
     assert {
@@ -2349,6 +2607,7 @@ def test_repair_round_exhaustion_after_change_requires_continuation(
                 replacement_text="return left * right",
             ),
             ChatResponse(text="Bad edit complete."),
+            ChatResponse(text="Bad edit complete."),
             replacement_response(
                 "repair-fix",
                 expected_content=multiplied,
@@ -2373,7 +2632,7 @@ def test_repair_round_exhaustion_after_change_requires_continuation(
 
     assert result.final_phase is CodingPhase.DONE
     assert result.repair_attempt_count == 1
-    assert result.completion_continuation_count == 1
+    assert result.completion_continuation_count == 2
     assert result.validation_succeeded is True
     assert result.assistant_summary == "Repair confirmed complete."
 
@@ -2436,6 +2695,7 @@ def test_edit_post_exhaustion_continuation_with_failed_action_does_not_confirm(
                 },
             ),
             ChatResponse(text="Second change complete."),
+            ChatResponse(text="Second change complete."),
         ]
     )
 
@@ -2443,13 +2703,13 @@ def test_edit_post_exhaustion_continuation_with_failed_action_does_not_confirm(
         create_session(repository, provider, max_tool_rounds=1),
         "Correct the add implementation.",
         tool_approval_handler=approve,
-        limits=CodingWorkflowLimits(edit_completion_continuations=2),
+        limits=CodingWorkflowLimits(edit_completion_continuations=3),
     )
 
     # The failed continuation attempt must not be mistaken for confirmation;
     # a further continuation and a real change were still required.
     assert result.final_phase is CodingPhase.DONE
-    assert result.completion_continuation_count == 2
+    assert result.completion_continuation_count == 3
     assert set(result.approved_workspace_paths) == {"module.py", "test_module.py"}
     assert Path(repository / "module.py").read_text(encoding="utf-8") == fixed
 
@@ -2529,6 +2789,7 @@ def test_repair_post_exhaustion_continuation_with_failed_action_does_not_confirm
                 replacement_text="return left * right",
             ),
             ChatResponse(text="Bad edit complete."),
+            ChatResponse(text="Bad edit complete."),
             replacement_response(
                 "repair-fix",
                 expected_content=multiplied,
@@ -2555,7 +2816,7 @@ def test_repair_post_exhaustion_continuation_with_failed_action_does_not_confirm
         CompletionError,
         match=(
             r"phase REPAIR: repair completed without a successful new "
-            r"workspace change.*repair_attempts=1, completion_continuations=1"
+            r"workspace change.*repair_attempts=1, completion_continuations=2"
         ),
     ):
         run_autonomous_coding_task(
@@ -2779,12 +3040,14 @@ def test_failed_validation_enters_repair_and_revalidates(
                 replacement_text="return left * right",
             ),
             ChatResponse(text="Applied the first edit."),
+            ChatResponse(text="Applied the first edit."),
             replacement_response(
                 "repair",
                 expected_content=multiplied,
                 expected_text="return left * right",
                 replacement_text="return left + right",
             ),
+            ChatResponse(text="Repaired the failing implementation."),
             ChatResponse(text="Repaired the failing implementation."),
         ]
     )
@@ -2812,7 +3075,7 @@ def test_failed_validation_enters_repair_and_revalidates(
     assert result.validation_runs[2].exit_code == 1
     assert result.validation_runs[-1].exit_code == 0
 
-    repair_prompt = provider.requests[3].messages[-1]["content"]
+    repair_prompt = provider.requests[4].messages[-1]["content"]
     assert "Original objective:\nCorrect the add implementation." in repair_prompt
     assert "Inspect [absolute-path] if needed." in repair_prompt
     assert "[redacted sensitive content]" in repair_prompt
@@ -2887,11 +3150,13 @@ def test_repair_prompt_preserves_all_safe_failure_and_runtime_evidence(
                 replacement_content=multiplied,
             ),
             ChatResponse(text="Initial edit applied."),
+            ChatResponse(text="Initial edit applied."),
             rewrite_response(
                 "repair",
                 expected_content=multiplied,
                 replacement_content=corrected,
             ),
+            ChatResponse(text="Repair applied."),
             ChatResponse(text="Repair applied."),
         ]
     )
@@ -3100,12 +3365,14 @@ def test_repair_validation_output_is_deterministically_bounded(
                 replacement_content=multiplied,
             ),
             ChatResponse(text="Initial edit applied."),
+            ChatResponse(text="Initial edit applied."),
             ChatResponse(text="Repair is not complete."),
             rewrite_response(
                 "repair",
                 expected_content=multiplied,
                 replacement_content=corrected,
             ),
+            ChatResponse(text="Repair applied."),
             ChatResponse(text="Repair applied."),
         ]
     )
@@ -3123,7 +3390,7 @@ def test_repair_validation_output_is_deterministically_bounded(
             if "Current phase: REPAIR" in request.messages[-1]["content"]
         )
     )
-    assert len(repair_prompts) == 2
+    assert len(repair_prompts) == 3
     evidence_blocks = [
         prompt.split("Failed validation evidence:\n", 1)[1].split(
             "\nCurrent changed-file paths:",
@@ -3131,7 +3398,7 @@ def test_repair_validation_output_is_deterministically_bounded(
         )[0]
         for prompt in repair_prompts
     ]
-    assert evidence_blocks[0] == evidence_blocks[1]
+    assert evidence_blocks[0] == evidence_blocks[1] == evidence_blocks[2]
     assert len(evidence_blocks[0]) <= MAX_REPAIR_VALIDATION_EVIDENCE_CHARACTERS
     assert evidence_blocks[0].count("[truncated]") == 2
     assert "STDOUT-START" in evidence_blocks[0]
@@ -3406,17 +3673,20 @@ def test_second_repair_resolves_every_failure_and_reaches_done(
                 replacement_content=multiplied,
             ),
             ChatResponse(text="Initial edit applied."),
+            ChatResponse(text="Initial edit applied."),
             rewrite_response(
                 "incomplete-repair",
                 expected_content=multiplied,
                 replacement_content=divided,
             ),
             ChatResponse(text="First repair applied."),
+            ChatResponse(text="First repair applied."),
             rewrite_response(
                 "complete-repair",
                 expected_content=divided,
                 replacement_content=corrected,
             ),
+            ChatResponse(text="Second repair applied."),
             ChatResponse(text="Second repair applied."),
         ]
     )
@@ -3455,12 +3725,14 @@ def test_repeated_validation_failure_stops_at_repair_limit(
                 replacement_text="return left * right",
             ),
             ChatResponse(text="First edit complete."),
+            ChatResponse(text="First edit complete."),
             replacement_response(
                 "repair-1",
                 expected_content=multiplied,
                 expected_text="return left * right",
                 replacement_text="return left / right",
             ),
+            ChatResponse(text="First repair complete."),
             ChatResponse(text="First repair complete."),
             replacement_response(
                 "repair-2",
@@ -3469,6 +3741,7 @@ def test_repeated_validation_failure_stops_at_repair_limit(
                 replacement_text="return left // right",
             ),
             ChatResponse(text="Second repair complete."),
+            ChatResponse(text="Second repair complete."),
         ]
     )
 
@@ -3476,7 +3749,7 @@ def test_repeated_validation_failure_stops_at_repair_limit(
         CompletionError,
         match=(
             r"phase REPAIR: validation still failed.*"
-            r"repair_attempts=2, completion_continuations=0"
+            r"repair_attempts=2, completion_continuations=3"
         ),
     ):
         run_autonomous_coding_task(
@@ -3551,6 +3824,7 @@ def test_all_controlled_workspace_action_shapes_count_as_changes(
             ChatResponse(text="Discovery complete."),
             tool_response("edit", tool_name, arguments),
             ChatResponse(text="Edit complete."),
+            ChatResponse(text="Edit complete."),
         ]
     )
 
@@ -3582,6 +3856,7 @@ def test_successful_file_rewrite_reaches_validation_done_and_path_evidence(
                 expected_content=original,
                 replacement_content=replacement,
             ),
+            ChatResponse(text="Rewrite complete."),
             ChatResponse(text="Rewrite complete."),
         ]
     )
@@ -3615,6 +3890,7 @@ def test_repairs_without_new_changes_stop_without_revalidating(
                 replacement_text="return left * right",
             ),
             ChatResponse(text="Edit complete."),
+            ChatResponse(text="Edit complete."),
             ChatResponse(text="Repair claim one."),
             ChatResponse(text="Repair claim two."),
             ChatResponse(text="Repair claim three."),
@@ -3629,7 +3905,7 @@ def test_repairs_without_new_changes_stop_without_revalidating(
         CompletionError,
         match=(
             r"phase REPAIR: repair completed without a successful new workspace "
-            r"change.*repair_attempts=2, completion_continuations=4"
+            r"change.*repair_attempts=2, completion_continuations=5"
         ),
     ):
         run_autonomous_coding_task(
@@ -3708,6 +3984,7 @@ def test_successful_actions_with_empty_final_diff_are_rejected(
                 replacement_text="return left + right",
             ),
             ChatResponse(text="Actions complete."),
+            ChatResponse(text="Actions complete."),
         ]
     )
 
@@ -3741,6 +4018,7 @@ def test_safe_untracked_git_evidence_satisfies_final_diff_gate(
                 expected_text="return left - right",
                 replacement_text="return left + right",
             ),
+            ChatResponse(text="Edit complete."),
             ChatResponse(text="Edit complete."),
         ]
     )
@@ -3811,6 +4089,7 @@ def test_untracked_only_created_files_reach_done_without_staging(
                 },
             ),
             ChatResponse(text="Created the source and focused test."),
+            ChatResponse(text="Created the source and focused test."),
         ]
     )
 
@@ -3865,6 +4144,7 @@ def test_omitted_only_untracked_file_cannot_reach_done(tmp_path: Path) -> None:
                 },
             ),
             ChatResponse(text="Created the requested file."),
+            ChatResponse(text="Created the requested file."),
         ]
     )
 
@@ -3907,6 +4187,7 @@ def test_failed_git_inspection_prevents_done(tmp_path: Path) -> None:
                 replacement_text="return left + right",
             ),
             ChatResponse(text="Edit complete."),
+            ChatResponse(text="Edit complete."),
         ]
     )
 
@@ -3938,6 +4219,7 @@ def test_phase_prompts_include_explicit_evidence_and_attempt_counters(
                 expected_text="return left - right",
                 replacement_text="return left + right",
             ),
+            ChatResponse(text="Edit complete."),
             ChatResponse(text="Edit complete."),
         ]
     )
@@ -4011,6 +4293,7 @@ def test_custom_acceptance_criteria_reach_every_model_facing_phase(
                 replacement_text="return left * right",
             ),
             ChatResponse(text="Bad edit complete."),
+            ChatResponse(text="Bad edit complete."),
             ChatResponse(text="No repair yet."),
             replacement_response(
                 "repair",
@@ -4018,6 +4301,7 @@ def test_custom_acceptance_criteria_reach_every_model_facing_phase(
                 expected_text="return left * right",
                 replacement_text="return left + right",
             ),
+            ChatResponse(text="Repair complete."),
             ChatResponse(text="Repair complete."),
         ]
     )
@@ -4030,7 +4314,7 @@ def test_custom_acceptance_criteria_reach_every_model_facing_phase(
     )
 
     assert result.final_phase is CodingPhase.DONE
-    phase_prompt_indexes = (0, 1, 2, 4, 5)
+    phase_prompt_indexes = (0, 1, 2, 5, 6)
     for request_index in phase_prompt_indexes:
         prompt = provider.requests[request_index].messages[-1]["content"]
         assert "Acceptance criteria:" in prompt
@@ -4109,6 +4393,7 @@ class TestDeterministicRegressionBattery:
                     replacement_text="ANSWER = 2",
                 ),
                 ChatResponse(text="Constant corrected."),
+                ChatResponse(text="Constant corrected."),
             ]
         )
 
@@ -4141,12 +4426,14 @@ class TestDeterministicRegressionBattery:
                     replacement_text="return left * right",
                 ),
                 ChatResponse(text="First edit complete."),
+                ChatResponse(text="First edit complete."),
                 replacement_response(
                     "repair",
                     expected_content=multiplied,
                     expected_text="return left * right",
                     replacement_text="return left + right",
                 ),
+                ChatResponse(text="Repair complete."),
                 ChatResponse(text="Repair complete."),
             ]
         )
@@ -4215,6 +4502,7 @@ class TestDeterministicRegressionBattery:
                     },
                 ),
                 ChatResponse(text="Function and test added."),
+                ChatResponse(text="Function and test added."),
             ]
         )
 
@@ -4274,6 +4562,7 @@ class TestDeterministicRegressionBattery:
                     replacement_text="return left * right",
                 ),
                 ChatResponse(text="The task passes."),
+                ChatResponse(text="The task passes."),
                 ChatResponse(text="Repair is complete."),
                 ChatResponse(text="Tests now pass."),
                 ChatResponse(text="No change needed."),
@@ -4323,6 +4612,7 @@ class TestDeterministicRegressionBattery:
                     replacement_text="return left * right",
                 ),
                 ChatResponse(text="First edit complete."),
+                ChatResponse(text="First edit complete."),
                 replacement_response(
                     "only-repair",
                     expected_content=multiplied,
@@ -4330,12 +4620,13 @@ class TestDeterministicRegressionBattery:
                     replacement_text="return left / right",
                 ),
                 ChatResponse(text="Only repair complete."),
+                ChatResponse(text="Only repair complete."),
             ]
         )
 
         with pytest.raises(
             CompletionError,
-            match=r"repair_attempts=1, completion_continuations=0",
+            match=r"repair_attempts=1, completion_continuations=2",
         ):
             run_autonomous_coding_task(
                 create_session(repository, provider),

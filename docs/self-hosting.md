@@ -233,13 +233,15 @@ Every DISCOVER, EDIT, and REPAIR prompt, including continuations, receives the
 original ordered acceptance criteria. The controller carries bounded sanitized
 discovery paths, metadata, and a normal discovery summary into later phases;
 that evidence remains available when a maximum-round DISCOVER turn is not
-committed to session history. If one EDIT or REPAIR send exhausts its
-tool-round budget, any successful approved change from that send is preserved;
-tool-round exhaustion does not roll it back. Exhaustion alone never completes
-the phase, and validation does not start solely because the send exhausted.
-The controller consumes one of the existing bounded completion continuations,
-tells the model that a change was preserved, that exhaustion is not evidence
-of completion, and that it must review the remaining acceptance criteria, make
+committed to session history. Any successful approved workspace change made
+during one EDIT or REPAIR send is preserved and is never rolled back, whether
+that send exhausted its tool-round budget or completed normally. Neither
+tool-round exhaustion nor a normal model completion is, by itself, evidence
+that the requested editing work is complete, so the phase does not return and
+validation does not start solely because a change was applied. The controller
+consumes one of the existing bounded completion continuations, tells the model
+that a change was preserved, that the change alone is not evidence of
+completion, and that it must review the remaining acceptance criteria, make
 another controlled change if work remains, or finish normally without
 inventing a new change if editing is already complete. A later continuation
 may only close out the phase without a new mutation when a preserved change is
@@ -248,11 +250,14 @@ workspace-changing action that failed, was denied, or produced no applied
 change; a continuation that only performs read-only inspection before
 exhausting again keeps that confirmation pending instead of discarding it, and
 a continuation with a failed or denied mutation attempt never counts as
-confirmation. An ordinary fresh EDIT or REPAIR turn with no preserved change
-still requires an observed change to complete. Repeated exhaustion remains
-bounded by the same completion continuation limit and fails closed, the same
-as any other unresolved EDIT or REPAIR phase, once the limit is reached.
-Unrelated completion errors remain terminal.
+confirmation. If a continuation applies another successful change instead of
+confirming, that new change still requires its own confirmation under the same
+bounded limit. An ordinary fresh EDIT or REPAIR turn with no preserved change
+still requires an observed change to complete. Repeated exhaustion or repeated
+unconfirmed normal completions remain bounded by the same completion
+continuation limit and fail closed, the same as any other unresolved EDIT or
+REPAIR phase, once the limit is reached. Unrelated completion errors remain
+terminal.
 
 Failed controlled actions are carried into later EDIT and REPAIR prompts as
 bounded safe evidence. The model is told that the workspace did not change and
