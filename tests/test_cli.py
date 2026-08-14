@@ -1517,11 +1517,14 @@ def test_main_reports_invalid_workspace_configuration(
     )
     monkeypatch.setattr("agent_workbench.cli.run_cli", run_cli_mock)
 
-    main(["--workspace", str(tmp_path / "missing")])
+    with pytest.raises(SystemExit) as raised:
+        main(["--workspace", str(tmp_path / "missing")])
 
-    assert (
-        "Configuration error: Workspace root does not exist:" in capsys.readouterr().out
-    )
+    assert raised.value.code == 1
+
+    captured = capsys.readouterr()
+    assert "Configuration error: Workspace root does not exist:" in captured.out
+    assert captured.err == ""
     run_cli_mock.assert_not_called()
 
 
@@ -2072,7 +2075,10 @@ def test_invalid_project_configuration_prevents_provider_construction(
     )
     monkeypatch.setattr("agent_workbench.cli.create_agent_session", create_mock)
 
-    main(["code", "--workspace", str(tmp_path), "--task", "Fix it."])
+    with pytest.raises(SystemExit) as raised:
+        main(["code", "--workspace", str(tmp_path), "--task", "Fix it."])
+
+    assert raised.value.code == 1
 
     create_mock.assert_not_called()
     output = capsys.readouterr().out
@@ -2096,7 +2102,10 @@ def test_invalid_project_instructions_prevent_provider_construction(
     monkeypatch.setattr("agent_workbench.cli.load_environment", Mock())
     monkeypatch.setattr("agent_workbench.cli.create_agent_session", create_mock)
 
-    main(["code", "--workspace", str(tmp_path), "Fix it."])
+    with pytest.raises(SystemExit) as raised:
+        main(["code", "--workspace", str(tmp_path), "Fix it."])
+
+    assert raised.value.code == 1
 
     create_mock.assert_not_called()
     output = capsys.readouterr().out
@@ -3429,3 +3438,81 @@ def test_isolated_cli_invalid_lifecycle_store_fails_before_workflow_starts(
     assert exit_code == 1
     runner.assert_not_called()
     assert "lifecycle store directory does not exist" in capsys.readouterr().out
+
+
+def test_lifecycle_runtime_configuration_error_exits_1_without_traceback(
+    monkeypatch,
+    tmp_path,
+    capsys,
+) -> None:
+    """Return status 1 for lifecycle persistence without worktree isolation."""
+
+    lifecycle_store = tmp_path / "lifecycle-store"
+    lifecycle_store.mkdir()
+
+    monkeypatch.setattr("agent_workbench.cli.load_environment", Mock())
+
+    with pytest.raises(SystemExit) as raised:
+        main(
+            [
+                "code",
+                "--workspace",
+                str(tmp_path),
+                "--provider",
+                "ollama",
+                "--model",
+                "test-model",
+                "--agent",
+                "developer",
+                "--enable-actions",
+                "--task",
+                "Fix it.",
+                "--lifecycle-store",
+                str(lifecycle_store),
+                "--session-id",
+                "task-001",
+            ]
+        )
+
+    assert raised.value.code == 1
+    captured = capsys.readouterr()
+    assert captured.out == (
+        "Configuration error: Lifecycle persistence options require "
+        "--worktree-path and --worktree-branch.\n"
+    )
+    assert captured.err == ""
+
+
+def test_incomplete_isolated_autonomous_workflow_configuration_exits_1_without_traceback(
+    tmp_path,
+    capsys,
+) -> None:
+    """Return status 1 for the defensive incomplete isolated-workflow guard."""
+
+    from agent_workbench.cli import _run_isolated_autonomous_task
+
+    configuration = RuntimeConfiguration(
+        provider_name="ollama",
+        model_name="test-model",
+        workspace_root=tmp_path,
+        enable_actions=True,
+        worktree_path=tmp_path / "isolated",
+        worktree_branch="agent/test",
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        _run_isolated_autonomous_task(
+            configuration,
+            task_prompt=None,
+            commit_message="fix: test",
+            lifecycle_store_directory=None,
+            lifecycle_session_id=None,
+        )
+
+    assert raised.value.code == 1
+    captured = capsys.readouterr()
+    assert captured.out == (
+        "Configuration error: Isolated autonomous workflow "
+        "configuration is incomplete.\n"
+    )
+    assert captured.err == ""
