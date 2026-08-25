@@ -781,6 +781,330 @@ def test_rejects_a_file_larger_than_the_size_limit(tmp_path: Path) -> None:
         read_workspace_file(workspace, {"path": "large.txt"})
 
 
+def test_reads_bounded_range_from_file_larger_than_size_limit(
+    tmp_path: Path,
+) -> None:
+    """Read a small inclusive range from a source above the whole-file limit."""
+
+    root, workspace = create_workspace(tmp_path)
+    lines = [f"line-{index:05d}\n" for index in range(1, 15_001)]
+    content = "".join(lines)
+    content_bytes = content.encode("utf-8")
+
+    assert len(content_bytes) > MAX_FILE_SIZE_BYTES
+    (root / "large.txt").write_bytes(content_bytes)
+
+    result = read_workspace_file(
+        workspace,
+        {"path": "large.txt", "line_start": 7000, "line_end": 7002},
+    )
+
+    assert result == {
+        "path": "large.txt",
+        "content": "".join(lines[6999:7002]),
+        "size_bytes": len(content_bytes),
+        "sha256": hashlib.sha256(content_bytes).hexdigest(),
+        "line_start": 7000,
+        "line_end": 7002,
+        "total_lines": len(lines),
+        "truncated": True,
+    }
+
+
+def test_large_partial_read_handles_multibyte_utf8(tmp_path: Path) -> None:
+    """Validate multibyte UTF-8 incrementally across an oversized source."""
+
+    root, workspace = create_workspace(tmp_path)
+
+    first_line = ("€" * 40_000) + "\n"
+    selected_line = "β😀 selected\n"
+    tail = "tail\n" * 1_000
+    content = first_line + selected_line + tail
+    content_bytes = content.encode("utf-8")
+
+    assert len(content_bytes) > MAX_FILE_SIZE_BYTES
+    (root / "unicode.txt").write_bytes(content_bytes)
+
+    result = read_workspace_file(
+        workspace,
+        {"path": "unicode.txt", "line_start": 2, "line_end": 2},
+    )
+
+    assert result["content"] == selected_line
+    assert result["size_bytes"] == len(content_bytes)
+    assert result["sha256"] == hashlib.sha256(content_bytes).hexdigest()
+    assert result["line_start"] == 2
+    assert result["line_end"] == 2
+    assert result["total_lines"] == 1002
+    assert result["truncated"] is True
+
+
+def test_large_partial_read_rejects_invalid_utf8_outside_selected_range(
+    tmp_path: Path,
+) -> None:
+    """Validate the complete source even when invalid bytes are outside the range."""
+
+    root, workspace = create_workspace(tmp_path)
+
+    content_bytes = (
+        b"selected\n"
+        + (b"valid filler\n" * 10_000)
+        + b"\xff invalid outside selected range\n"
+    )
+
+    assert len(content_bytes) > MAX_FILE_SIZE_BYTES
+    (root / "invalid-large.txt").write_bytes(content_bytes)
+
+    with pytest.raises(ValueError, match="read_file requires valid UTF-8"):
+        read_workspace_file(
+            workspace,
+            {
+                "path": "invalid-large.txt",
+                "line_start": 1,
+                "line_end": 1,
+            },
+        )
+
+
+def test_large_partial_read_rejects_oversized_selected_content(
+    tmp_path: Path,
+) -> None:
+    """Reject a selected line whose exact returned bytes exceed the output limit."""
+
+    root, workspace = create_workspace(tmp_path)
+
+    content_bytes = (b"x" * (MAX_FILE_SIZE_BYTES + 1)) + b"\n"
+    (root / "large-line.txt").write_bytes(content_bytes)
+
+    with pytest.raises(ValueError, match="selected content exceeds"):
+        read_workspace_file(
+            workspace,
+            {"path": "large-line.txt", "line_start": 1, "line_end": 1},
+        )
+
+
+def test_large_partial_read_rejects_start_beyond_eof(tmp_path: Path) -> None:
+    """Preserve the existing start-beyond-EOF failure for oversized sources."""
+
+    root, workspace = create_workspace(tmp_path)
+
+    content_bytes = b"x" * (MAX_FILE_SIZE_BYTES + 1)
+    (root / "one-line-large.txt").write_bytes(content_bytes)
+
+    with pytest.raises(ValueError, match="exceeds the total file line count"):
+        read_workspace_file(
+            workspace,
+            {
+                "path": "one-line-large.txt",
+                "line_start": 2,
+                "line_end": 2,
+            },
+        )
+
+
+def test_registry_reads_bounded_range_from_large_file(tmp_path: Path) -> None:
+    """Expose oversized-source bounded reads through the registered tool handler."""
+
+    root, workspace = create_workspace(tmp_path)
+
+    lines = ["head\n"] + ["filler\n"] * 15_000 + ["tail\n"]
+    content = "".join(lines)
+    content_bytes = content.encode("utf-8")
+
+    assert len(content_bytes) > MAX_FILE_SIZE_BYTES
+    (root / "registry-large.txt").write_bytes(content_bytes)
+
+    registry = ToolRegistry()
+    register_workspace_tools(registry, workspace)
+
+    result = registry.execute(
+        ToolInvocation(
+            id="read-large-partial-1",
+            tool_name="read_file",
+            arguments={
+                "path": "registry-large.txt",
+                "line_start": 2,
+                "line_end": 3,
+            },
+        )
+    )
+
+    assert result.status == "success"
+    assert result.output == {
+        "path": "registry-large.txt",
+        "content": "filler\nfiller\n",
+        "size_bytes": len(content_bytes),
+        "sha256": hashlib.sha256(content_bytes).hexdigest(),
+        "line_start": 2,
+        "line_end": 3,
+        "total_lines": len(lines),
+        "truncated": True,
+    }
+
+
+def test_large_partial_read_preserves_crlf_and_missing_final_newline(
+    tmp_path: Path,
+) -> None:
+    """Preserve CRLF bytes while correctly counting a final unterminated line."""
+
+    root, workspace = create_workspace(tmp_path)
+
+    content_bytes = b"alpha\r\nbeta\r\n" + (b"filler\r\n" * 15_000) + b"omega"
+
+    assert len(content_bytes) > MAX_FILE_SIZE_BYTES
+    (root / "crlf-large.txt").write_bytes(content_bytes)
+
+    result = read_workspace_file(
+        workspace,
+        {"path": "crlf-large.txt", "line_start": 1, "line_end": 2},
+    )
+
+    assert result["content"] == "alpha\r\nbeta\r\n"
+    assert result["size_bytes"] == len(content_bytes)
+    assert result["sha256"] == hashlib.sha256(content_bytes).hexdigest()
+    assert result["line_start"] == 1
+    assert result["line_end"] == 2
+    assert result["total_lines"] == 15_003
+    assert result["truncated"] is True
+
+
+def test_large_partial_read_has_no_phantom_line_after_trailing_newline(
+    tmp_path: Path,
+) -> None:
+    """Do not count a phantom final line when an oversized file ends in LF."""
+
+    root, workspace = create_workspace(tmp_path)
+
+    line_count = 30_000
+    content_bytes = b"line\n" * line_count
+
+    assert len(content_bytes) > MAX_FILE_SIZE_BYTES
+    (root / "trailing-newline-large.txt").write_bytes(content_bytes)
+
+    result = read_workspace_file(
+        workspace,
+        {
+            "path": "trailing-newline-large.txt",
+            "line_start": line_count,
+            "line_end": line_count,
+        },
+    )
+
+    assert result["content"] == "line\n"
+    assert result["line_start"] == line_count
+    assert result["line_end"] == line_count
+    assert result["total_lines"] == line_count
+    assert result["truncated"] is True
+
+
+def test_large_partial_read_preserves_carriage_return_line_boundaries(
+    tmp_path: Path,
+) -> None:
+    """Match splitlines semantics for standalone carriage-return boundaries."""
+
+    root, workspace = create_workspace(tmp_path)
+
+    filler_count = 20_000
+    content = "alpha\rbeta\r" + ("filler\r" * filler_count)
+    content_bytes = content.encode("utf-8")
+
+    assert len(content_bytes) > MAX_FILE_SIZE_BYTES
+    (root / "carriage-return-large.txt").write_bytes(content_bytes)
+
+    result = read_workspace_file(
+        workspace,
+        {
+            "path": "carriage-return-large.txt",
+            "line_start": 2,
+            "line_end": 2,
+        },
+    )
+
+    assert result["content"] == "beta\r"
+    assert result["size_bytes"] == len(content_bytes)
+    assert result["sha256"] == hashlib.sha256(content_bytes).hexdigest()
+    assert result["line_start"] == 2
+    assert result["line_end"] == 2
+    assert result["total_lines"] == filler_count + 2
+    assert result["truncated"] is True
+
+
+def test_large_partial_read_preserves_unicode_splitlines_boundaries(
+    tmp_path: Path,
+) -> None:
+    """Match splitlines semantics for Unicode line-separator characters."""
+
+    root, workspace = create_workspace(tmp_path)
+
+    filler_count = 15_000
+    content = "alpha\u2028beta\u0085" + ("filler\u2029" * filler_count)
+    content_bytes = content.encode("utf-8")
+
+    assert len(content_bytes) > MAX_FILE_SIZE_BYTES
+    (root / "unicode-lines-large.txt").write_bytes(content_bytes)
+
+    result = read_workspace_file(
+        workspace,
+        {
+            "path": "unicode-lines-large.txt",
+            "line_start": 2,
+            "line_end": 2,
+        },
+    )
+
+    assert result["content"] == "beta\u0085"
+    assert result["size_bytes"] == len(content_bytes)
+    assert result["sha256"] == hashlib.sha256(content_bytes).hexdigest()
+    assert result["line_start"] == 2
+    assert result["line_end"] == 2
+    assert result["total_lines"] == filler_count + 2
+    assert result["truncated"] is True
+
+
+@pytest.mark.parametrize(
+    "separator",
+    ("\v", "\f", "\x1c", "\x1d", "\x1e"),
+    ids=(
+        "vertical-tab",
+        "form-feed",
+        "file-separator",
+        "group-separator",
+        "record-separator",
+    ),
+)
+def test_large_partial_read_preserves_additional_splitlines_boundaries(
+    tmp_path: Path,
+    separator: str,
+) -> None:
+    """Match splitlines semantics for the remaining ASCII control separators."""
+
+    root, workspace = create_workspace(tmp_path)
+
+    content = "alpha" + separator + "selected" + separator + ("filler\n" * 20_000)
+    content_bytes = content.encode("utf-8")
+    expected_lines = content.splitlines(keepends=True)
+
+    assert len(content_bytes) > MAX_FILE_SIZE_BYTES
+    (root / "control-separators-large.txt").write_bytes(content_bytes)
+
+    result = read_workspace_file(
+        workspace,
+        {
+            "path": "control-separators-large.txt",
+            "line_start": 2,
+            "line_end": 2,
+        },
+    )
+
+    assert result["content"] == expected_lines[1]
+    assert result["content"] == "selected" + separator
+    assert result["size_bytes"] == len(content_bytes)
+    assert result["line_start"] == 2
+    assert result["line_end"] == 2
+    assert result["total_lines"] == len(expected_lines)
+    assert result["truncated"] is True
+
+
 def test_registry_handler_returns_strict_workspace_tool_output(tmp_path: Path) -> None:
     """Execute the registered read_file handler through ToolRegistry."""
 

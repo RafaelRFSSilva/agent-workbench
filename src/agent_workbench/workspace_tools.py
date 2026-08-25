@@ -1,5 +1,6 @@
 """Provider-independent read-only workspace tools."""
 
+import codecs
 import hashlib
 from pathlib import Path
 
@@ -15,10 +16,24 @@ MAX_LIST_DEPTH = 4
 """Maximum recursive depth accepted by list_files."""
 
 MAX_FILE_SIZE_BYTES = 100 * 1024
-"""Maximum UTF-8 file size returned by read_file."""
+"""Maximum returned UTF-8 bytes and whole-file read source size."""
 
 MAX_READ_LINES = 400
 """Maximum number of lines returned by one partial read_file request."""
+
+_SPLITLINE_ENDINGS = (
+    "\n",
+    "\r",
+    "\v",
+    "\f",
+    "\x1c",
+    "\x1d",
+    "\x1e",
+    "\x85",
+    "\u2028",
+    "\u2029",
+)
+"""Line endings recognized by str.splitlines()."""
 
 MAX_SEARCH_QUERY_LENGTH = 256
 """Maximum number of characters accepted in a search query."""
@@ -202,9 +217,18 @@ def read_workspace_file(
     except OSError:
         raise ValueError("Unable to inspect workspace file.") from None
 
+    partial_read = line_start is not None or line_end is not None
+
     if size_bytes > MAX_FILE_SIZE_BYTES:
-        raise ToolArgumentError(
-            f"workspace file exceeds the {MAX_FILE_SIZE_BYTES}-byte limit."
+        if not partial_read:
+            raise ToolArgumentError(
+                f"workspace file exceeds the {MAX_FILE_SIZE_BYTES}-byte limit."
+            )
+        return _read_large_partial_file(
+            workspace,
+            file_path,
+            line_start=line_start,
+            line_end=line_end,
         )
 
     try:
@@ -230,7 +254,7 @@ def read_workspace_file(
         "sha256": hashlib.sha256(content_bytes).hexdigest(),
     }
 
-    if line_start is None and line_end is None:
+    if not partial_read:
         return result
 
     partial_content, returned_start, returned_end, total_lines = _slice_file_content(
@@ -248,6 +272,153 @@ def read_workspace_file(
         }
     )
     return result
+
+
+def _read_large_partial_file(
+    workspace: Workspace,
+    file_path: Path,
+    *,
+    line_start: int | None,
+    line_end: int | None,
+) -> JSONObject:
+    """Stream one bounded line range from an oversized UTF-8 source."""
+
+    resolved_start = line_start or 1
+    requested_end = line_end or resolved_start + MAX_READ_LINES - 1
+
+    digest = hashlib.sha256()
+    decoder = codecs.getincrementaldecoder("utf-8")("strict")
+
+    selected_content = bytearray()
+    selected_content_exceeded_limit = False
+
+    current_line = 1
+    scanned_size_bytes = 0
+    saw_text = False
+    ended_with_line_break = False
+    pending_cr = False
+
+    def append_selected(text: str) -> None:
+        nonlocal selected_content_exceeded_limit
+
+        if not resolved_start <= current_line <= requested_end:
+            return
+
+        encoded = text.encode("utf-8")
+
+        if (
+            not selected_content_exceeded_limit
+            and len(selected_content) + len(encoded) <= MAX_FILE_SIZE_BYTES
+        ):
+            selected_content.extend(encoded)
+        else:
+            selected_content_exceeded_limit = True
+
+    def finish_line() -> None:
+        nonlocal current_line, ended_with_line_break
+
+        current_line += 1
+        ended_with_line_break = True
+
+    def process_decoded(text: str) -> None:
+        nonlocal pending_cr, saw_text, ended_with_line_break
+
+        if not text:
+            return
+
+        saw_text = True
+
+        if pending_cr:
+            if text.startswith("\n"):
+                append_selected("\n")
+                finish_line()
+                text = text[1:]
+            else:
+                finish_line()
+
+            pending_cr = False
+
+        if not text:
+            return
+
+        trailing_cr = text.endswith("\r")
+
+        if trailing_cr:
+            text = text[:-1]
+
+        for piece in text.splitlines(keepends=True):
+            append_selected(piece)
+
+            if piece.endswith(_SPLITLINE_ENDINGS):
+                finish_line()
+            else:
+                ended_with_line_break = False
+
+        if trailing_cr:
+            append_selected("\r")
+            pending_cr = True
+            ended_with_line_break = False
+
+    try:
+        with file_path.open("rb") as source:
+            while True:
+                chunk = source.read(8192)
+
+                if not chunk:
+                    break
+
+                scanned_size_bytes += len(chunk)
+                digest.update(chunk)
+
+                decoded = decoder.decode(chunk, final=False)
+                process_decoded(decoded)
+
+            final_decoded = decoder.decode(b"", final=True)
+            process_decoded(final_decoded)
+
+            if pending_cr:
+                finish_line()
+                pending_cr = False
+
+    except UnicodeDecodeError:
+        raise ToolArgumentError("read_file requires valid UTF-8.") from None
+    except OSError:
+        raise ValueError("Unable to read workspace file.") from None
+
+    if not saw_text:
+        total_lines = 0
+    elif ended_with_line_break:
+        total_lines = current_line - 1
+    else:
+        total_lines = current_line
+
+    if resolved_start > total_lines:
+        raise ToolArgumentError(
+            "read_file line_start exceeds the total file line count."
+        )
+
+    returned_end = min(requested_end, total_lines)
+
+    if selected_content_exceeded_limit:
+        raise ToolArgumentError(
+            f"read_file selected content exceeds the {MAX_FILE_SIZE_BYTES}-byte limit."
+        )
+
+    try:
+        content = bytes(selected_content).decode("utf-8")
+    except UnicodeDecodeError:
+        raise ToolArgumentError("read_file requires valid UTF-8.") from None
+
+    return {
+        "path": _workspace_relative_path(workspace, file_path),
+        "content": content,
+        "size_bytes": scanned_size_bytes,
+        "sha256": digest.hexdigest(),
+        "line_start": resolved_start,
+        "line_end": returned_end,
+        "total_lines": total_lines,
+        "truncated": resolved_start > 1 or returned_end < total_lines,
+    }
 
 
 def search_workspace_text(
