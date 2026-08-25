@@ -713,6 +713,7 @@ def _run_model_change_phase(
     # True only while the pending confirmation was preserved across a
     # tool-round exhaustion, used solely to word the next outstanding prompt.
     change_confirmation_via_exhaustion = False
+    decision_mode = False
     outstanding = (
         "Apply at least one successful controlled workspace change.",
         "Use repository evidence already gathered instead of restarting discovery.",
@@ -732,11 +733,14 @@ def _run_model_change_phase(
             else _build_phase_prompt(state, outstanding=outstanding)
         )
         try:
+            allowed_tool_names = (
+                _WORKSPACE_CHANGE_TOOL_NAMES
+                if phase is CodingPhase.EDIT and decision_mode
+                else _READ_ONLY_TOOL_NAMES | _WORKSPACE_CHANGE_TOOL_NAMES
+            )
             response = session.send(
                 prompt,
-                allowed_tool_names=available_tools.intersection(
-                    _READ_ONLY_TOOL_NAMES | _WORKSPACE_CHANGE_TOOL_NAMES
-                ),
+                allowed_tool_names=available_tools.intersection(allowed_tool_names),
                 tool_round_observer=observer,
                 tool_approval_handler=approval_handler,
                 recover_approval_preview_errors=True,
@@ -764,6 +768,7 @@ def _run_model_change_phase(
                 # never proof of completion; require a bounded continuation.
                 state.assistant_summary = _MAXIMUM_ROUNDS_CHANGE_SUMMARY
                 awaiting_change_confirmation = True
+                decision_mode = False
                 change_confirmation_via_exhaustion = True
                 incomplete_reason = (
                     "the model-facing call exhausted its tool-round budget; a "
@@ -774,6 +779,7 @@ def _run_model_change_phase(
                 # An attempted mutation failed or was denied before exhaustion;
                 # never let that stand in for the pending confirmation.
                 awaiting_change_confirmation = False
+                decision_mode = False
                 incomplete_reason = (
                     "the model-facing call exhausted its tool-round budget without "
                     "completing the required workspace change"
@@ -781,6 +787,8 @@ def _run_model_change_phase(
             else:
                 # Pure read-only exhaustion never clears a confirmation already
                 # pending from an earlier preserved change.
+                if phase is CodingPhase.EDIT and not awaiting_change_confirmation:
+                    decision_mode = bool(current_call_rounds)
                 incomplete_reason = (
                     "the model-facing call exhausted its tool-round budget while "
                     "only performing read-only inspection"
@@ -795,6 +803,7 @@ def _run_model_change_phase(
                 # A successful mutation proves work happened, not that all
                 # requested editing work is complete; require confirmation.
                 awaiting_change_confirmation = True
+                decision_mode = False
                 change_confirmation_via_exhaustion = False
                 incomplete_reason = (
                     "a successful workspace change was applied but has not yet "
@@ -805,12 +814,15 @@ def _run_model_change_phase(
                 # A mutation was attempted and failed/denied; do not let prose
                 # from this response stand in for confirmation.
                 awaiting_change_confirmation = False
+                decision_mode = False
                 incomplete_reason = "no successful new workspace change was observed"
             elif awaiting_change_confirmation:
                 # The continuation confirmed completion without inventing a new
                 # mutation; the previously preserved change may proceed.
                 return True
             else:
+                if phase is CodingPhase.EDIT:
+                    decision_mode = decision_mode or bool(current_call_rounds)
                 incomplete_reason = "no successful new workspace change was observed"
 
         if (
@@ -857,11 +869,20 @@ def _run_model_change_phase(
                 "response without inventing another workspace change.",
             )
         else:
-            outstanding = (
-                f"{phase.value} is incomplete because {incomplete_reason}.",
-                "Apply a controlled workspace change now.",
-                "Assistant prose is not evidence of a workspace change.",
-            )
+            if phase is CodingPhase.EDIT and decision_mode:
+                outstanding = (
+                    f"{phase.value} is incomplete because {incomplete_reason}.",
+                    "Repository evidence has already been gathered; further read-only inspection is intentionally unavailable.",
+                    "Use the evidence already gathered to make a controlled workspace change now if you can do so safely.",
+                    "If you cannot safely make a change from that evidence, finish without a tool call.",
+                    "Assistant prose is not evidence of a workspace change.",
+                )
+            else:
+                outstanding = (
+                    f"{phase.value} is incomplete because {incomplete_reason}.",
+                    "Apply a controlled workspace change now.",
+                    "Assistant prose is not evidence of a workspace change.",
+                )
 
 
 def _run_validation_phase(
