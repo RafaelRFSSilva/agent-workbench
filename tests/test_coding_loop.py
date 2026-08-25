@@ -21,6 +21,7 @@ from agent_workbench.coding_loop import (
     MAX_REPAIR_VALIDATION_FIELD_CHARACTERS,
     CodingProgressEvent,
     CodingProgressKind,
+    CodingModelSendTrace,
     CodingPhase,
     CodingWorkflowLimits,
     _CONTROLLED_EDIT_SELECTION_GUIDANCE,
@@ -1493,12 +1494,14 @@ def test_validation_failure_emits_repair_attempt_and_safe_pytest_summary(
         ]
     )
     progress: list[CodingProgressEvent] = []
+    traces: list[CodingModelSendTrace] = []
 
     run_autonomous_coding_task(
         create_session(repository, provider),
         "Correct the add implementation.",
         tool_approval_handler=approve,
         progress_event_observer=progress.append,
+        model_send_trace_observer=traces.append,
     )
 
     pytest_events = [event for event in progress if event.tool_name == "run_pytest"]
@@ -1512,6 +1515,9 @@ def test_validation_failure_emits_repair_attempt_and_safe_pytest_summary(
     assert repair.phase is CodingPhase.REPAIR
     assert repair.repair_attempt == 1
     assert repair.max_repair_attempts == 2
+    repair_traces = [trace for trace in traces if trace.phase is CodingPhase.REPAIR]
+    assert repair_traces
+    assert all(not trace.decision_mode for trace in repair_traces)
 
 
 def test_formatter_created_unexpected_path_fails_before_done(
@@ -1861,6 +1867,65 @@ def test_edit_decision_mode_persists_through_prose_and_still_bounds_completions(
         assert "apply_text_replacement" in request_tools
 
 
+def test_model_send_trace_reports_edit_scope_transitions(
+    tmp_path: Path,
+) -> None:
+    """Trace discovery, decision-mode persistence, and normal confirmation scope."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    original = "def add(left: int, right: int) -> int:\n    return left - right\n"
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            tool_response("edit-read", "read_file", {"path": "module.py"}),
+            ChatResponse(text="Inspection complete."),
+            ChatResponse(text="I need more time."),
+            replacement_response(
+                "decision-edit",
+                expected_content=original,
+                expected_text="return left - right",
+                replacement_text="return left + right",
+            ),
+            ChatResponse(text="Edit applied."),
+            ChatResponse(text="No further changes are needed."),
+        ]
+    )
+    traces: list[CodingModelSendTrace] = []
+
+    result = run_autonomous_coding_task(
+        create_session(repository, provider),
+        "Correct the add implementation.",
+        tool_approval_handler=approve,
+        model_send_trace_observer=traces.append,
+        limits=CodingWorkflowLimits(edit_completion_continuations=4),
+    )
+
+    assert result.final_phase is CodingPhase.DONE
+    assert [trace.phase for trace in traces] == [
+        CodingPhase.DISCOVER,
+        CodingPhase.EDIT,
+        CodingPhase.EDIT,
+        CodingPhase.EDIT,
+        CodingPhase.EDIT,
+    ]
+    assert traces[0].allowed_tool_names == (
+        "inspect_git_diff",
+        "inspect_git_status",
+        "list_files",
+        "read_file",
+        "search_symbols",
+        "search_text",
+    )
+    assert traces[1].decision_mode is False
+    assert "read_file" in traces[1].allowed_tool_names
+    assert traces[2].decision_mode is True
+    assert "read_file" not in traces[2].allowed_tool_names
+    assert traces[3].decision_mode is True
+    assert "read_file" not in traces[3].allowed_tool_names
+    assert traces[4].decision_mode is False
+    assert "read_file" in traces[4].allowed_tool_names
+
+
 def test_successful_edit_from_decision_mode_preserves_confirmation_flow(
     tmp_path: Path,
 ) -> None:
@@ -1981,12 +2046,14 @@ def test_failed_edit_from_decision_mode_restores_read_only_tools(
             ChatResponse(text="No further changes are needed."),
         ]
     )
+    traces: list[CodingModelSendTrace] = []
 
     result = run_autonomous_coding_task(
         create_session(repository, provider),
         "Correct the add implementation.",
         tool_approval_handler=approve,
         limits=CodingWorkflowLimits(edit_completion_continuations=3),
+        model_send_trace_observer=traces.append,
     )
 
     assert result.final_phase is CodingPhase.DONE
@@ -1997,6 +2064,33 @@ def test_failed_edit_from_decision_mode_restores_read_only_tools(
     assert "read_file" in recovery_tools
     assert "apply_text_replacement" in recovery_tools
     assert any(tool_result.status == "error" for tool_result in result.tool_results)
+    edit_traces = [trace for trace in traces if trace.phase is CodingPhase.EDIT]
+    failed_action_trace_index = next(
+        index for index, trace in enumerate(edit_traces) if trace.decision_mode
+    )
+    failed_action_trace = edit_traces[failed_action_trace_index]
+    recovery_trace = edit_traces[failed_action_trace_index + 1]
+    assert failed_action_trace.allowed_tool_names == (
+        "apply_file_patch",
+        "apply_file_rewrite",
+        "apply_line_range_replacement",
+        "apply_text_replacement",
+        "apply_workspace_changes",
+    )
+    assert recovery_trace.decision_mode is False
+    assert recovery_trace.allowed_tool_names == (
+        "apply_file_patch",
+        "apply_file_rewrite",
+        "apply_line_range_replacement",
+        "apply_text_replacement",
+        "apply_workspace_changes",
+        "inspect_git_diff",
+        "inspect_git_status",
+        "list_files",
+        "read_file",
+        "search_symbols",
+        "search_text",
+    )
 
 
 def test_normal_edit_successful_change_requires_completion_confirmation(

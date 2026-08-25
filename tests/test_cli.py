@@ -9,6 +9,7 @@ import pytest
 
 from agent_workbench.built_in_tools import create_built_in_tool_registry
 from agent_workbench.coding_loop import (
+    CodingModelSendTrace,
     CodingPhase,
     CodingProgressEvent,
     CodingProgressKind,
@@ -17,6 +18,8 @@ from agent_workbench.cli import (
     AUTONOMOUS_MAX_TOOL_ROUNDS,
     CANCELLATION_MESSAGE,
     _display_coding_progress,
+    _display_model_send_trace,
+    _run_autonomous_task,
     main,
     run_cli as run_session_cli,
 )
@@ -2564,6 +2567,57 @@ def test_default_autonomous_output_is_concise_stable_and_hides_model_prose(
         "[VERIFY] 1 changed file\n"
         "[DONE] Task completed successfully\n"
     )
+
+
+def test_model_send_trace_display_is_metadata_only_and_explicitly_rendered(
+    capsys,
+) -> None:
+    """Render stable controller scope metadata without prompt or payload data."""
+
+    _display_model_send_trace(
+        CodingModelSendTrace(
+            phase=CodingPhase.EDIT,
+            allowed_tool_names=("apply_text_replacement",),
+            continuation=2,
+            decision_mode=True,
+        )
+    )
+
+    assert capsys.readouterr().out == (
+        "Model send:\n"
+        "  Phase: EDIT\n"
+        "  Continuation: 2\n"
+        "  Decision mode: yes\n"
+        "  Tools: apply_text_replacement\n"
+    )
+
+
+@pytest.mark.parametrize("show_tool_traces", (False, True))
+def test_autonomous_cli_model_send_trace_is_opt_in(
+    monkeypatch,
+    tmp_path,
+    show_tool_traces,
+) -> None:
+    """Pass model-send rendering only when the existing trace flag is enabled."""
+
+    session = Mock()
+    captured: dict[str, object] = {}
+
+    def run_task(_session, _prompt, **kwargs):
+        captured.update(kwargs)
+        return Mock(assistant_summary="summary")
+
+    monkeypatch.setattr("agent_workbench.cli.run_autonomous_coding_task", run_task)
+
+    _run_autonomous_task(
+        session,
+        "Fix the defect.",
+        show_tool_traces=show_tool_traces,
+        show_assistant_summary=False,
+    )
+
+    trace_observer = captured.get("model_send_trace_observer")
+    assert (trace_observer is not None) is show_tool_traces
 
 
 def test_progress_renderer_covers_repair_skip_plural_and_terminal_failure(
