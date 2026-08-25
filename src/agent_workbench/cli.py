@@ -16,6 +16,7 @@ from agent_workbench.arguments import (
 )
 from agent_workbench.coding_loop import (
     AutonomousCodingResult,
+    CodingModelSendTrace,
     CodingProgressEvent,
     CodingProgressKind,
     CodingPhase,
@@ -292,6 +293,11 @@ def _run_autonomous_task(
     """Run one supervised autonomous task and display its final result."""
 
     observer = _display_tool_round if show_tool_traces else None
+    model_send_trace_arguments = (
+        {"model_send_trace_observer": _display_model_send_trace}
+        if show_tool_traces
+        else {}
+    )
     terminal_failure_displayed = False
 
     def display_progress(event: CodingProgressEvent) -> None:
@@ -307,6 +313,7 @@ def _run_autonomous_task(
             tool_approval_handler=_prompt_for_tool_approval,
             tool_round_observer=observer,
             progress_event_observer=display_progress,
+            **model_send_trace_arguments,
         )
     except (
         CompletionError,
@@ -350,6 +357,11 @@ def _run_isolated_autonomous_task(
         raise SystemExit(1)
 
     observer = _display_tool_round if runtime_configuration.show_tool_traces else None
+    model_send_trace_arguments = (
+        {"model_send_trace_observer": _display_model_send_trace}
+        if runtime_configuration.show_tool_traces
+        else {}
+    )
     terminal_failure_displayed = False
 
     def display_progress(event: CodingProgressEvent) -> None:
@@ -383,6 +395,7 @@ def _run_isolated_autonomous_task(
             lifecycle_store=lifecycle_store,
             tool_round_observer=observer,
             progress_event_observer=display_progress,
+            **model_send_trace_arguments,
             max_tool_rounds=runtime_configuration.max_tool_rounds,
         )
     except (
@@ -713,6 +726,16 @@ def _display_coding_progress(event: CodingProgressEvent) -> None:
 
     if message is not None:
         print(f"[{label}] {message}")
+
+
+def _display_model_send_trace(trace: CodingModelSendTrace) -> None:
+    """Display safe metadata for one controller model send."""
+
+    print("Model send:")
+    print(f"  Phase: {trace.phase.value}")
+    print(f"  Continuation: {trace.continuation}")
+    print(f"  Decision mode: {'yes' if trace.decision_mode else 'no'}")
+    print(f"  Tools: {', '.join(trace.allowed_tool_names)}")
 
 
 def _format_validation_progress(event: CodingProgressEvent) -> str:

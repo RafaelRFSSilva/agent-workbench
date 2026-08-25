@@ -199,6 +199,16 @@ class CodingProgressKind(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class CodingModelSendTrace:
+    """Store safe metadata for one model-facing coding-loop send."""
+
+    phase: CodingPhase
+    allowed_tool_names: tuple[str, ...]
+    continuation: int
+    decision_mode: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class CodingProgressEvent:
     """Store one typed safe autonomous coding progress update."""
 
@@ -219,6 +229,7 @@ class CodingProgressEvent:
 
 
 type CodingProgressObserver = Callable[[CodingProgressEvent], None]
+type CodingModelSendTraceObserver = Callable[[CodingModelSendTrace], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -367,6 +378,7 @@ class _WorkflowState:
     baseline_unsafe_changed_path_count: int = 0
     skipped_validation_runs: list[ValidationRun] = field(default_factory=list)
     progress_event_observer: CodingProgressObserver | None = None
+    model_send_trace_observer: CodingModelSendTraceObserver | None = None
 
 
 def run_autonomous_coding_task(
@@ -376,6 +388,7 @@ def run_autonomous_coding_task(
     tool_approval_handler: ToolApprovalHandler,
     tool_round_observer: ToolRoundObserver | None = None,
     progress_event_observer: CodingProgressObserver | None = None,
+    model_send_trace_observer: CodingModelSendTraceObserver | None = None,
     acceptance_criteria: Iterable[str] = DEFAULT_CODING_ACCEPTANCE_CRITERIA,
     limits: CodingWorkflowLimits = DEFAULT_CODING_WORKFLOW_LIMITS,
 ) -> AutonomousCodingResult:
@@ -387,6 +400,7 @@ def run_autonomous_coding_task(
         tool_approval_handler=tool_approval_handler,
         tool_round_observer=tool_round_observer,
         progress_event_observer=progress_event_observer,
+        model_send_trace_observer=model_send_trace_observer,
         acceptance_criteria=acceptance_criteria,
         limits=limits,
     )
@@ -394,6 +408,7 @@ def run_autonomous_coding_task(
         task_spec=task_spec,
         limits=limits,
         progress_event_observer=progress_event_observer,
+        model_send_trace_observer=model_send_trace_observer,
     )
     try:
         (
@@ -590,6 +605,7 @@ def _validate_inputs(
     tool_approval_handler: object,
     tool_round_observer: object,
     progress_event_observer: object,
+    model_send_trace_observer: object,
     acceptance_criteria: object,
     limits: object,
 ) -> tuple[TaskSpec, ToolRegistry, frozenset[str]]:
@@ -608,6 +624,12 @@ def _validate_inputs(
     if progress_event_observer is not None and not callable(progress_event_observer):
         raise ConfigurationError(
             "autonomous coding progress event observer must be callable."
+        )
+    if model_send_trace_observer is not None and not callable(
+        model_send_trace_observer
+    ):
+        raise ConfigurationError(
+            "autonomous coding model-send trace observer must be callable."
         )
     if not isinstance(limits, CodingWorkflowLimits):
         raise ConfigurationError(
@@ -659,6 +681,14 @@ def _run_discover_phase(
     phase_start = len(state.rounds)
     response: ChatResponse | None = None
     try:
+        allowed_tool_names = available_tools.intersection(_READ_ONLY_TOOL_NAMES)
+        _emit_model_send_trace(
+            state,
+            phase=CodingPhase.DISCOVER,
+            allowed_tool_names=allowed_tool_names,
+            continuation=1,
+            decision_mode=False,
+        )
         response = session.send(
             _build_phase_prompt(
                 state,
@@ -668,7 +698,7 @@ def _run_discover_phase(
                     "Return a concise discovery completion when inspection is sufficient.",
                 ),
             ),
-            allowed_tool_names=available_tools.intersection(_READ_ONLY_TOOL_NAMES),
+            allowed_tool_names=allowed_tool_names,
             max_tool_rounds=state.limits.discover_tool_rounds,
             tool_round_observer=observer,
             tool_approval_handler=approval_handler,
@@ -737,6 +767,13 @@ def _run_model_change_phase(
                 _WORKSPACE_CHANGE_TOOL_NAMES
                 if phase is CodingPhase.EDIT and decision_mode
                 else _READ_ONLY_TOOL_NAMES | _WORKSPACE_CHANGE_TOOL_NAMES
+            )
+            _emit_model_send_trace(
+                state,
+                phase=phase,
+                allowed_tool_names=available_tools.intersection(allowed_tool_names),
+                continuation=local_continuations + 1,
+                decision_mode=phase is CodingPhase.EDIT and decision_mode,
             )
             response = session.send(
                 prompt,
@@ -1172,6 +1209,27 @@ def _emit_progress(
 
     if state.progress_event_observer is not None:
         state.progress_event_observer(event)
+
+
+def _emit_model_send_trace(
+    state: _WorkflowState,
+    *,
+    phase: CodingPhase,
+    allowed_tool_names: Iterable[str],
+    continuation: int,
+    decision_mode: bool,
+) -> None:
+    """Publish bounded metadata immediately before one model-facing send."""
+
+    if state.model_send_trace_observer is not None:
+        state.model_send_trace_observer(
+            CodingModelSendTrace(
+                phase=phase,
+                allowed_tool_names=tuple(sorted(allowed_tool_names)),
+                continuation=continuation,
+                decision_mode=decision_mode,
+            )
+        )
 
 
 def _run_validation_tool(

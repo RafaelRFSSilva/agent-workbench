@@ -265,6 +265,7 @@ def install_successful_coding_stub(
         return SimpleNamespace(worktree=worktree, session=object())
 
     def run_coding(_session, _prompt, **_kwargs):
+        captured["model_send_trace_observer"] = _kwargs.get("model_send_trace_observer")
         worktree = captured["worktree"]
         worktree_path = worktree.worktree_path
         (worktree_path / "module.py").write_text(
@@ -865,6 +866,32 @@ def test_post_approval_stale_plan_leaves_planned_and_never_writes_execution_star
     assert [record.phase for record in store.writes] == [
         IsolatedCommitLifecyclePhase.PLANNED
     ]
+
+
+def test_isolated_tracing_forwards_exact_model_send_observer(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Forward an enabled model-send observer unchanged to the coding loop."""
+
+    source = create_repository(tmp_path / "source")
+    captured = install_successful_coding_stub(monkeypatch)
+    observer = object()
+
+    run_isolated_autonomous_workflow(
+        SessionId("isolated-model-trace"),
+        configuration(source),
+        "agent/model-trace",
+        tmp_path / "isolated",
+        "Correct the add implementation.",
+        "fix: model trace",
+        worktree_approval_handler=approve,
+        tool_approval_handler=approve,
+        commit_approval_handler=approve,
+        model_send_trace_observer=observer,
+    )
+
+    assert captured["model_send_trace_observer"] is observer
 
 
 def test_execution_started_persistence_failure_occurs_before_git_add(

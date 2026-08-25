@@ -10,6 +10,7 @@ from agent_workbench.coding_loop import (
     DEFAULT_AUTONOMOUS_MAX_TOOL_ROUNDS,
     DEFAULT_CODING_ACCEPTANCE_CRITERIA,
     AutonomousCodingResult,
+    CodingModelSendTraceObserver,
     CodingProgressObserver,
     CodingPhase,
     run_autonomous_coding_task,
@@ -67,6 +68,7 @@ def run_isolated_autonomous_workflow(
     lifecycle_store: IsolatedCommitLifecycleStore | None = None,
     tool_round_observer: ToolRoundObserver | None = None,
     progress_event_observer: CodingProgressObserver | None = None,
+    model_send_trace_observer: CodingModelSendTraceObserver | None = None,
     acceptance_criteria: Iterable[str] = DEFAULT_CODING_ACCEPTANCE_CRITERIA,
     max_tool_rounds: int = DEFAULT_AUTONOMOUS_MAX_TOOL_ROUNDS,
 ) -> IsolatedAutonomousWorkflowResult:
@@ -112,13 +114,18 @@ def run_isolated_autonomous_workflow(
         raise _preserved_failure("Isolated session construction", exc) from None
 
     try:
+        coding_kwargs = {
+            "tool_approval_handler": tool_approval_handler,
+            "tool_round_observer": tool_round_observer,
+            "progress_event_observer": progress_event_observer,
+            "acceptance_criteria": task_spec.acceptance_criteria,
+        }
+        if model_send_trace_observer is not None:
+            coding_kwargs["model_send_trace_observer"] = model_send_trace_observer
         coding_result = run_autonomous_coding_task(
             isolated.session,
             task_spec.objective,
-            tool_approval_handler=tool_approval_handler,
-            tool_round_observer=tool_round_observer,
-            progress_event_observer=progress_event_observer,
-            acceptance_criteria=task_spec.acceptance_criteria,
+            **coding_kwargs,
         )
     except (CompletionError, ConfigurationError) as exc:
         raise _preserved_failure("Autonomous coding", exc) from None

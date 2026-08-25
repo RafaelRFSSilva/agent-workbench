@@ -9,6 +9,7 @@ import pytest
 from agent_workbench.arguments import RuntimeConfiguration
 from agent_workbench.cli import (
     AUTONOMOUS_MAX_TOOL_ROUNDS,
+    _display_model_send_trace,
     _display_tool_round,
     _prompt_for_isolated_commit_approval,
     _prompt_for_tool_approval,
@@ -290,6 +291,18 @@ def test_main_delegates_complete_isolated_workflow_once(
 
     main(arguments)
 
+    expected_kwargs = {
+        "worktree_approval_handler": _prompt_for_worktree_approval,
+        "tool_approval_handler": _prompt_for_tool_approval,
+        "commit_approval_handler": _prompt_for_isolated_commit_approval,
+        "lifecycle_store": None,
+        "tool_round_observer": expected_observer,
+        "progress_event_observer": ANY,
+        "max_tool_rounds": AUTONOMOUS_MAX_TOOL_ROUNDS,
+    }
+    if show_tool_traces:
+        expected_kwargs["model_send_trace_observer"] = _display_model_send_trace
+
     workflow.assert_called_once_with(
         SessionId("cli-session"),
         runtime,
@@ -297,13 +310,7 @@ def test_main_delegates_complete_isolated_workflow_once(
         Path("/isolated"),
         "Correct the implementation.",
         "fix: exact message  ",
-        worktree_approval_handler=_prompt_for_worktree_approval,
-        tool_approval_handler=_prompt_for_tool_approval,
-        commit_approval_handler=_prompt_for_isolated_commit_approval,
-        lifecycle_store=None,
-        tool_round_observer=expected_observer,
-        progress_event_observer=ANY,
-        max_tool_rounds=AUTONOMOUS_MAX_TOOL_ROUNDS,
+        **expected_kwargs,
     )
     assert callable(workflow.call_args.kwargs["progress_event_observer"])
     create_session.assert_not_called()
