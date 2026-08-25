@@ -1787,6 +1787,218 @@ def test_edit_completion_continuation_then_successful_change(
     assert "Assistant prose is not evidence" in continuation
 
 
+def test_read_only_edit_inspection_enters_decision_mode(
+    tmp_path: Path,
+) -> None:
+    """Expose only workspace actions after an inspection-only EDIT call."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    original = "def add(left: int, right: int) -> int:\n    return left - right\n"
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            tool_response("edit-read", "read_file", {"path": "module.py"}),
+            ChatResponse(text="Inspection complete."),
+            replacement_response(
+                "decision-edit",
+                expected_content=original,
+                expected_text="return left - right",
+                replacement_text="return left + right",
+            ),
+            ChatResponse(text="Edit applied."),
+            ChatResponse(text="No further changes are needed."),
+        ]
+    )
+
+    result = run_autonomous_coding_task(
+        create_session(repository, provider),
+        "Correct the add implementation.",
+        tool_approval_handler=approve,
+    )
+
+    assert result.final_phase is CodingPhase.DONE
+    decision_tools = {tool.name for tool in provider.requests[3].tools}
+    assert decision_tools == {
+        "apply_file_patch",
+        "apply_file_rewrite",
+        "apply_line_range_replacement",
+        "apply_text_replacement",
+        "apply_workspace_changes",
+    }
+    assert "read_file" not in decision_tools
+    assert (
+        "Repository evidence has already been gathered"
+        in provider.requests[3].messages[-1]["content"]
+    )
+
+
+def test_edit_decision_mode_persists_through_prose_and_still_bounds_completions(
+    tmp_path: Path,
+) -> None:
+    """Keep read-only tools withheld until the existing continuation limit fails."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            tool_response("edit-read", "read_file", {"path": "module.py"}),
+            ChatResponse(text="Inspection complete."),
+            ChatResponse(text="I need more time."),
+            ChatResponse(text="Still considering the change."),
+        ]
+    )
+
+    with pytest.raises(CompletionError, match="completion continuation limit reached"):
+        run_autonomous_coding_task(
+            create_session(repository, provider),
+            "Correct the add implementation.",
+            tool_approval_handler=approve,
+        )
+
+    for request in provider.requests[4:]:
+        request_tools = {tool.name for tool in request.tools}
+        assert "read_file" not in request_tools
+        assert "apply_text_replacement" in request_tools
+
+
+def test_successful_edit_from_decision_mode_preserves_confirmation_flow(
+    tmp_path: Path,
+) -> None:
+    """Allow a decision-mode action to proceed through normal confirmation."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    original = "def add(left: int, right: int) -> int:\n    return left - right\n"
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            tool_response("edit-read", "read_file", {"path": "module.py"}),
+            ChatResponse(text="Inspection complete."),
+            replacement_response(
+                "decision-edit",
+                expected_content=original,
+                expected_text="return left - right",
+                replacement_text="return left + right",
+            ),
+            ChatResponse(text="Edit applied."),
+            ChatResponse(text="No further changes are needed."),
+        ]
+    )
+
+    result = run_autonomous_coding_task(
+        create_session(repository, provider),
+        "Correct the add implementation.",
+        tool_approval_handler=approve,
+    )
+
+    assert result.final_phase is CodingPhase.DONE
+    assert result.workspace_change_applied is True
+    assert result.completion_continuation_count == 2
+    confirmation_tools = {tool.name for tool in provider.requests[5].tools}
+    assert "read_file" in confirmation_tools
+
+
+def test_successful_decision_mode_change_survives_exhaustion_before_confirmation(
+    tmp_path: Path,
+) -> None:
+    """Restore read-only tools after an exhausted successful decision-mode call."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    original = "def add(left: int, right: int) -> int:\n    return left - right\n"
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            tool_response("edit-read", "read_file", {"path": "module.py"}),
+            ChatResponse(text="Inspection complete."),
+            replacement_response(
+                "decision-edit-exhausted",
+                expected_content=original,
+                expected_text="return left - right",
+                replacement_text="return left + right",
+            ),
+            replacement_response(
+                "decision-edit-after-success",
+                expected_content=original,
+                expected_text="return left - right",
+                replacement_text="return left + right",
+            ),
+            replacement_response(
+                "decision-edit-exhaustion-trigger",
+                expected_content=original,
+                expected_text="return left - right",
+                replacement_text="return left + right",
+            ),
+            ChatResponse(text="The change is complete."),
+        ]
+    )
+
+    result = run_autonomous_coding_task(
+        create_session(repository, provider, max_tool_rounds=2),
+        "Correct the add implementation.",
+        tool_approval_handler=approve,
+    )
+
+    assert DEFAULT_EDIT_COMPLETION_CONTINUATIONS == 2
+    assert result.final_phase is CodingPhase.DONE
+    assert result.workspace_change_applied is True
+    assert result.completion_continuation_count == 2
+    decision_tools = {tool.name for tool in provider.requests[3].tools}
+    confirmation_tools = {tool.name for tool in provider.requests[6].tools}
+    assert "read_file" not in decision_tools
+    assert "apply_text_replacement" in decision_tools
+    assert "read_file" in confirmation_tools
+    assert (repository / "module.py").read_text(encoding="utf-8") == original.replace(
+        "return left - right",
+        "return left + right",
+    )
+
+
+def test_failed_edit_from_decision_mode_restores_read_only_tools(
+    tmp_path: Path,
+) -> None:
+    """Restore safe inspection after a stale decision-mode mutation attempt."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    original = "def add(left: int, right: int) -> int:\n    return left - right\n"
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            tool_response("edit-read", "read_file", {"path": "module.py"}),
+            ChatResponse(text="Inspection complete."),
+            replacement_response(
+                "stale-edit",
+                expected_content="stale content",
+                expected_text="return left - right",
+                replacement_text="return left + right",
+            ),
+            ChatResponse(text="The previous action failed; I will refresh the file."),
+            replacement_response(
+                "fresh-edit",
+                expected_content=original,
+                expected_text="return left - right",
+                replacement_text="return left + right",
+            ),
+            ChatResponse(text="Edit applied."),
+            ChatResponse(text="No further changes are needed."),
+        ]
+    )
+
+    result = run_autonomous_coding_task(
+        create_session(repository, provider),
+        "Correct the add implementation.",
+        tool_approval_handler=approve,
+        limits=CodingWorkflowLimits(edit_completion_continuations=3),
+    )
+
+    assert result.final_phase is CodingPhase.DONE
+    assert result.workspace_change_applied is True
+    decision_tools = {tool.name for tool in provider.requests[3].tools}
+    recovery_tools = {tool.name for tool in provider.requests[5].tools}
+    assert "read_file" not in decision_tools
+    assert "read_file" in recovery_tools
+    assert "apply_text_replacement" in recovery_tools
+    assert any(tool_result.status == "error" for tool_result in result.tool_results)
+
+
 def test_normal_edit_successful_change_requires_completion_confirmation(
     tmp_path: Path,
 ) -> None:
