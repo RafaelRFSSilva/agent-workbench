@@ -189,6 +189,7 @@ class AgentSession:
         tool_round_observer: ToolRoundObserver | None = None,
         tool_approval_handler: ToolApprovalHandler | None = None,
         recover_approval_preview_errors: bool = False,
+        recover_multiple_approval_actions: bool = False,
     ) -> ChatResponse:
         """Complete and transactionally commit one conversation turn."""
 
@@ -204,6 +205,10 @@ class AgentSession:
             or max_tool_rounds <= 0
         ):
             raise ConfigurationError("maximum tool rounds must be a positive integer.")
+        if not isinstance(recover_multiple_approval_actions, bool):
+            raise ConfigurationError(
+                "multiple approval action recovery must be a boolean."
+            )
 
         allowed_names = _normalize_allowed_tool_names(allowed_tool_names)
         effective_max_tool_rounds = (
@@ -248,6 +253,7 @@ class AgentSession:
                     tool_round_observer=tool_round_observer,
                     tool_approval_handler=tool_approval_handler,
                     recover_approval_preview_errors=recover_approval_preview_errors,
+                    recover_multiple_approval_actions=recover_multiple_approval_actions,
                 )
         except Exception:
             self._status = SessionStatus.FAILED

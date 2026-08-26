@@ -1765,6 +1765,226 @@ def test_recovers_approval_preview_failure_as_tool_error_when_enabled() -> None:
     assert provider.requests[1].tool_interactions == (expected_round,)
 
 
+def test_multiple_approval_actions_remain_fatal_by_default() -> None:
+    """Preserve the terminal protocol error unless recovery is enabled."""
+
+    registry = ToolRegistry()
+    executions = []
+    approvals = []
+    definition = create_calculator_definition()
+    registry.register(
+        definition,
+        lambda arguments: executions.append(arguments),
+        requires_approval=True,
+        approval_preview=lambda arguments: arguments,
+    )
+    provider = FakeProvider(
+        [
+            create_tool_response(
+                ToolInvocation("first", "calculator", {"expression": "1 + 1"}),
+                ToolInvocation("second", "calculator", {"expression": "2 + 2"}),
+            )
+        ]
+    )
+
+    with pytest.raises(
+        CompletionError,
+        match="Approval-required tool actions must be requested one at a time",
+    ):
+        run_tool_calling_loop(
+            provider,
+            ChatRequest(messages=[], tools=(definition,)),
+            registry,
+            max_tool_rounds=1,
+            tool_approval_handler=approvals.append,
+        )
+
+    assert executions == []
+    assert approvals == []
+
+
+def test_recovers_multiple_approval_actions_with_one_error_per_invocation() -> None:
+    """Return bounded errors for every invalid invocation without executing any."""
+
+    registry = ToolRegistry()
+    definition = create_calculator_definition()
+    executions = []
+    approvals = []
+    registry.register(
+        definition,
+        lambda arguments: executions.append(arguments),
+        requires_approval=True,
+    )
+    invalid = create_tool_response(
+        ToolInvocation("first", "calculator", {"expression": "1 + 1"}),
+        ToolInvocation("second", "calculator", {"expression": "2 + 2"}),
+    )
+    provider = FakeProvider([invalid, ChatResponse(text="Recovered.")])
+    observed: list[ToolInteractionRound] = []
+
+    result = run_tool_calling_loop(
+        provider,
+        ChatRequest(messages=[], tools=(definition,)),
+        registry,
+        max_tool_rounds=1,
+        tool_round_observer=observed.append,
+        tool_approval_handler=approvals.append,
+        recover_multiple_approval_actions=True,
+    )
+
+    assert result.text == "Recovered."
+    assert executions == []
+    assert approvals == []
+    assert len(observed) == 1
+    round_ = observed[0]
+    assert [result.invocation_id for result in round_.results] == ["first", "second"]
+    assert all(result.status == "error" for result in round_.results)
+    assert all(
+        "requested one at a time" in (result.error or "")
+        and "None of the requested tools were executed" in (result.error or "")
+        and "exactly one approval-required action" in (result.error or "")
+        for result in round_.results
+    )
+    assert provider.requests[1].tool_interactions == tuple(observed)
+
+
+def test_multiple_approval_recovery_rejects_mixed_batch_without_read_execution() -> (
+    None
+):
+    """Reject a mixed read/action response as one atomic invalid batch."""
+
+    registry = ToolRegistry()
+    read_file = create_read_file_definition()
+    calculator = create_calculator_definition()
+    reads = []
+    registry.register(read_file, lambda arguments: reads.append(arguments))
+    registry.register(
+        calculator,
+        lambda arguments: None,
+        requires_approval=True,
+    )
+    invalid = create_tool_response(
+        ToolInvocation("read", "read_file", {"path": "module.py"}),
+        ToolInvocation("action", "calculator", {"expression": "2 + 2"}),
+    )
+    provider = FakeProvider([invalid, ChatResponse(text="Retry.")])
+    observed: list[ToolInteractionRound] = []
+
+    run_tool_calling_loop(
+        provider,
+        ChatRequest(messages=[], tools=(read_file, calculator)),
+        registry,
+        max_tool_rounds=1,
+        tool_round_observer=observed.append,
+        recover_multiple_approval_actions=True,
+    )
+
+    assert reads == []
+    assert [result.invocation_id for result in observed[0].results] == [
+        "read",
+        "action",
+    ]
+
+
+def test_multiple_approval_recovery_allows_valid_single_action_retry() -> None:
+    """Continue from an invalid batch to one normally approved action."""
+
+    registry = ToolRegistry()
+    definition = create_calculator_definition()
+    executions = []
+    approvals = []
+    registry.register(
+        definition,
+        lambda arguments: executions.append(arguments) or {"value": 4},
+        requires_approval=True,
+        approval_preview=lambda arguments: {"expression": arguments["expression"]},
+    )
+    provider = FakeProvider(
+        [
+            create_tool_response(
+                ToolInvocation("first", "calculator", {"expression": "1 + 1"}),
+                ToolInvocation("second", "calculator", {"expression": "2 + 2"}),
+            ),
+            create_tool_response(
+                ToolInvocation("retry", "calculator", {"expression": "2 + 2"})
+            ),
+            ChatResponse(text="Completed."),
+        ]
+    )
+
+    result = run_tool_calling_loop(
+        provider,
+        ChatRequest(messages=[], tools=(definition,)),
+        registry,
+        max_tool_rounds=2,
+        tool_approval_handler=lambda request: (
+            approvals.append(request) or ToolApprovalDecision.APPROVE
+        ),
+        recover_multiple_approval_actions=True,
+    )
+
+    assert result.text == "Completed."
+    assert executions == [{"expression": "2 + 2"}]
+    assert len(approvals) == 1
+    assert approvals[0].invocation.id == "retry"
+    assert approvals[0].preview == {"expression": "2 + 2"}
+
+
+def test_multiple_approval_recovery_consumes_tool_round_budget() -> None:
+    """Bound repeated invalid approval batches with the normal round limit."""
+
+    definition = create_calculator_definition()
+    registry = ToolRegistry()
+    registry.register(definition, lambda arguments: None, requires_approval=True)
+    invalid = create_tool_response(
+        ToolInvocation("first", "calculator", {"expression": "1 + 1"}),
+        ToolInvocation("second", "calculator", {"expression": "2 + 2"}),
+    )
+    provider = FakeProvider([invalid, invalid, invalid])
+
+    with pytest.raises(
+        CompletionError,
+        match="The maximum number of tool execution rounds was exceeded",
+    ):
+        run_tool_calling_loop(
+            provider,
+            ChatRequest(messages=[], tools=(definition,)),
+            registry,
+            max_tool_rounds=2,
+            recover_multiple_approval_actions=True,
+        )
+
+    assert len(provider.requests) == 3
+
+
+def test_multiple_read_only_invocations_bypass_approval_recovery() -> None:
+    """Keep valid multiple read-only invocations executing normally."""
+
+    read_file = create_read_file_definition()
+    registry = ToolRegistry()
+    executions = []
+    registry.register(
+        read_file,
+        lambda arguments: executions.append(arguments) or {"content": "value"},
+    )
+    requested = create_tool_response(
+        ToolInvocation("first", "read_file", {"path": "one.py"}),
+        ToolInvocation("second", "read_file", {"path": "two.py"}),
+    )
+    provider = FakeProvider([requested, ChatResponse(text="Read.")])
+
+    result = run_tool_calling_loop(
+        provider,
+        ChatRequest(messages=[], tools=(read_file,)),
+        registry,
+        max_tool_rounds=1,
+        recover_multiple_approval_actions=True,
+    )
+
+    assert result.text == "Read."
+    assert executions == [{"path": "one.py"}, {"path": "two.py"}]
+
+
 def test_invalid_arguments_are_returned_before_approval_then_corrected() -> None:
     """Reject the advertised wrong shape and preserve one round for correction."""
 

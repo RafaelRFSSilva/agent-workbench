@@ -781,6 +781,7 @@ def _run_model_change_phase(
                 tool_round_observer=observer,
                 tool_approval_handler=approval_handler,
                 recover_approval_preview_errors=True,
+                recover_multiple_approval_actions=True,
             )
         except CompletionError as exc:
             if str(exc).startswith("Tool argument validation recovery limit reached;"):

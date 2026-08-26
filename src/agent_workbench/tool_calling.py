@@ -62,6 +62,11 @@ _VALIDATION_BATCH_RETRY_ERROR = (
     "failed argument validation. Issue corrected tool calls matching the "
     "advertised schemas."
 )
+_MULTIPLE_APPROVAL_ACTIONS_ERROR = (
+    "Approval-required tool actions must be requested one at a time. None of "
+    "the requested tools were executed. Retry with exactly one approval-required "
+    "action."
+)
 _CONTROLLED_WORKSPACE_ACTION_TOOL_NAMES = frozenset(
     {
         "apply_file_patch",
@@ -354,6 +359,7 @@ def run_tool_calling_loop(
     tool_round_observer: ToolRoundObserver | None = None,
     tool_approval_handler: ToolApprovalHandler | None = None,
     recover_approval_preview_errors: bool = False,
+    recover_multiple_approval_actions: bool = False,
 ) -> ChatResponse:
     """Complete a request, executing requested tools until text is returned."""
 
@@ -366,6 +372,8 @@ def run_tool_calling_loop(
 
     if not isinstance(recover_approval_preview_errors, bool):
         raise ConfigurationError("approval preview recovery must be a boolean.")
+    if not isinstance(recover_multiple_approval_actions, bool):
+        raise ConfigurationError("multiple approval action recovery must be a boolean.")
 
     completed_rounds = request.tool_interactions
     current_request = request
@@ -402,6 +410,42 @@ def run_tool_calling_loop(
 
     while True:
         response = provider.complete(current_request)
+
+        if (
+            len(response.tool_invocations) > 1
+            and recover_multiple_approval_actions
+            and any(
+                registry.requires_approval(invocation)
+                for invocation in response.tool_invocations
+            )
+        ):
+            if executed_rounds >= max_tool_rounds:
+                raise CompletionError(
+                    "The maximum number of tool execution rounds was exceeded."
+                )
+
+            completed_round = ToolInteractionRound(
+                response=response,
+                results=tuple(
+                    ToolResult(
+                        invocation_id=invocation.id,
+                        status="error",
+                        error=_MULTIPLE_APPROVAL_ACTIONS_ERROR,
+                    )
+                    for invocation in response.tool_invocations
+                ),
+            )
+            completed_rounds = (*completed_rounds, completed_round)
+
+            if tool_round_observer is not None:
+                tool_round_observer(completed_round)
+
+            executed_rounds += 1
+            current_request = replace(
+                request,
+                tool_interactions=completed_rounds,
+            )
+            continue
 
         if inspection_tools_withheld and any(
             invocation.tool_name in _REPEATED_INSPECTION_TOOL_NAMES
