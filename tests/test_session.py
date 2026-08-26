@@ -23,7 +23,12 @@ from agent_workbench.session import AgentSession, SessionId, SessionStatus
 from agent_workbench.structured_outputs import JSONResponseFormat
 from agent_workbench.tasks import TaskSpec
 from agent_workbench.tool_registry import ToolRegistry
-from agent_workbench.tools import ToolDefinition, ToolInvocation, ToolResult
+from agent_workbench.tools import (
+    ToolApprovalDecision,
+    ToolDefinition,
+    ToolInvocation,
+    ToolResult,
+)
 
 type ProviderOutcome = ChatResponse | Exception | Callable[[ChatRequest], ChatResponse]
 
@@ -381,6 +386,69 @@ def test_tool_send_executes_round_forwards_observer_and_commits_final_text() -> 
     )
     assert session.status is SessionStatus.READY
     assert registry.definitions == (definition,)
+
+
+def test_tool_send_recovers_multiple_approval_actions_and_commits_final_text() -> None:
+    """Forward opt-in recovery while preserving normal session commit semantics."""
+
+    definition = calculator_definition()
+    executions = []
+    approvals = []
+    registry = ToolRegistry()
+    registry.register(
+        definition,
+        lambda arguments: executions.append(arguments) or {"result": 4},
+        requires_approval=True,
+        approval_preview=lambda arguments: arguments,
+    )
+    invalid = ChatResponse(
+        tool_invocations=(
+            ToolInvocation("first", "calculator", {"expression": "1 + 1"}),
+            ToolInvocation("second", "calculator", {"expression": "2 + 2"}),
+        )
+    )
+    retry = tool_response("retry")
+    provider = FakeProvider([invalid, retry, ChatResponse(text="Done.")])
+    session = AgentSession(
+        id=SessionId("session-1"),
+        provider=provider,
+        tool_registry=registry,
+        max_tool_rounds=2,
+    )
+
+    result = session.send(
+        "Calculate.",
+        tool_approval_handler=lambda request: (
+            approvals.append(request) or ToolApprovalDecision.APPROVE
+        ),
+        recover_multiple_approval_actions=True,
+    )
+
+    assert result.text == "Done."
+    assert executions == [{"expression": "2 + 2"}]
+    assert len(approvals) == 1
+    assert session.status is SessionStatus.READY
+    assert session.messages == (
+        {"role": "user", "content": "Calculate."},
+        {"role": "assistant", "content": "Done."},
+    )
+
+
+@pytest.mark.parametrize("value", [None, 0, "true"])
+def test_session_rejects_invalid_multiple_approval_recovery_option(
+    value: object,
+) -> None:
+    """Require the opt-in recovery option to be a boolean."""
+
+    session = AgentSession(
+        id=SessionId("session-1"),
+        provider=FakeProvider([ChatResponse(text="Done.")]),
+    )
+    with pytest.raises(ConfigurationError, match="multiple approval action recovery"):
+        session.send(
+            "Calculate.",
+            recover_multiple_approval_actions=value,  # type: ignore[arg-type]
+        )
 
 
 def test_send_exposes_only_allowed_tools_for_one_call() -> None:

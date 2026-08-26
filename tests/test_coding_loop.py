@@ -1793,6 +1793,96 @@ def test_edit_completion_continuation_then_successful_change(
     assert "Assistant prose is not evidence" in continuation
 
 
+def test_edit_recovers_multiple_workspace_actions_before_single_action_retry(
+    tmp_path: Path,
+) -> None:
+    """Recover an invalid action batch inside EDIT without approving or executing it."""
+
+    repository = create_coding_repository(tmp_path / "project")
+    original = "def add(left: int, right: int) -> int:\n    return left - right\n"
+    invalid_batch = ChatResponse(
+        tool_invocations=(
+            ToolInvocation(
+                id="invalid-first",
+                tool_name="apply_text_replacement",
+                arguments={
+                    "path": "module.py",
+                    "expected_text": "return left - right",
+                    "replacement_text": "return left + right",
+                    "expected_file_sha256": hashlib.sha256(
+                        original.encode("utf-8")
+                    ).hexdigest(),
+                },
+            ),
+            ToolInvocation(
+                id="invalid-second",
+                tool_name="apply_text_replacement",
+                arguments={
+                    "path": "test_module.py",
+                    "expected_text": "assert add(1, 2) == 3",
+                    "replacement_text": "assert add(2, 3) == 5",
+                    "expected_file_sha256": hashlib.sha256(
+                        (repository / "test_module.py")
+                        .read_text(encoding="utf-8")
+                        .encode("utf-8")
+                    ).hexdigest(),
+                },
+            ),
+        )
+    )
+    provider = ScriptedProvider(
+        [
+            ChatResponse(text="Discovery complete."),
+            invalid_batch,
+            replacement_response(
+                "valid-retry",
+                expected_content=original,
+                expected_text="return left - right",
+                replacement_text="return left + right",
+            ),
+            ChatResponse(text="Edit applied."),
+            ChatResponse(text="No further changes are needed."),
+        ]
+    )
+    approvals: list[str] = []
+    observed: list[object] = []
+
+    def approve_action(request) -> ToolApprovalDecision:
+        approvals.append(request.invocation.tool_name)
+        return ToolApprovalDecision.APPROVE
+
+    result = run_autonomous_coding_task(
+        create_session(repository, provider),
+        "Correct the add implementation.",
+        tool_approval_handler=approve_action,
+        tool_round_observer=observed.append,
+    )
+
+    assert result.final_phase is CodingPhase.DONE
+    assert result.workspace_change_applied is True
+    assert approvals.count("apply_text_replacement") == 1
+    invalid_round = observed[0]
+    assert [tool_result.invocation_id for tool_result in invalid_round.results] == [
+        "invalid-first",
+        "invalid-second",
+    ]
+    assert all(tool_result.status == "error" for tool_result in invalid_round.results)
+    assert "None of the requested tools were executed" in (
+        invalid_round.results[0].error or ""
+    )
+    assert (
+        sum(
+            tool_name == "apply_text_replacement" and tool_result.status == "success"
+            for tool_name, tool_result in zip(
+                result.executed_tool_names,
+                result.tool_results,
+                strict=True,
+            )
+        )
+        == 1
+    )
+
+
 def test_read_only_edit_inspection_enters_decision_mode(
     tmp_path: Path,
 ) -> None:
